@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dion"
+version = "0.1.0"
+description = "Dion: Distributed Orthonormal Updates"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "numpy",
+  "torch>=2.7.1",
+]
+
+[project.optional-dependencies]
+train = [
+  "huggingface-hub",
+  "wandb",
+  "omegaconf",
+  "datasets",
+  "tiktoken",
+]
+dev = [
+  "setuptools",
+  "pytest",
+  "pytest-cov",
+  "pylint",
+  "black",
+]
+gns = [
+  "gram-newton-schulz==0.1.6",
+  "quack-kernels==0.5.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["dion", "dion.*"]
+
+# The machine exposes NVIDIA RTX 4090 GPUs and an R580 driver module.
+# Pin torch to the CUDA 12.8 wheel index; the Python environment does not
+# require a system-wide CUDA toolkit for the prebuilt PyTorch runtime.
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
