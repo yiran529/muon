@@ -193,11 +193,16 @@ M001 DDP 原型达到当前阶段的自动化测试和两卡 NCCL smoke-test 完
 
 ### 验证、结果与观察
 
-待启动并通过第一个 optimizer step 后补充。
+- warmup 默认值和 M001 配置的聚焦测试：`2 passed`。
+- 提交：`d0fbd11`（`config: use 300-step ARC warmup`）。
+- 宿主环境确认 CUDA 可用且共有 8 张 GPU；GPU 0、1 已被其他任务占用，因此沿用此前 DDP baseline 使用的空闲 GPU 2、3、4、5，没有干扰既有进程。
+- 2026-09-04 01:13 CST 在 tmux 会话 `cm001_m001_arctopk` 启动，W&B run id 为 `21qkn1do`。
+- step 0 validation loss 为 `11.2487`；首个 optimizer step 完成，step 1 train loss 为 `11.2486`。首步包含 `torch.compile` 开销，用时约 107.67 秒。
+- 停止日志跟踪后再次检查，进度已继续到 step 19，近期步耗约 2.3 秒，进程与 tmux 会话均仍在运行；未因启动问题修改 batch size 或其他 baseline 超参数。
 
 ### 结论和下一步
 
-启动阶段只观察到第一个 optimizer step 成功且进程继续运行，之后不持续盯守。完整结果待训练自行结束后整理。
+启动阶段已确认第一个 optimizer step 成功且后续训练继续运行，之后按约定不持续盯守。完整结果待训练自行结束后整理。
 
 ### 关联位置
 
