@@ -1,9 +1,12 @@
 """ARC-TopK compression primitives and EF21M state updates."""
 
 import math
+from typing import Generator, List, Optional
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
+from torch.distributed import ProcessGroup
 
 
 def validate_arc_topk_config(
@@ -102,3 +105,117 @@ def ef21m_apply_delta_(
 ) -> None:
     local_estimate.add_(local_delta.to(dtype=local_estimate.dtype))
     global_estimate.add_(averaged_delta.to(dtype=global_estimate.dtype))
+
+
+def arc_topk_ef21m_async(
+    gradients: List[Tensor],
+    trackers: List[Tensor],
+    local_estimates: List[Tensor],
+    global_estimates: List[Tensor],
+    *,
+    process_group: Optional[ProcessGroup],
+    ratio: float,
+    projection_rank: int,
+    eta: float,
+    base_seed: int,
+    step: int,
+    task_index: int,
+) -> Generator[None, None, List[Tensor]]:
+    """Apply ARC-TopK Algorithm 1 to an EF21M shape group.
+
+    The four tensor lists contain corresponding two-dimensional tensors. State
+    tensors are updated in place; the returned list is ``global_estimates`` so
+    it can feed directly into the caller's optimizer update.
+    """
+    validate_arc_topk_config(ratio, projection_rank, eta)
+    count = len(gradients)
+    if count == 0:
+        return []
+    if not (
+        count == len(trackers) == len(local_estimates) == len(global_estimates)
+    ):
+        raise ValueError("gradient and EF21M state lists must have equal lengths")
+    shape = gradients[0].shape
+    if len(shape) != 2 or any(t.shape != shape for t in gradients):
+        raise ValueError("ARC-TopK shape groups require same-shaped 2D gradients")
+
+    world_size = dist.get_world_size(process_group) if process_group is not None else 1
+    group_rank = dist.get_rank(process_group) if process_group is not None else 0
+    source_rank = (
+        dist.get_process_group_ranks(process_group)[0]
+        if process_group is not None
+        else 0
+    )
+    seed_value = int(base_seed) + int(step) * 1_000_003 + int(task_index)
+    seed_tensor = torch.zeros((), dtype=torch.int64, device=gradients[0].device)
+    if group_rank == 0:
+        seed_tensor.fill_(seed_value)
+    if process_group is not None and world_size > 1:
+        work = dist.broadcast(
+            seed_tensor,
+            src=source_rank,
+            group=process_group,
+            async_op=True,
+        )
+        yield
+        work.wait()
+    synchronized_seed = int(seed_tensor.item())
+
+    gradient_batch = torch.stack(
+        [g.to(dtype=trackers[i].dtype) for i, g in enumerate(gradients)]
+    )
+    tracker_batch = torch.stack(trackers)
+    local_estimate_batch = torch.stack(local_estimates)
+    global_estimate_batch = torch.stack(global_estimates)
+
+    ef21m_update_tracker_(tracker_batch, gradient_batch, eta)
+    delta_batch = tracker_batch - local_estimate_batch
+    rows, columns = shape
+    projection = make_gaussian_projection(
+        count,
+        columns,
+        projection_rank,
+        seed=synchronized_seed,
+        device=gradient_batch.device,
+        dtype=torch.float32,
+    )
+    global_sketch = arc_topk_local_sketch(delta_batch, projection)
+    if process_group is not None and world_size > 1:
+        work = dist.all_reduce(
+            global_sketch,
+            op=dist.ReduceOp.SUM,
+            group=process_group,
+            async_op=True,
+        )
+        yield
+        work.wait()
+        global_sketch.div_(world_size)
+
+    k = math.ceil(ratio * rows)
+    indices = arc_topk_support(global_sketch, k)
+    local_selected = gather_rows(delta_batch, indices)
+    averaged_selected = local_selected.clone()
+    if process_group is not None and world_size > 1:
+        work = dist.all_reduce(
+            averaged_selected,
+            op=dist.ReduceOp.SUM,
+            group=process_group,
+            async_op=True,
+        )
+        yield
+        work.wait()
+        averaged_selected.div_(world_size)
+
+    local_compressed = scatter_rows(local_selected, indices, rows)
+    averaged_compressed = scatter_rows(averaged_selected, indices, rows)
+    ef21m_apply_delta_(
+        local_estimate_batch,
+        global_estimate_batch,
+        local_compressed,
+        averaged_compressed,
+    )
+
+    torch._foreach_copy_(trackers, list(tracker_batch.unbind(0)))
+    torch._foreach_copy_(local_estimates, list(local_estimate_batch.unbind(0)))
+    torch._foreach_copy_(global_estimates, list(global_estimate_batch.unbind(0)))
+    return global_estimates
