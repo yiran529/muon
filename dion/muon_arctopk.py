@@ -20,6 +20,7 @@ from .muon import (
     muon_update_pre_orthogonalize,
 )
 from .opt_utils import AsyncTask, as_scalar_tensor, to_local
+from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
 
 class ArcTopKMuon(Muon):
@@ -119,6 +120,61 @@ class ArcTopKMuon(Muon):
                 )
                 task_index += 1
 
+    def _create_lion_tasks(
+        self, param_groups: List[dict]
+    ) -> Generator[AsyncTask, None, None]:
+        for group in param_groups:
+            params = list(group["params"])
+            if not params:
+                continue
+            gradients = [
+                to_local(p.grad) if p.grad is not None else torch.zeros_like(to_local(p))
+                for p in params
+            ]
+            states = [self._get_or_initialize_state(p, "lion") for p in params]
+            yield AsyncTask(
+                _lion_update_allreduce_async(
+                    X=to_local(params),
+                    G=gradients,
+                    M=to_local([state["momentum"] for state in states]),
+                    lr=group["lr"],
+                    beta1=torch.tensor(group["beta1"]),
+                    beta2=torch.tensor(group["beta2"]),
+                    weight_decay=as_scalar_tensor(group["weight_decay"]),
+                    cautious_wd=group.get("cautious_wd", False),
+                    process_group=self._process_group,
+                )
+            )
+
+    def _create_adamw_tasks(
+        self, param_groups: List[dict]
+    ) -> Generator[AsyncTask, None, None]:
+        for group in param_groups:
+            params = list(group["params"])
+            if not params:
+                continue
+            gradients = [
+                to_local(p.grad) if p.grad is not None else torch.zeros_like(to_local(p))
+                for p in params
+            ]
+            states = [self._get_or_initialize_state(p, "adamw") for p in params]
+            yield AsyncTask(
+                _adamw_update_allreduce_async(
+                    X=to_local(params),
+                    G=gradients,
+                    M=to_local([state["momentum"] for state in states]),
+                    V=to_local([state["variance"] for state in states]),
+                    lr=group["lr"],
+                    beta1=torch.tensor(group["beta1"]),
+                    beta2=torch.tensor(group["beta2"]),
+                    weight_decay=as_scalar_tensor(group["weight_decay"]),
+                    state_steps=[state["step_dev"] for state in states],
+                    epsilon=torch.tensor(group["epsilon"]),
+                    cautious_wd=group.get("cautious_wd", False),
+                    process_group=self._process_group,
+                )
+            )
+
 
 def arc_topk_muon_update_megabatch_async(
     X: List[Tensor],
@@ -192,5 +248,82 @@ def arc_topk_muon_update_megabatch_async(
         base_lr=lr,
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
+        cautious_wd=cautious_wd,
+    )
+
+
+def _average_gradients_async(
+    gradients: List[Tensor],
+    process_group: Optional[ProcessGroup],
+) -> Generator[None, None, List[Tensor]]:
+    averaged = [gradient.clone() for gradient in gradients]
+    if process_group is None:
+        return averaged
+    world_size = torch.distributed.get_world_size(process_group)
+    if world_size == 1:
+        return averaged
+    for gradient in averaged:
+        work = torch.distributed.all_reduce(
+            gradient,
+            op=torch.distributed.ReduceOp.SUM,
+            group=process_group,
+            async_op=True,
+        )
+        yield
+        work.wait()
+        gradient.div_(world_size)
+    return averaged
+
+
+def _lion_update_allreduce_async(
+    X: List[Tensor],
+    G: List[Tensor],
+    M: List[Tensor],
+    lr: Tensor,
+    beta1: Tensor,
+    beta2: Tensor,
+    weight_decay: Tensor,
+    cautious_wd: bool,
+    process_group: Optional[ProcessGroup],
+) -> Generator[None, None, None]:
+    averaged = yield from _average_gradients_async(G, process_group)
+    yield from lion_update_foreach_async(
+        X,
+        averaged,
+        M,
+        lr,
+        beta1,
+        beta2,
+        weight_decay,
+        cautious_wd,
+    )
+
+
+def _adamw_update_allreduce_async(
+    X: List[Tensor],
+    G: List[Tensor],
+    M: List[Tensor],
+    V: List[Tensor],
+    lr: Tensor,
+    beta1: Tensor,
+    beta2: Tensor,
+    weight_decay: Tensor,
+    state_steps: List[Tensor],
+    epsilon: Tensor,
+    cautious_wd: bool,
+    process_group: Optional[ProcessGroup],
+) -> Generator[None, None, None]:
+    averaged = yield from _average_gradients_async(G, process_group)
+    yield from adamw_update_foreach_async(
+        X,
+        averaged,
+        M,
+        V,
+        lr,
+        beta1,
+        beta2,
+        weight_decay,
+        state_steps=state_steps,
+        epsilon=epsilon,
         cautious_wd=cautious_wd,
     )
