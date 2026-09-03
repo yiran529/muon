@@ -45,7 +45,7 @@ def test_arctopk_hyperparameter_defaults_select_ddp_arc_topk():
     assert hp.arc_projection_rank == 4
     assert hp.arc_eta == 0.1
     assert hp.arc_seed == 42
-    assert hp.arc_start_compress_step == 1000
+    assert hp.arc_start_compress_step == 300
 
 
 def test_arctopk_parser_accepts_method_specific_arguments():
@@ -160,4 +160,4 @@ def test_m001_yaml_loads_through_shared_parser():
     assert hp.arc_projection_rank == 4
     assert hp.arc_eta == 0.1
     assert hp.arc_seed == 42
-    assert hp.arc_start_compress_step == 1000
+    assert hp.arc_start_compress_step == 300

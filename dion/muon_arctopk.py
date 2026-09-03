@@ -35,7 +35,7 @@ class ArcTopKMuon(Muon):
         arc_projection_rank: int = 4,
         arc_eta: float = 0.1,
         arc_seed: int = 42,
-        arc_start_compress_step: int = 1000,
+        arc_start_compress_step: int = 300,
         **kwargs,
     ):
         validate_arc_topk_config(

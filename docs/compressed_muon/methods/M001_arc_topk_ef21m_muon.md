@@ -31,7 +31,7 @@ h_t^(i) = (1 - eta) h_(t-1)^(i) + eta grad_t^(i)
 delta_t^(i) = h_t^(i) - g_(t-1)^(i)
 ```
 
-首步使用 dense All-Reduce 初始化，使论文证明中的 `g_0 = h_0`、`V_0 = 0` 成立。默认前 1000 个 optimizer steps 保持 dense；warmup 期间继续更新 tracker，并令 `g_t^(i) = h_t^(i)`。第 1001 步开始执行 ARC-TopK。
+首步使用 dense All-Reduce 初始化，使论文证明中的 `g_0 = h_0`、`V_0 = 0` 成立。针对当前 3000 步 GPT 训练，默认前 300 个 optimizer steps 保持 dense；warmup 期间继续更新 tracker，并令 `g_t^(i) = h_t^(i)`。第 301 步开始执行 ARC-TopK。
 
 对所有 `delta_t^(i)` 执行完整 ARC-TopK：
 
@@ -90,7 +90,7 @@ def main(
 
 - 定义继承自基础配置的 `ArcTopKHyperparameters`。
 - 增加 `arc_topk_ratio`、`arc_projection_rank`、`arc_eta` 和 `arc_seed` 参数。
-- 增加 `arc_start_compress_step`，默认值为论文实验设置的 `1000`。
+- 增加 `arc_start_compress_step`。论文实验使用固定 1000 步；当前 3000 步 GPT 配置采用约占总步数 10% 的 `300`。
 - 默认设置 `optimizer="arc_topk_muon"` 和 `replicate_mesh_grad_sync=True`。
 - optimizer factory 只接受纯 DDP，即 `device_mesh is None`。
 - 复用基础训练循环、DDP `no_sync()`、数据加载、日志和 checkpoint 管理。

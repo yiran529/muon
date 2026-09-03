@@ -60,7 +60,7 @@ uv run --frozen --extra dev pytest tests -v
 - ARC 顺序固定为 rank-0 seed broadcast、sketch All-Reduce 平均、公共 Top-K support、selected-values All-Reduce 平均。
 - 各 rank 按相同参数/shape 顺序发 collective；局部 `grad is None` 使用零张量，不能造成 collective 次序分叉。
 - EF21M 状态包括 `arc_h_local`、`arc_g_local`、`arc_g_global`，并随 optimizer `state_dict()` 保存和恢复。
-- 首个 optimizer step 使用 dense All-Reduce 初始化 `h_0`、`g_0`，满足 `g_0 = h_0`；配置默认 `arc_start_compress_step=1000`，第 1–1000 步保持 dense，第 1001 步开始 ARC。
+- 首个 optimizer step 使用 dense All-Reduce 初始化 `h_0`、`g_0`，满足 `g_0 = h_0`；当前 GPT 配置默认 `arc_start_compress_step=300`，第 1–300 步保持 dense，第 301 步开始 ARC。
 - projection 与 sketch 跟随梯度/状态 dtype；BF16 路径不得把 sketch 固定提升为 FP32。
 - `arc_g_global` 进入原 Muon momentum、Nesterov、正交化、结果收集和参数更新路径；原 `dion/muon.py` 行为未被修改。
 - AdamW/Lion 参数仍执行 dense All-Reduce，两个 rank 的参数更新保持一致。

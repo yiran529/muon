@@ -175,3 +175,32 @@ M001 DDP 原型达到当前阶段的自动化测试和两卡 NCCL smoke-test 完
 - 测试：`tests/test_arc_topk.py`、`tests/test_arc_topk_distributed.py`、`tests/test_muon_arctopk.py`、`tests/test_train_arctopk.py`
 - 正式实验编号：无。
 - 正式产物路径：无。
+
+## 2026-09-04：将 GPT compression warmup 调整为 300 并启动 CM001
+
+### 目的与假设
+
+论文实验统一在 1000 iterations 后开始压缩，但其 C4 训练明显长于当前 3000-step GPT 配置。为避免三分之一训练都使用 dense 通信，当前配置改用约占总步数 10% 的 300-step compression warmup。除 ARC-TopK-EF21M 专属参数和 optimizer-side DDP gradient sync 外，训练超参数沿用此前完成的 4 卡 DDP Muon 160M baseline。
+
+### 修改与实验配置
+
+- `arc_start_compress_step` 的 M001 默认值和正式配置从 `1000` 改为 `300`，第 301 个 optimizer step 开始 ARC-TopK。
+- 实验编号：`CM001-m001-gpt160m-ddp-ws4-s42`。
+- 4 GPU DDP，模型 162M 参数，`batch_size=1024`、`device_batch_size=32`、`sequence_length=1024`、`num_iterations=3000`。
+- `lr=0.02`、`mu=0.95`、`weight_decay=0.01`、`adjust_lr=spectral_norm`、scalar optimizer 为 AdamW。
+- ARC 参数：`ratio=0.2`、`projection_rank=4`、`eta=0.1`、seed `42`、compression warmup `300`。
+- 启用 W&B；不保存 checkpoint；训练在 `tmux` 中运行。
+
+### 验证、结果与观察
+
+待启动并通过第一个 optimizer step 后补充。
+
+### 结论和下一步
+
+启动阶段只观察到第一个 optimizer step 成功且进程继续运行，之后不持续盯守。完整结果待训练自行结束后整理。
+
+### 关联位置
+
+- 配置：`configs/compressed_muon/m001_arc_topk_muon_ddp.yaml`
+- 实验登记：`docs/compressed_muon/EXPERIMENTS.md`
+- 产物：`artifacts/compressed_muon/CM001-m001-gpt160m-ddp-ws4-s42/`
