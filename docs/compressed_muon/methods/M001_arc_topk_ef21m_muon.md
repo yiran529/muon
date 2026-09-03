@@ -2,7 +2,7 @@
 
 ## 状态
 
-设计待用户复核。第一版以通过自动化测试为完成条件，不启动正式训练或性能实验。
+第一版实现完成，M001 聚焦测试与相关基线回归测试通过。未启动正式训练、收敛实验或性能实验。
 
 ## 目标
 
@@ -144,11 +144,11 @@ tests/test_muon_arctopk_distributed.py
 
 ```text
 0 < arc_topk_ratio <= 1
-1 <= projection_rank <= n
+projection_rank >= 1
 K = ceil(arc_topk_ratio * m)
 ```
 
-采用论文公式中的 `1 / sqrt(r)` 缩放。因为该缩放不改变 Top-K 排序，但保留它能使实现与论文定义一致。
+采用论文公式中的 `1 / sqrt(r)` 缩放。因为该缩放不改变 Top-K 排序，但保留它能使实现与论文定义一致。为了获得投影压缩收益，实际配置通常应使 `projection_rank < n`；这属于效率建议，而不是算法有效性的输入约束。
 
 ### 通信
 
