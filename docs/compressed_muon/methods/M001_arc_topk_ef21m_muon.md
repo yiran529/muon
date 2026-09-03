@@ -23,9 +23,15 @@
 对于第 `i` 个 DDP rank 的本地随机梯度，EF21M 状态更新为：
 
 ```text
+h_0^(i) = grad_0^(i)
+g_0^(i) = h_0^(i)
+g_global_0 = Average_i(h_0^(i))
+
 h_t^(i) = (1 - eta) h_(t-1)^(i) + eta grad_t^(i)
 delta_t^(i) = h_t^(i) - g_(t-1)^(i)
 ```
+
+首步使用 dense All-Reduce 初始化，使论文证明中的 `g_0 = h_0`、`V_0 = 0` 成立。默认前 1000 个 optimizer steps 保持 dense；warmup 期间继续更新 tracker，并令 `g_t^(i) = h_t^(i)`。第 1001 步开始执行 ARC-TopK。
 
 对所有 `delta_t^(i)` 执行完整 ARC-TopK：
 
@@ -84,6 +90,7 @@ def main(
 
 - 定义继承自基础配置的 `ArcTopKHyperparameters`。
 - 增加 `arc_topk_ratio`、`arc_projection_rank`、`arc_eta` 和 `arc_seed` 参数。
+- 增加 `arc_start_compress_step`，默认值为论文实验设置的 `1000`。
 - 默认设置 `optimizer="arc_topk_muon"` 和 `replicate_mesh_grad_sync=True`。
 - optimizer factory 只接受纯 DDP，即 `device_mesh is None`。
 - 复用基础训练循环、DDP `no_sync()`、数据加载、日志和 checkpoint 管理。
@@ -148,17 +155,19 @@ projection_rank >= 1
 K = ceil(arc_topk_ratio * m)
 ```
 
-采用论文公式中的 `1 / sqrt(r)` 缩放。因为该缩放不改变 Top-K 排序，但保留它能使实现与论文定义一致。为了获得投影压缩收益，实际配置通常应使 `projection_rank < n`；这属于效率建议，而不是算法有效性的输入约束。
+采用论文公式中的 `1 / sqrt(r)` 缩放。因为该缩放不改变 Top-K 排序，但保留它能使实现与论文定义一致。projection 和 sketch 跟随梯度/EF21M 状态 dtype，避免 BF16 训练时将 sketch 固定提升到 FP32 而增加通信字节。为了获得投影压缩收益，实际配置通常应使 `projection_rank < n`；这属于效率建议，而不是算法有效性的输入约束。
 
 ### 通信
 
-每个 shape group 的正常顺序固定为：
+每个 shape group 在压缩阶段的正常顺序固定为：
 
 ```text
 seed broadcast
 sketch AllReduce-AVG
 selected-values AllReduce-AVG
 ```
+
+首步和 warmup 阶段不生成 seed 或 sketch，只对完整 tracker batch 执行一次 dense AllReduce-AVG。`arc_start_compress_step=0` 会关闭额外 warmup，但首步仍执行理论要求的 dense 初始化。
 
 所有 ranks 必须按相同参数顺序创建 task。ARC 模式不按本地 `grad is not None` 独立过滤参数；本地缺失梯度按零梯度参与 EF21M 递推，避免 collective 顺序不一致。即使所有 ranks 的当前梯度都缺失，历史 tracker 仍按公式继续演化，因此不额外引入 active-mask collective。
 
@@ -179,12 +188,15 @@ selected-values AllReduce-AVG
 - 非 DDP 启动时立即报错，不静默退化到 FSDP。
 - process group 缺失且 world size 大于 1 时立即报错。
 - 非法 ratio、projection rank 或 eta 在构造时报错。
+- 非法 `arc_start_compress_step`（负数、布尔值或非整数）在构造时报错。
 - 第一版拒绝 `flatten=True`、`num_heads>1` 和 `split_sizes`，避免 ARC 行定义与 Muon 子矩阵语义混杂。
 - collective task 的参数集合必须 rank-symmetric；测试覆盖某 rank 本地梯度缺失的情况。
 
 ## Checkpoint
 
 普通单进程 `state_dict()` 必须包含并恢复全部 ARC/EF21M 状态。
+
+加入 warmup 配置之前创建的 M001 checkpoint 没有 `arc_start_compress_step`。加载时将该字段迁移为 `0`，保留旧 checkpoint 恢复后立即压缩的行为，避免重新执行默认 1000 步 warmup。
 
 分布式 checkpoint 的 rank-local `h_local` 和 `g_local` 在不同 DDP ranks 上合法地不同，不能在保存前简单平均。第一版不承诺分布式 checkpoint 的不间断轨迹等价；专用训练配置默认 `checkpoint_freq=0`。后续若需要正式长训练，应将 rank-local compressor state 设计为显式 rank-local checkpoint 数据。
 
@@ -198,6 +210,8 @@ selected-values AllReduce-AVG
 - selected-values All-Reduce 等于手工计算的平均值。
 - `ratio=1` 时 ARC 输出等于 dense average。
 - EF21M 的 `h_local`、`g_local`、`g_global` 多步递推符合公式 11a–11c。
+- 首步 dense 初始化满足 `g_0 = h_0`，warmup 截止步仍走 dense tracker 同步。
+- BF16 输入产生 BF16 projection/sketch，不额外扩大 sketch 通信字节。
 - 两个 DDP ranks 使用不同本地矩阵梯度后，Muon momentum 和参数保持一致。
 - AdamW/Lion 参数通过 dense All-Reduce 保持一致。
 - 某个 rank 的局部梯度缺失时 collective 不死锁。

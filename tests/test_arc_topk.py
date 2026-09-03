@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from dion.arc_topk import (
+    arc_topk_ef21m_async,
     arc_topk_local_sketch,
     arc_topk_support,
     ef21m_apply_delta_,
@@ -15,6 +16,14 @@ from dion.arc_topk import (
     scatter_rows,
     validate_arc_topk_config,
 )
+
+
+def _run_generator(generator):
+    while True:
+        try:
+            next(generator)
+        except StopIteration as stop:
+            return stop.value
 
 
 @pytest.mark.parametrize(
@@ -36,6 +45,17 @@ def test_invalid_arc_config_is_rejected(ratio, projection_rank, eta):
 def test_valid_arc_config_is_accepted():
     validate_arc_topk_config(0.25, 4, 0.1)
     validate_arc_topk_config(1.0, 1, 1.0)
+
+
+@pytest.mark.parametrize("start_compress_step", [-1, True, 1.5])
+def test_invalid_start_compress_step_is_rejected(start_compress_step):
+    with pytest.raises(ValueError):
+        validate_arc_topk_config(0.25, 4, 0.1, start_compress_step)
+
+
+def test_valid_start_compress_step_is_accepted():
+    validate_arc_topk_config(0.25, 4, 0.1, 0)
+    validate_arc_topk_config(0.25, 4, 0.1, 1000)
 
 
 def test_gaussian_projection_is_reproducible_without_using_global_rng():
@@ -72,6 +92,15 @@ def test_local_sketch_applies_batched_projection_and_rank_normalization():
     sketch = arc_topk_local_sketch(delta, projection)
 
     torch.testing.assert_close(sketch, delta / math.sqrt(2.0))
+
+
+def test_local_sketch_preserves_bfloat16_communication_dtype():
+    delta = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]], dtype=torch.bfloat16)
+    projection = torch.eye(2, dtype=torch.bfloat16).unsqueeze(0)
+
+    sketch = arc_topk_local_sketch(delta, projection)
+
+    assert sketch.dtype == torch.bfloat16
 
 
 def test_support_selects_rows_with_largest_sketch_norms():
@@ -148,3 +177,101 @@ def test_ef21m_estimates_accumulate_local_and_global_compressed_deltas():
 
     torch.testing.assert_close(local_estimate, 2 * local_delta)
     torch.testing.assert_close(global_estimate, 2 * averaged_delta)
+
+
+def test_first_step_dense_initializes_h_and_g_before_compression():
+    gradient = torch.arange(12.0).reshape(4, 3)
+    tracker = torch.zeros_like(gradient)
+    local_estimate = torch.zeros_like(gradient)
+    global_estimate = torch.zeros_like(gradient)
+
+    result = _run_generator(
+        arc_topk_ef21m_async(
+            gradients=[gradient],
+            trackers=[tracker],
+            local_estimates=[local_estimate],
+            global_estimates=[global_estimate],
+            process_group=None,
+            ratio=0.25,
+            projection_rank=2,
+            eta=0.1,
+            base_seed=17,
+            step=1,
+            task_index=0,
+            start_compress_step=0,
+        )
+    )
+
+    torch.testing.assert_close(tracker, gradient)
+    torch.testing.assert_close(local_estimate, gradient)
+    torch.testing.assert_close(global_estimate, gradient)
+    torch.testing.assert_close(result[0], gradient)
+
+
+def test_warmup_uses_dense_tracker_update_through_configured_step():
+    previous = torch.full((4, 3), 2.0)
+    gradient = torch.arange(12.0).reshape(4, 3)
+    tracker = previous.clone()
+    local_estimate = previous.clone()
+    global_estimate = previous.clone()
+
+    result = _run_generator(
+        arc_topk_ef21m_async(
+            gradients=[gradient],
+            trackers=[tracker],
+            local_estimates=[local_estimate],
+            global_estimates=[global_estimate],
+            process_group=None,
+            ratio=0.25,
+            projection_rank=2,
+            eta=0.25,
+            base_seed=17,
+            step=1000,
+            task_index=0,
+            start_compress_step=1000,
+        )
+    )
+
+    expected_tracker = 0.75 * previous + 0.25 * gradient
+    torch.testing.assert_close(tracker, expected_tracker)
+    torch.testing.assert_close(local_estimate, expected_tracker)
+    torch.testing.assert_close(global_estimate, expected_tracker)
+    torch.testing.assert_close(result[0], expected_tracker)
+
+
+def test_step_after_warmup_uses_bfloat16_arc_compression():
+    gradient = torch.arange(12.0, dtype=torch.bfloat16).reshape(4, 3)
+    tracker = torch.zeros_like(gradient)
+    local_estimate = torch.zeros_like(gradient)
+    global_estimate = torch.zeros_like(gradient)
+
+    projection = make_gaussian_projection(
+        1,
+        3,
+        2,
+        seed=17 + 1001 * 1_000_003,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    assert projection.dtype == torch.bfloat16
+
+    result = _run_generator(
+        arc_topk_ef21m_async(
+            gradients=[gradient],
+            trackers=[tracker],
+            local_estimates=[local_estimate],
+            global_estimates=[global_estimate],
+            process_group=None,
+            ratio=0.25,
+            projection_rank=2,
+            eta=1.0,
+            base_seed=17,
+            step=1001,
+            task_index=0,
+            start_compress_step=1000,
+        )
+    )
+
+    assert result[0].dtype == torch.bfloat16
+    assert torch.count_nonzero(local_estimate).item() == 3
+    torch.testing.assert_close(global_estimate, local_estimate)

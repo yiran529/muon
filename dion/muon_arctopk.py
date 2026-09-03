@@ -35,12 +35,14 @@ class ArcTopKMuon(Muon):
         arc_projection_rank: int = 4,
         arc_eta: float = 0.1,
         arc_seed: int = 42,
+        arc_start_compress_step: int = 1000,
         **kwargs,
     ):
         validate_arc_topk_config(
             arc_topk_ratio,
             arc_projection_rank,
             arc_eta,
+            arc_start_compress_step,
         )
         if isinstance(distributed_mesh, DeviceMesh):
             raise ValueError("ArcTopKMuon first version is DDP only")
@@ -48,6 +50,7 @@ class ArcTopKMuon(Muon):
         self._arc_projection_rank = arc_projection_rank
         self._arc_eta = arc_eta
         self._arc_seed = arc_seed
+        self._arc_start_compress_step = arc_start_compress_step
         super().__init__(params, distributed_mesh=distributed_mesh, **kwargs)
 
         for group in self.param_groups:
@@ -63,6 +66,7 @@ class ArcTopKMuon(Muon):
             group["arc_projection_rank"] = arc_projection_rank
             group["arc_eta"] = arc_eta
             group["arc_seed"] = arc_seed
+            group["arc_start_compress_step"] = arc_start_compress_step
 
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
         state = super()._get_or_initialize_state(param, algo)
@@ -71,6 +75,14 @@ class ArcTopKMuon(Muon):
             state.setdefault("arc_g_local", torch.zeros_like(param))
             state.setdefault("arc_g_global", torch.zeros_like(param))
         return state
+
+    def load_state_dict(self, state_dict):
+        migrated = dict(state_dict)
+        migrated["param_groups"] = [dict(group) for group in state_dict["param_groups"]]
+        for group in migrated["param_groups"]:
+            if group.get("algorithm") == "muon":
+                group.setdefault("arc_start_compress_step", 0)
+        super().load_state_dict(migrated)
 
     def _create_ortho_tasks(
         self, param_groups: List[dict]
@@ -116,6 +128,7 @@ class ArcTopKMuon(Muon):
                         arc_seed=group["arc_seed"],
                         step=group["step"],
                         task_index=task_index,
+                        start_compress_step=group["arc_start_compress_step"],
                     )
                 )
                 task_index += 1
@@ -200,6 +213,7 @@ def arc_topk_muon_update_megabatch_async(
     arc_seed: int,
     step: int,
     task_index: int,
+    start_compress_step: int,
 ) -> Generator[None, None, None]:
     synchronized_gradients = yield from arc_topk_ef21m_async(
         gradients=G,
@@ -213,6 +227,7 @@ def arc_topk_muon_update_megabatch_async(
         base_seed=arc_seed,
         step=step,
         task_index=task_index,
+        start_compress_step=start_compress_step,
     )
 
     updates = muon_update_pre_orthogonalize(

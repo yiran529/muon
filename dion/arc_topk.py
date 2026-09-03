@@ -13,6 +13,7 @@ def validate_arc_topk_config(
     ratio: float,
     projection_rank: int,
     eta: float,
+    start_compress_step: int = 0,
 ) -> None:
     if not 0.0 < ratio <= 1.0:
         raise ValueError(f"ratio must be in (0, 1], got {ratio}")
@@ -26,6 +27,15 @@ def validate_arc_topk_config(
         )
     if not 0.0 < eta <= 1.0:
         raise ValueError(f"eta must be in (0, 1], got {eta}")
+    if (
+        isinstance(start_compress_step, bool)
+        or not isinstance(start_compress_step, int)
+        or start_compress_step < 0
+    ):
+        raise ValueError(
+            "start_compress_step must be a non-negative integer, got "
+            f"{start_compress_step!r}"
+        )
 
 
 def make_gaussian_projection(
@@ -57,9 +67,7 @@ def arc_topk_local_sketch(delta: Tensor, projection: Tensor) -> Tensor:
             f"incompatible delta/projection shapes: {tuple(delta.shape)} and "
             f"{tuple(projection.shape)}"
         )
-    return torch.bmm(delta.float(), projection.float()) / math.sqrt(
-        projection.shape[-1]
-    )
+    return torch.bmm(delta, projection) / math.sqrt(projection.shape[-1])
 
 
 def arc_topk_support(global_sketch: Tensor, k: int) -> Tensor:
@@ -120,6 +128,7 @@ def arc_topk_ef21m_async(
     base_seed: int,
     step: int,
     task_index: int,
+    start_compress_step: int = 0,
 ) -> Generator[None, None, List[Tensor]]:
     """Apply ARC-TopK Algorithm 1 to an EF21M shape group.
 
@@ -127,7 +136,7 @@ def arc_topk_ef21m_async(
     tensors are updated in place; the returned list is ``global_estimates`` so
     it can feed directly into the caller's optimizer update.
     """
-    validate_arc_topk_config(ratio, projection_rank, eta)
+    validate_arc_topk_config(ratio, projection_rank, eta, start_compress_step)
     count = len(gradients)
     if count == 0:
         return []
@@ -139,7 +148,38 @@ def arc_topk_ef21m_async(
     if len(shape) != 2 or any(t.shape != shape for t in gradients):
         raise ValueError("ARC-TopK shape groups require same-shaped 2D gradients")
 
+    gradient_batch = torch.stack(
+        [g.to(dtype=trackers[i].dtype) for i, g in enumerate(gradients)]
+    )
+    tracker_batch = torch.stack(trackers)
+    local_estimate_batch = torch.stack(local_estimates)
+    global_estimate_batch = torch.stack(global_estimates)
+
+    if step == 1:
+        tracker_batch.copy_(gradient_batch)
+    else:
+        ef21m_update_tracker_(tracker_batch, gradient_batch, eta)
+
     world_size = dist.get_world_size(process_group) if process_group is not None else 1
+    if step == 1 or step <= start_compress_step:
+        local_estimate_batch.copy_(tracker_batch)
+        global_estimate_batch.copy_(tracker_batch)
+        if process_group is not None and world_size > 1:
+            work = dist.all_reduce(
+                global_estimate_batch,
+                op=dist.ReduceOp.SUM,
+                group=process_group,
+                async_op=True,
+            )
+            yield
+            work.wait()
+            global_estimate_batch.div_(world_size)
+
+        torch._foreach_copy_(trackers, list(tracker_batch.unbind(0)))
+        torch._foreach_copy_(local_estimates, list(local_estimate_batch.unbind(0)))
+        torch._foreach_copy_(global_estimates, list(global_estimate_batch.unbind(0)))
+        return global_estimates
+
     group_rank = dist.get_rank(process_group) if process_group is not None else 0
     source_rank = (
         dist.get_process_group_ranks(process_group)[0]
@@ -161,14 +201,6 @@ def arc_topk_ef21m_async(
         work.wait()
     synchronized_seed = int(seed_tensor.item())
 
-    gradient_batch = torch.stack(
-        [g.to(dtype=trackers[i].dtype) for i, g in enumerate(gradients)]
-    )
-    tracker_batch = torch.stack(trackers)
-    local_estimate_batch = torch.stack(local_estimates)
-    global_estimate_batch = torch.stack(global_estimates)
-
-    ef21m_update_tracker_(tracker_batch, gradient_batch, eta)
     delta_batch = tracker_batch - local_estimate_batch
     rows, columns = shape
     projection = make_gaussian_projection(
@@ -177,7 +209,7 @@ def arc_topk_ef21m_async(
         projection_rank,
         seed=synchronized_seed,
         device=gradient_batch.device,
-        dtype=torch.float32,
+        dtype=gradient_batch.dtype,
     )
     global_sketch = arc_topk_local_sketch(delta_batch, projection)
     if process_group is not None and world_size > 1:

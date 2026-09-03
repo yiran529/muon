@@ -46,3 +46,4 @@ arc_topk_ratio: 0.2
 arc_projection_rank: 4
 arc_eta: 0.1
 arc_seed: 42
+arc_start_compress_step: 1000

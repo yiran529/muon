@@ -132,3 +132,46 @@ M001 DDP 原型达到当前阶段的自动化测试和两卡 NCCL smoke-test 完
 - 配置：`configs/compressed_muon/m001_arc_topk_muon_ddp.yaml`
 - 正式实验编号：无。
 - 正式产物路径：无。
+
+## 2026-09-04：对齐论文与官方仓库的初始化、warmup 和 dtype
+
+### 目的与假设
+
+对照 ARC-TopK 论文与官方发布仓库，修正第一版原型的三处语义或实现差异：EF21M 从零状态直接压缩导致首步通常不满足 `g_0 = h_0`；缺少论文实验使用的压缩 warmup；BF16 梯度的 sketch 被固定提升到 FP32，增加了实际通信字节。
+
+### 修改与配置
+
+- 首个 optimizer step 直接令本地 `h_0 = g_0 = grad_0`，并通过一次 dense All-Reduce 得到全局 `g_0`，使 `V_0 = ||g_0-h_0||^2 = 0`。
+- 新增 `arc_start_compress_step`，默认值和 M001 配置均为 `1000`。第 1–1000 步保持 dense tracker 同步，第 1001 步开始 ARC-TopK；设为 `0` 时仅保留首步 dense 初始化。
+- warmup 期间仍按 `eta` 更新 `h_t`，随后令本地 `g_t=h_t` 并 dense 聚合全局 tracker，不生成 ARC seed 或 sketch。
+- Gaussian projection 和 sketch 改为跟随梯度/EF21M 状态 dtype，保留论文的 `1/sqrt(r)` 缩放。
+- 旧 M001 checkpoint 加载时若缺少新字段，将 `arc_start_compress_step` 迁移为 `0`，保持旧版本立即压缩的恢复语义。
+- 更新 M001 方法说明、验证 prompt、配置以及本地和两 rank 分布式测试。
+
+### 验证
+
+- TDD 红测：新增行为测试在修改前出现 `17 failed, 20 passed`，失败原因分别为缺少 warmup 参数、首步仍执行稀疏压缩、BF16 sketch 被提升为 FP32。
+- M001 聚焦测试（含两 rank Gloo）：`49 passed, 0 failed, 0 skipped`。
+- 原 Muon、配置、状态预创建和 Dion3 alias 回归：在 GPU 2、3 可见环境中得到 `131 passed, 0 failed, 4 skipped`；4 项需要超过 2 张 GPU 的参数化测试因设备数不足而跳过。
+- 两卡 BF16/NCCL smoke test：GPU 2、3 上验证首步 dense 初始化、warmup 后进入 ARC、BF16 输出 dtype 和两 rank 全局估计一致，结果通过；临时脚本已删除。
+- `python -m py_compile dion/arc_topk.py dion/muon_arctopk.py train_arctopk.py`：通过。
+- `git diff --check`：通过。
+- 独立代码审查发现旧 M001 checkpoint 缺少新增 warmup 字段会在恢复后触发 `KeyError`；增加迁移和回归测试后完成复审。
+
+### 结果与观察
+
+- 首步不再受 `ratio` 和 `eta` 缩放影响，`h_0`、本地 `g_0` 等于完整本地初始梯度，全局 `g_0` 等于各 rank 初始梯度平均。
+- warmup 截止步仍走 dense tracker 同步，超过阈值后才执行 seed broadcast、sketch All-Reduce 和 selected-values All-Reduce。
+- BF16 输入的 projection、sketch、selected values 和全局估计保持 BF16；不再因固定 FP32 sketch 产生双倍 sketch 字节。
+
+### 结论和下一步
+
+三处已知不一致已在 M001 正常执行路径中修正。当前结论仍只覆盖算法路径与短 smoke test，不代表端到端吞吐、通信收益或训练收敛已经得到验证。下一步应使用 dense DDP Muon 作为基线进行短训练和 profiler 对比。
+
+### 关联位置
+
+- 代码：`dion/arc_topk.py`、`dion/muon_arctopk.py`、`train_arctopk.py`
+- 配置：`configs/compressed_muon/m001_arc_topk_muon_ddp.yaml`
+- 测试：`tests/test_arc_topk.py`、`tests/test_arc_topk_distributed.py`、`tests/test_muon_arctopk.py`、`tests/test_train_arctopk.py`
+- 正式实验编号：无。
+- 正式产物路径：无。

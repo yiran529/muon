@@ -45,6 +45,7 @@ def test_arctopk_hyperparameter_defaults_select_ddp_arc_topk():
     assert hp.arc_projection_rank == 4
     assert hp.arc_eta == 0.1
     assert hp.arc_seed == 42
+    assert hp.arc_start_compress_step == 1000
 
 
 def test_arctopk_parser_accepts_method_specific_arguments():
@@ -62,6 +63,8 @@ def test_arctopk_parser_accepts_method_specific_arguments():
             "0.3",
             "--arc_seed",
             "7",
+            "--arc_start_compress_step",
+            "250",
         ]
     )
 
@@ -69,6 +72,7 @@ def test_arctopk_parser_accepts_method_specific_arguments():
     assert args.arc_projection_rank == 8
     assert args.arc_eta == 0.3
     assert args.arc_seed == 7
+    assert args.arc_start_compress_step == 250
 
 
 def test_arctopk_optimizer_rejects_fsdp_device_mesh():
@@ -120,6 +124,10 @@ def test_arctopk_optimizer_builds_matrix_and_scalar_groups():
     assert opt.param_groups[0]["arc_projection_rank"] == hp.arc_projection_rank
     assert opt.param_groups[0]["arc_eta"] == hp.arc_eta
     assert opt.param_groups[0]["arc_seed"] == hp.arc_seed
+    assert (
+        opt.param_groups[0]["arc_start_compress_step"]
+        == hp.arc_start_compress_step
+    )
 
 
 def test_m001_yaml_loads_through_shared_parser():
@@ -152,3 +160,4 @@ def test_m001_yaml_loads_through_shared_parser():
     assert hp.arc_projection_rank == 4
     assert hp.arc_eta == 0.1
     assert hp.arc_seed == 42
+    assert hp.arc_start_compress_step == 1000

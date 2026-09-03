@@ -24,6 +24,7 @@ def _make_optimizer(param, **kwargs):
         arc_projection_rank=2,
         arc_eta=1.0,
         arc_seed=17,
+        arc_start_compress_step=0,
     )
     options.update(kwargs)
     return ArcTopKMuon([param], **options)
@@ -55,6 +56,8 @@ def test_arc_topk_muon_prepopulates_full_state():
         {"arc_projection_rank": True},
         {"arc_eta": 0.0},
         {"arc_eta": 1.1},
+        {"arc_start_compress_step": -1},
+        {"arc_start_compress_step": True},
     ],
 )
 def test_arc_topk_muon_rejects_invalid_arc_configuration(kwargs):
@@ -126,3 +129,27 @@ def test_arc_topk_state_dict_round_trip_restores_all_trackers():
     assert restored.param_groups[0]["arc_projection_rank"] == 2
     assert restored.param_groups[0]["arc_eta"] == 0.25
     assert restored.param_groups[0]["arc_seed"] == 17
+    assert restored.param_groups[0]["arc_start_compress_step"] == 0
+
+
+def test_legacy_state_dict_resumes_with_immediate_compression():
+    parameter = torch.nn.Parameter(torch.zeros(4, 3))
+    optimizer = _make_optimizer(parameter, arc_topk_ratio=0.5, arc_eta=0.25)
+    parameter.grad = torch.arange(12.0).reshape(4, 3)
+    optimizer.step()
+    legacy = copy.deepcopy(optimizer.state_dict())
+    del legacy["param_groups"][0]["arc_start_compress_step"]
+
+    restored_parameter = torch.nn.Parameter(torch.zeros(4, 3))
+    restored = _make_optimizer(
+        restored_parameter,
+        arc_topk_ratio=0.5,
+        arc_eta=0.25,
+        arc_start_compress_step=1000,
+    )
+    restored.load_state_dict(legacy)
+    restored_parameter.grad = torch.full((4, 3), 3.0)
+    restored.step()
+
+    assert restored.param_groups[0]["arc_start_compress_step"] == 0
+    assert restored.param_groups[0]["step"] == 2

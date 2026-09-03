@@ -23,6 +23,7 @@ class ArcTopKHyperparameters(train.Hyperparameters):
     arc_projection_rank: int = 4
     arc_eta: float = 0.1
     arc_seed: int = 42
+    arc_start_compress_step: int = 1000
 
 
 def configure_arc_topk_parser(parser: argparse.ArgumentParser) -> None:
@@ -32,6 +33,7 @@ def configure_arc_topk_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--arc_projection_rank", type=int, default=None)
     parser.add_argument("--arc_eta", type=float, default=None)
     parser.add_argument("--arc_seed", type=int, default=None)
+    parser.add_argument("--arc_start_compress_step", type=int, default=None)
 
 
 def init_arc_topk_optimizer(
@@ -76,6 +78,7 @@ def init_arc_topk_optimizer(
     train.print0(f"ARC-TopK ratio: {hp.arc_topk_ratio}")
     train.print0(f"ARC projection rank: {hp.arc_projection_rank}")
     train.print0(f"EF21M eta: {hp.arc_eta}")
+    train.print0(f"ARC compression starts after step: {hp.arc_start_compress_step}")
     train.print0(f"Muon LR adjust method: {hp.adjust_lr}")
     train.print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
 
@@ -94,6 +97,7 @@ def init_arc_topk_optimizer(
         arc_projection_rank=hp.arc_projection_rank,
         arc_eta=hp.arc_eta,
         arc_seed=hp.arc_seed,
+        arc_start_compress_step=hp.arc_start_compress_step,
     )
 
 

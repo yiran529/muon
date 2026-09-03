@@ -128,3 +128,58 @@ def test_arc_topk_two_rank_collectives(case, ratio):
         nprocs=2,
         join=True,
     )
+
+
+def _initialization_worker(rank: int, world_size: int, port: int) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        gradient = _gradient_for_case(rank, "different")
+        tracker = torch.zeros_like(gradient)
+        local_estimate = torch.zeros_like(gradient)
+        global_estimate = torch.zeros_like(gradient)
+        result = {}
+
+        def task():
+            result["gradients"] = yield from arc_topk_ef21m_async(
+                gradients=[gradient],
+                trackers=[tracker],
+                local_estimates=[local_estimate],
+                global_estimates=[global_estimate],
+                process_group=dist.group.WORLD,
+                ratio=0.25,
+                projection_rank=2,
+                eta=0.1,
+                base_seed=19,
+                step=1,
+                task_index=0,
+                start_compress_step=1000,
+            )
+
+        AsyncRuntime(iter([AsyncTask(task())]), max_concurrent_tasks=1).run()
+
+        expected_global = (
+            _gradient_for_case(0, "different")
+            + _gradient_for_case(1, "different")
+        ) / 2
+        torch.testing.assert_close(tracker, gradient)
+        torch.testing.assert_close(local_estimate, gradient)
+        torch.testing.assert_close(global_estimate, expected_global)
+        torch.testing.assert_close(result["gradients"][0], expected_global)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_first_step_dense_initialization_across_two_ranks():
+    mp.spawn(
+        _initialization_worker,
+        args=(2, _free_port()),
+        nprocs=2,
+        join=True,
+    )
