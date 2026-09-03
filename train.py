@@ -88,7 +88,7 @@ def print0(*args):
         print(*args)
 
 
-def parse_cli_args():
+def parse_cli_args(configure_parser=None):
     # --- Command-line argument parsing ---
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -210,6 +210,9 @@ def parse_cli_args():
     parser.add_argument(
         "--use_gram_newton_schulz", action="store_true", help="Use Gram Newton-Schulz for orthogonalization"
     )
+
+    if configure_parser is not None:
+        configure_parser(parser)
 
     cli_args = parser.parse_args()
     if cli_args.config:
@@ -692,11 +695,15 @@ class CheckpointManager:
         dist.barrier()
 
 
-def main():
+def main(
+    hyperparameters_factory=Hyperparameters,
+    optimizer_factory=init_optimizer,
+    configure_parser=None,
+):
     torch._dynamo.config.cache_size_limit = 100
     # --- Parse command line arguments and set hyperparams ---
-    cli_args = parse_cli_args()
-    hp = Hyperparameters()
+    cli_args = parse_cli_args(configure_parser=configure_parser)
+    hp = hyperparameters_factory()
     hp = override_args_from_cli(hp, cli_args)
 
     if hp.checkpoint_freq > 0:
@@ -841,7 +848,7 @@ def main():
     print0(f"Scalar optimizer: {hp.scalar_opt}")
     print0(f"Base learning rate: {hp.lr}")
 
-    optimizer = init_optimizer(
+    optimizer = optimizer_factory(
         model=raw_model,
         device_mesh=device_mesh,
         ddp_model=model if isinstance(model, DDP) else None,
