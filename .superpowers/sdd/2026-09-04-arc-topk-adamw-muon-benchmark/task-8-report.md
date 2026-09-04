@@ -50,3 +50,6 @@ Free disk at launch was `67,082,040 KB` (about 64 GB). A concurrent `nvidia-smi`
 - Profile retry naming now detects an existing rank-0 trace and chooses a retry summary/trace pair, so a valid trace cannot be overwritten.
 - Fresh checks: shell syntax, Python compilation, whitespace check, strict invalid-artifact rejection, corrected-event emission, and dry-run all passed. The dry-run emitted no torchrun processes and retained the required rotated order.
 - The original live outputs already used the intended three launches per timing repetition; resume will not add replacement attempts for invalid Muon-dense repetitions.
+- Additional bounded-state fix: completion now requires both `timing_valid` and `profile_valid` for every corrected formal ID and rejects any cell with invalid/failed/OOM/skipped history; per-model partial manifests classify each cell as `completed`, `skipped`, `oom`, `invalid`, or `pending`.
+- Final fix checks: `bash -n`, validator `py_compile`, `git diff --check`, strict rejection of a Muon-dense artifact (exit 2), outside-repository `--dry-run` (exit 0), corrected supersession events (24), and no retry JSONs were observed.
+- Resumed status log: `artifacts/compressed_muon/scale-to-1b-status-20260904T224243+0800.log`; at the latest check CM006b GPT-350M timing-r1 was running after valid CM004/CM005 outputs were reused.
