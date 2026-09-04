@@ -327,3 +327,90 @@ CM001 没有观察到端到端加速；在当前单机 4 卡、162M 模型、大
 - ARC-TopK 产物：`artifacts/compressed_muon/CM001-m001-gpt160m-ddp-ws4-s42/`
 - dense baseline 产物：`artifacts/compressed_muon/trial-baseline-gpt160m-ddp-ws4-wandb/`
 - W&B：ARC-TopK `21qkn1do`；dense baseline `hpo9y2w4`
+
+## 2026-09-04：CM002/CM003 60M ARC-TopK AdamW/Muon formal benchmark
+
+### 目的、假设与执行口径
+
+本次实验比较相同 60M GPT DDP 工作负载下 AdamW/Muon 的 dense 与 ARC-TopK 路径，分别覆盖正常 NCCL 和 `NCCL_P2P_DISABLE=1`、`NCCL_SHM_DISABLE=0` 的通信受限环境。假设是：ARC-TopK 对矩阵梯度使用相同的 sketch、Top-K、EF21M 和 selected-values collective，因此 AdamW 与 Muon 应有近似的理论梯度载荷缩减；实际梯度通信时间和完整 step 是否相近则由 profiler/timing 直接测量。
+
+代码与配置：benchmark metadata 的 commit 为 `78d36f0e3bee4c25dba0901c38ad86d717cad759`，核心 benchmark/optimizer code gate commit 为 `a55103d`；BF16，gpt60m（64,094,208 parameters），world size 4，local batch 1，sequence length 256，gradient accumulation 1，seed 42，ARC ratio 0.2、projection rank 4、eta 0.1、compression start 0。每次 timing 为 fresh process、20 warmup + 100 measured steps；CM002a–d 与 CM003a/c/d 各 3 次，CM003b AdamW ARC 因初始 CV 超过 5% 增加 fresh r4/r5，共 5 次。Profiler 与 timing 分离，每个 cell 独立执行 3 次严格 3 wait + 3 warmup + 5 active schedule，共 24 次；不将 profiler step 样本混入 timing 均值。
+
+八个正式实验 ID 为：`CM002a-adamw-dense-gpt60m-ddp-ws4-s42`、`CM002b-m001-adamw-arc-gpt60m-ddp-ws4-s42`、`CM002c-muon-dense-gpt60m-ddp-ws4-s42`、`CM002d-m001-muon-arc-gpt60m-ddp-ws4-s42`、`CM003a-adamw-dense-gpt60m-ddp-ws4-s42`、`CM003b-m001-adamw-arc-gpt60m-ddp-ws4-s42`、`CM003c-muon-dense-gpt60m-ddp-ws4-s42`、`CM003d-m001-muon-arc-gpt60m-ddp-ws4-s42`。所有运行固定 GPU 2–5：GPU 2 `GPU-e6622753-895a-f8fc-6082-ac71bbfa0037`、GPU 3 `GPU-f7d3c0fb-aed7-235f-7332-68966b63e0c5`、GPU 4 `GPU-0bc7caf4-d72c-c6b9-a9c1-60d2ff5779c4`、GPU 5 `GPU-76169292-9c3b-c2e1-682b-bacd97a2f23c`；GPU 0/1 上的既有 PID 未触碰。CM002 timing/profiler 均 unset P2P/SHM overrides；CM003 每次均精确设置 `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=0`，formal timing 未设置 `NCCL_DEBUG`。
+
+### Raw 产物与 timing 观察
+
+Timing raw JSON 分别位于以下八个目录的 `timing-r1.json`、`timing-r2.json`、`timing-r3.json`；CM003b 另有 `timing-r4.json`、`timing-r5.json`：
+
+```text
+artifacts/compressed_muon/CM002a-adamw-dense-gpt60m-ddp-ws4-s42/
+artifacts/compressed_muon/CM002b-m001-adamw-arc-gpt60m-ddp-ws4-s42/
+artifacts/compressed_muon/CM002c-muon-dense-gpt60m-ddp-ws4-s42/
+artifacts/compressed_muon/CM002d-m001-muon-arc-gpt60m-ddp-ws4-s42/
+artifacts/compressed_muon/CM003a-adamw-dense-gpt60m-ddp-ws4-s42/
+artifacts/compressed_muon/CM003b-m001-adamw-arc-gpt60m-ddp-ws4-s42/
+artifacts/compressed_muon/CM003c-muon-dense-gpt60m-ddp-ws4-s42/
+artifacts/compressed_muon/CM003d-m001-muon-arc-gpt60m-ddp-ws4-s42/
+```
+
+下表的 fwd/bwd、optimizer、step、throughput、显存均来自 timing JSON；均值和 CV 是独立 process repeat 之间的统计。Profiler 的 NCCL 与 exposed 列见下一节，exposed 明确是 trace-derived estimate。
+
+| cell | timing repeats | fwd/bwd ms | optimizer ms | full step ms（CV） | tokens/s | peak alloc/reserved MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| CM002a AdamW dense normal | 3 | 16.897965 | 3.001526 | 19.900334（3.4660%） | 51498.410969 | 884.261882 / 2946.000000 |
+| CM002b AdamW ARC normal | 3 | 1.847274 | 17.084153 | 18.887576（3.9705%） | 54271.415678 | 965.814941 / 1192.000000 |
+| CM002c Muon dense normal | 3 | 16.550148 | 2.906673 | 19.422119（3.9470%） | 52779.005873 | 858.805501 / 2957.333333 |
+| CM002d Muon ARC normal | 3 | 1.860179 | 18.876050 | 20.703583（0.7448%） | 49461.871843 | 861.803223 / 1096.000000 |
+| CM003a AdamW dense P2P-disabled | 3 | 16.663302 | 3.000105 | 19.663192（4.4407%） | 52147.293332 | 884.553548 / 2946.000000 |
+| CM003b AdamW ARC P2P-disabled | 5 | 1.873306 | 15.746766 | 17.553639（**6.3068%**） | 58509.270036 | 965.814941 / 1192.000000 |
+| CM003c Muon dense P2P-disabled | 3 | 17.955371 | 2.901864 | 20.822211（3.8273%） | 49225.346761 | 858.805501 / 2957.333333 |
+| CM003d Muon ARC P2P-disabled | 3 | 1.864635 | 19.166942 | 21.001396（1.8032%） | 48769.164195 | 861.803223 / 1096.000000 |
+
+所有 26 个 timing launch 均为 exit 0；finite loss/parameters、四 rank parameter checksum agreement、collective signature agreement 和相关 observer bytes 检查均通过。CM003b 的 5 次 step means 原始值为 `16.770048, 17.128663, 19.471452, 17.497559, 16.900475 ms`；追加 r4/r5 后仍超过预先约定的 5% CV gate，因此没有删除 outlier 或继续运行。
+
+### 通信 bytes、collective 与 profiler 观察
+
+Timing JSON 的 logical per-step communication bytes 在所有对应 cell 中一致：dense 为 `dense_gradient=128188416` bytes；ARC 为 `arc_seed=24`、`arc_sketch=147456`、`arc_selected_values=5054464`、`uncompressed=103022592` bytes。Profiler active 5 steps 的 observer aggregate 与 trace `message_bytes` 一致：dense `ddp_gradient` 为 `640942080` bytes、10 kernels；ARC `arc_seed` 为 `120` bytes/15 kernels，`arc_sketch` 为 `737280`/15，`arc_selected_values` 为 `25272320`/15，`arc_dense_uncompressed` 为 `515112960`/10；Muon ARC 另有 `muon_result` 为 `31457280`/15。对应的 collective message size/aggregate bytes 和 category 在 24 份 profiler summary 中全部匹配，未出现 `unattributed`。
+
+Profiler summary 的 NCCL 总 kernel 时间、gradient subset 时间和 exposed 时间（每项为 3 次 profiler 的 mean，单位 ms）如下；gradient subset 对 ARC 只包括 seed/sketch/selected/dense-uncompressed，不把 Muon result collective 计入梯度通信：
+
+| optimizer/transport | dense NCCL / gradient | ARC NCCL / gradient | dense exposed | ARC exposed |
+|---|---:|---:|---:|---:|
+| AdamW normal | 67.445109 / 67.445109 | 87.346332 / 87.346332 | 59.985469 | 82.194081 |
+| Muon normal | 72.341463 / 72.341463 | 88.641753 / 72.741819 | 65.448999 | 80.635589 |
+| AdamW P2P-disabled | 73.587885 / 73.587885 | 70.650401 / 70.650401 | 66.767080 | 67.238248 |
+| Muon P2P-disabled | 72.957913 / 72.957913 | 73.929255 / 65.005935 | 65.971962 | 67.847936 |
+
+`exposed` 不是独立端到端计时，而是 profiler trace 中 NCCL union 减去与非 NCCL compute union 的重叠所得估计。Profiler 的 trace raw paths 对每个 cell 均为 `artifacts/compressed_muon/<experiment-id>/profiler/profile-r1-rank0.json`、`profile-r2-rank0.json`、`profile-r3-rank0.json`，summary paths 为同目录的 `profile-r1-summary.json` 至 `profile-r3-summary.json`；24 个 summary 和 24 个 rank-0 full trace 均保留。一次性 profiler launcher 为 `artifacts/compressed_muon/formal_profile_launcher.sh`。
+
+下表为 profiler active trace 中各 named range 的 3 次 trace aggregate mean（单位 ms；每个值是该 trace 的 5 active steps 合计，不应与 timing JSON 的未加 profiler fwd/bwd/optimizer 样本混同）：
+
+| ARC cell | fwd/bwd | optimizer | projection | Top-K | selected-values range | EF21M | Newton–Schulz | Muon result range |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| CM002b AdamW normal | 72.630477 | 49.964263 | 1.815897 | 2.413674 | 3.264076 | 2.349721 | 不适用 | 不适用 |
+| CM002d Muon normal | 73.843712 | 74.481387 | 1.825061 | 2.666384 | 3.162141 | 2.153707 | 21.624165 | 3.847616 |
+| CM003b AdamW P2P-disabled | 74.402554 | 45.050390 | 1.872287 | 2.838119 | 3.291741 | 2.372291 | 不适用 | 不适用 |
+| CM003d Muon P2P-disabled | 75.466137 | 72.105939 | 1.828947 | 2.900010 | 3.170042 | 2.145668 | 21.866812 | 3.986063 |
+
+### Summary、observations 与 inference
+
+四份机械 summary 为 `artifacts/compressed_muon/cm002-adamw-summary.json`、`cm002-muon-summary.json`、`cm003-adamw-summary.json`、`cm003-muon-summary.json`。其中 CM003 AdamW summary 使用 dense r1–r3 和 ARC r1–r5；其他 cell 使用各自 r1–r3。结果为：
+
+- `R_bytes=0.1557386`，AdamW 与 Muon 相同。这是 logical gradient communication bytes 的观察，符合预注册的“理论 byte reduction 近似相同”规则。
+- normal AdamW：`R_grad_comm=-0.2951`、`R_step=0.0509`；normal Muon：`R_grad_comm=-0.00553`、`R_step=-0.06598`。
+- P2P-disabled AdamW：`R_grad_comm=0.03992`、`R_step=0.10728`，但 ARC timing CV 为 `6.3068%`，不能视作稳定 wall-clock 结果。P2P-disabled Muon：`R_grad_comm=0.10899`、`R_step=-0.00861`。
+- P2P-disabled 下 AdamW/Muon 的 `R_grad_comm` 差异约 6.91 个百分点，超过预注册的 5 个百分点规则；加上 AdamW ARC timing 不稳定，不能认定两种 optimizer 获得相近的实际通信收益。
+- wall-clock 观察也不支持两者都获得稳定正收益：Muon 的两个 transport `R_step` 均非正；AdamW normal 收益约 5.09%，P2P-disabled 的约 10.73% 受 CV gate 拒绝。上述是本 synthetic microbenchmark 的 observations，不是对优化器或方法的普遍结论。
+
+`R_bytes` 与 profiler gradient/NCCL time 的对应关系不能直接推出完整 step 加速；ARC projection、Top-K、EF21M、更多 collective、Muon Newton–Schulz、不可压缩张量和 overlap 都可能改变 wall-clock。trace exposed time 只是重叠推断，不能替代独立端到端通信计时。该 synthetic 100-step benchmark 不证明 convergence、time-to-quality 或最终模型质量。
+
+### Scale-up 决策与限制
+
+按预注册 scale gate，只有八个 60M cells correctness/required metrics 齐全且所有 timing CV ≤5% 才能扩展到 130M；CM003b 即使追加两次 fresh repeat 仍为 6.3068%，所以本轮不扩展到 130M、350M 或 1B。`docs/compressed_muon/RESULTS.md` 未更新，等待稳定证据。正式实验登记已将 7 个稳定 cell 标为 `completed`，CM003b 标为 `stopped`（运行成功但 comparison gate failed）。
+
+### 关联产物
+
+- Task 6 执行报告：`.superpowers/sdd/2026-09-04-arc-topk-adamw-muon-benchmark/task-6-execution-report.md`
+- Task 6/7 ledger：`.superpowers/sdd/2026-09-04-arc-topk-adamw-muon-benchmark/progress.md`
+- 实验登记：`docs/compressed_muon/EXPERIMENTS.md`
+- timing/profiler raw：`artifacts/compressed_muon/CM002a-adamw-dense-gpt60m-ddp-ws4-s42/` 至 `CM003d-m001-muon-arc-gpt60m-ddp-ws4-s42/`
