@@ -53,3 +53,12 @@ Free disk at launch was `67,082,040 KB` (about 64 GB). A concurrent `nvidia-smi`
 - Additional bounded-state fix: completion now requires both `timing_valid` and `profile_valid` for every corrected formal ID and rejects any cell with invalid/failed/OOM/skipped history; per-model partial manifests classify each cell as `completed`, `skipped`, `oom`, `invalid`, or `pending`.
 - Final fix checks: `bash -n`, validator `py_compile`, `git diff --check`, strict rejection of a Muon-dense artifact (exit 2), outside-repository `--dry-run` (exit 0), corrected supersession events (24), and no retry JSONs were observed.
 - Resumed status log: `artifacts/compressed_muon/scale-to-1b-status-20260904T224243+0800.log`; at the latest check CM006b GPT-350M timing-r1 was running after valid CM004/CM005 outputs were reused.
+
+## Review round 2 fix (2026-09-04)
+
+- Paused only `m001_arc_topk_scale_to_1b` while fixing manifest migration; no other process was stopped.
+- Reworked `reconcile_manifest` to independently ensure all 24 exact corrected `planned` IDs and to add each exact stale-ID → corrected-ID `superseded` mapping at most once. Removed the global superseded-event early return, so stale-only and partially reconciled manifests converge on resume. Existing raw artifacts and event history are preserved.
+- Added `--reconcile-only` plus `SCALE_TO_1B_ARTIFACT_ROOT`, `SCALE_TO_1B_MANIFEST`, and `SCALE_TO_1B_STATUS_LOG` overrides solely to support isolated, reproducible migration checks without touching the live manifest.
+- Focused stale-only fixture: corrected planned=24, exact superseded mappings=24, second reconciliation unchanged at 73 lines.
+- Focused partially reconciled fixture (one corrected planned row and one mapping pre-existing): corrected planned=24, exact superseded mappings=24, second reconciliation unchanged at 73 lines.
+- Live manifest reconciliation on resume will add missing corrected planned rows and exact mappings; malformed historical `superseded_id` evidence is retained.

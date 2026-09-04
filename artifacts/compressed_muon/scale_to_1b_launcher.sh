@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Serial, resumable M001 ARC-TopK scale-out through GPT-1B.
 set -u
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"; ARTIFACT_ROOT="$ROOT/artifacts/compressed_muon"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"; ARTIFACT_ROOT="${SCALE_TO_1B_ARTIFACT_ROOT:-$ROOT/artifacts/compressed_muon}"
 PYTHON="$ROOT/.venv/bin/python"; TORCHRUN="$ROOT/.venv/bin/torchrun"; GPUS="2,3,4,5"; RUN_TAG="$(date +%Y%m%dT%H%M%S%z)"
-MANIFEST="$ARTIFACT_ROOT/scale-to-1b-manifest.jsonl"; STATUS_LOG="$ARTIFACT_ROOT/scale-to-1b-status-$RUN_TAG.log"; VALIDATOR="$ARTIFACT_ROOT/validate_scale_to_1b.py"; DRY_RUN=0
+MANIFEST="${SCALE_TO_1B_MANIFEST:-$ARTIFACT_ROOT/scale-to-1b-manifest.jsonl}"; STATUS_LOG="${SCALE_TO_1B_STATUS_LOG:-$ARTIFACT_ROOT/scale-to-1b-status-$RUN_TAG.log}"; VALIDATOR="$ARTIFACT_ROOT/validate_scale_to_1b.py"; DRY_RUN=0; RECONCILE_ONLY=0
 MODELS=(gpt130m gpt350m gpt1b); TRANSPORTS=(normal p2p_disabled)
 cd "$ROOT" || exit 2
 
@@ -18,13 +18,36 @@ init_manifest() {
     for suffix in a b c d; do case "$suffix" in a) id="${base}a-adamw-dense-$model-ddp-ws4-s42";; b) id="${base}b-m001-adamw-arc-$model-ddp-ws4-s42";; c) id="${base}c-muon-dense-$model-ddp-ws4-s42";; d) id="${base}d-m001-muon-arc-$model-ddp-ws4-s42";; esac; event event planned id "$id" model "$model" transport "$transport"; done
   done; done
 }
+manifest_has() {
+  "$PYTHON" -c 'import json,sys; path,event,key,value=sys.argv[1:]; found=False
+for line in open(path):
+    if not line.strip(): continue
+    row=json.loads(line)
+    if row.get("event")==event and row.get(key)==value: found=True; break
+print("1" if found else "0")' "$MANIFEST" "$1" "$2" "$3" | grep -qx 1
+}
+manifest_has_id() {
+  "$PYTHON" -c 'import json,sys; path,value=sys.argv[1:]; found=False
+for line in open(path):
+    if not line.strip(): continue
+    row=json.loads(line)
+    if row.get("id")==value or row.get("stale_id")==value: found=True; break
+print("1" if found else "0")' "$MANIFEST" "$1" | grep -qx 1
+}
 reconcile_manifest() {
-  local marker="$ARTIFACT_ROOT/scale-to-1b-manifest-reconciled"
-  grep -Fq '"event": "superseded"' "$MANIFEST" && return
-  for old in CM004-a CM004-b CM004-c CM004-d CM005-a CM005-b CM005-c CM005-d CM006-a CM006-b CM006-c CM006-d CM007-a CM007-b CM007-c CM007-d CM008-a CM008-b CM008-c CM008-d CM009-a CM009-b CM009-c CM009-d; do
-    if grep -Fq "\"id\": \"$old-" "$MANIFEST"; then event event superseded id "${old}-..." corrected_id "${old/-/}..." reason "corrected suffix mapping"; fi
-  done
-  : > "$marker"
+  local model transport suffix corrected stale
+  # Run every mapping on every resume. Each exact event is checked independently,
+  # so an interrupted/partially reconciled manifest converges without duplicates.
+  for model in "${MODELS[@]}"; do for transport in "${TRANSPORTS[@]}"; do for suffix in a b c d; do
+    corrected="$(cell_id "$model" "$transport" "$suffix")"
+    stale="${corrected:0:5}-${corrected:5}"
+    if ! manifest_has planned id "$corrected"; then
+      event event planned id "$corrected" model "$model" transport "$transport"
+    fi
+    if manifest_has_id "$stale" && ! manifest_has superseded stale_id "$stale"; then
+      event event superseded stale_id "$stale" corrected_id "$corrected" reason "corrected suffix mapping"
+    fi
+  done; done; done
 }
 cell_event() { event event cell id "$1" status "$2" path "${3:-}" message "${4:-}"; }
 oom_sentinel() { printf '%s/scale-to-1b-oom-%s-%s' "$ARTIFACT_ROOT" "$1" "$2"; }
@@ -131,8 +154,8 @@ finalize_state() {
 }
 
 main() {
-  while [[ "$#" -gt 0 ]]; do case "$1" in --dry-run) DRY_RUN=1;; --resume) :;; *) echo "unknown argument: $1" >&2; return 2;; esac; shift; done
-  init_manifest; reconcile_manifest; event event launcher status running status_log "$STATUS_LOG"; [[ "$DRY_RUN" == 1 ]] && { log "DRY-RUN requested"; run_matrix timing gpt130m normal; run_matrix profile gpt130m normal; return 0; }
+  while [[ "$#" -gt 0 ]]; do case "$1" in --dry-run) DRY_RUN=1;; --resume) :;; --reconcile-only) RECONCILE_ONLY=1;; *) echo "unknown argument: $1" >&2; return 2;; esac; shift; done
+  init_manifest; reconcile_manifest; [[ "$RECONCILE_ONLY" == 1 ]] && return 0; event event launcher status running status_log "$STATUS_LOG"; [[ "$DRY_RUN" == 1 ]] && { log "DRY-RUN requested"; run_matrix timing gpt130m normal; run_matrix profile gpt130m normal; return 0; }
   preflight || return $?; for model in gpt130m gpt350m; do for transport in "${TRANSPORTS[@]}"; do run_matrix timing "$model" "$transport"; done; done
   for world in 1 4; do for suffix in a b c d; do case "$suffix" in a) optimizer=adamw; sync=dense;; b) optimizer=adamw; sync=arc;; c) optimizer=muon; sync=dense;; d) optimizer=muon; sync=arc;; esac; run_probe "$optimizer" "$sync" "$world" "$suffix" || true; done; done
   for transport in "${TRANSPORTS[@]}"; do run_matrix timing gpt1b "$transport"; done; preflight || return $?; for model in "${MODELS[@]}"; do for transport in "${TRANSPORTS[@]}"; do run_matrix profile "$model" "$transport"; done; done
