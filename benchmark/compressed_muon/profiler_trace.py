@@ -48,7 +48,10 @@ def _args(event: dict[str, Any]) -> dict[str, Any]:
 
 def _correlation(event: dict[str, Any]):
     args = _args(event)
-    for key in ("correlation", "correlation_id", "External id", "external_id", "external id"):
+    # Kineto's GPU kernels carry both a CUDA launch correlation and the CPU
+    # record's External id. The latter is what joins record_param_comms to the
+    # kernel; synthetic/older traces may only provide correlation.
+    for key in ("External id", "external_id", "external id", "correlation", "correlation_id"):
         if key in args:
             return args[key]
         if key in event:
@@ -109,8 +112,12 @@ def _range_category(name: str) -> str | None:
 
 
 def _is_nccl(event: dict[str, Any]) -> bool:
-    text = " ".join(str(event.get(k, "")) for k in ("name", "cat", "s", "stream")).lower()
-    return "nccl" in text
+    """Return true only for GPU NCCL kernels, not CPU/GPU annotations."""
+    name = str(event.get("name", "")).lower()
+    category = str(event.get("cat", "")).lower()
+    if "nccl" not in name:
+        return False
+    return category in {"kernel", "cuda_kernel", "gpu"} or "ncclkernel" in name or "nccldevkernel" in name
 
 
 def attribute_trace(trace: Any) -> dict[str, Any]:
@@ -142,8 +149,9 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
     for event in events:
         name = str(event.get("name", "")).lower()
         corr = _correlation(event)
-        if corr is None or ("c10d" not in name and "allreduce" not in name
-                            and "allgather" not in name and "broadcast" not in name):
+        if corr is None or ("c10d" not in name and "record_param_comms" not in name
+                            and "allreduce" not in name and "allgather" not in name
+                            and "broadcast" not in name):
             continue
         parent = _args(event).get("parent_correlation", _args(event).get("parent_external_id"))
         if parent is not None and str(parent) in correlation_categories:

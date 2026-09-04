@@ -75,6 +75,27 @@ def test_parent_payload_is_counted_once_for_multiple_nccl_kernels():
     assert sketch["message_bytes"] == 30
 
 
+def test_trace_uses_record_param_comms_as_c10d_to_kernel_bridge():
+    trace = {"traceEvents": [
+        {"name": "arc/sketch", "ph": "X", "cat": "user_annotation", "pid": 1,
+         "tid": 1, "ts": 0, "dur": 100, "args": {}},
+        {"name": "c10d::allreduce_", "ph": "X", "cat": "cpu_op", "pid": 1,
+         "tid": 1, "ts": 10, "dur": 70, "args": {"External id": 21}},
+        {"name": "record_param_comms", "ph": "X", "cat": "cpu_op", "pid": 1,
+         "tid": 1, "ts": 20, "dur": 50, "args": {"External id": 22}},
+        {"name": "nccl:all_reduce", "ph": "X", "cat": "user_annotation", "pid": 1,
+         "tid": 1, "ts": 30, "dur": 20, "args": {"External id": 23}},
+        {"name": "ncclDevKernel_AllReduce", "ph": "X", "cat": "kernel", "pid": 0,
+         "tid": 9, "ts": 200, "dur": 5, "args": {"External id": 22}},
+        {"name": "nccl:all_reduce", "ph": "X", "cat": "gpu_user_annotation", "pid": 0,
+         "tid": 9, "ts": 200, "dur": 5, "args": {"External id": 23}},
+    ]}
+    result = attribute_trace(trace)
+    assert result["nccl_kernel_time_ms"] == pytest.approx(0.005)
+    assert result["collectives"][0]["category"] == "arc_sketch"
+    assert result["collectives"][0]["kernel_count"] == 1
+
+
 def test_gradient_comm_excludes_local_ef21m_math():
     from tests.test_benchmark_arc_2x2 import _config
 
@@ -140,3 +161,16 @@ def test_observer_can_record_full_tensor_list_payload():
     event = observer.events[0]
     assert event.numel == 5 and event.bytes == 20
     assert aggregate_observed(observer)[0]["numel"] == 5
+
+
+def test_observed_payloads_enrich_trace_categories():
+    trace_summary = {"collectives": [
+        {"category": "arc_sketch", "message_bytes": 0},
+        {"category": "muon_result", "message_bytes": 0},
+    ]}
+    observed = [
+        {"category": "arc/sketch", "bytes": 123},
+        {"category": "muon/result_collective", "bytes": 456},
+    ]
+    bench.merge_observed_message_bytes(trace_summary, observed)
+    assert [x["message_bytes"] for x in trace_summary["collectives"]] == [123, 456]

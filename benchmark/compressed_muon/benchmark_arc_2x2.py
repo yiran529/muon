@@ -435,7 +435,8 @@ def _run_steps(model, optimizer, batches, config, ddp_model=None, measure=False)
     return fwd_samples, opt_samples, step_samples, last_loss
 
 
-def run_profiler(model, optimizer, batches, config, *, ddp_model=None, output=None):
+def run_profiler(model, optimizer, batches, config, *, ddp_model=None, output=None,
+                 observer: CollectiveObserver | None = None):
     """Capture exactly 3 wait, 3 warmup, and 5 active profiler steps."""
     if not torch.cuda.is_available():
         raise RuntimeError("profiler execution requires CUDA")
@@ -456,7 +457,7 @@ def run_profiler(model, optimizer, batches, config, *, ddp_model=None, output=No
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
         schedule=schedule, on_trace_ready=on_trace_ready, record_shapes=False,
     ) as prof:
-        for tokens, targets in batches[:11]:
+        for step_index, (tokens, targets) in enumerate(batches[:11]):
             context = sync_context(config, ddp_model)
             with context:
                 with record_function("benchmark/forward_backward"):
@@ -465,6 +466,12 @@ def run_profiler(model, optimizer, batches, config, *, ddp_model=None, output=No
                     last_loss = loss.detach()
             with record_function("benchmark/optimizer"):
                 optimizer.step(); optimizer.zero_grad(set_to_none=True)
+            # Drain wait/warmup work before the profiler enters its active
+            # window so kernels from step 6 cannot spill into step 7's trace.
+            if step_index == 5:
+                torch.cuda.synchronize()
+                if observer is not None:
+                    observer.events.clear()
             prof.step()
     run_profiler.last_loss = last_loss
     return trace_path
@@ -491,21 +498,45 @@ def run_profile_mode(config: BenchmarkConfig) -> dict[str, Any]:
     batches = [(torch.randint(0, 50304, (config.local_batch, config.sequence_length), device=device),
                 torch.randint(0, 50304, (config.local_batch, config.sequence_length), device=device)) for _ in range(11)]
     with observer_scope(observer):
-        trace_path = run_profiler(ddp_model, optimizer, batches, config, ddp_model=ddp_model)
+        trace_path = run_profiler(
+            ddp_model, optimizer, batches, config, ddp_model=ddp_model,
+            observer=observer,
+        )
     result = build_result_skeleton(config)
     raw = _raw_model(ddp_model); compressed, uncompressed = _optimizer_parameters(raw)
     result["communication"] = communication_result(config, group_parameters_by_shape_dtype(compressed), uncompressed)
     result["profiler"]["trace_path"] = trace_path
-    result["profiler"]["observed_collectives"] = aggregate_observed(observer)
+    observed_collectives = aggregate_observed(observer)
+    result["profiler"]["observed_collectives"] = observed_collectives
     result["correctness"] = _correctness(ddp_model, config, getattr(run_profiler, "last_loss", None), observer)
     if rank == 0:
         from benchmark.compressed_muon.profiler_trace import attribute_trace
         trace_summary = attribute_trace(trace_path)
+        merge_observed_message_bytes(trace_summary, observed_collectives)
         result["profiler"].update(trace_summary)
         if config.output:
             Path(config.output).parent.mkdir(parents=True, exist_ok=True)
             Path(config.output).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return result
+
+
+def merge_observed_message_bytes(trace_summary: dict[str, Any], observed: list[dict[str, Any]]) -> None:
+    """Attach active-window logical payloads to trace-derived categories."""
+    category_names = {
+        "ddp_gradient": "ddp_gradient",
+        "arc/seed": "arc_seed",
+        "arc/sketch": "arc_sketch",
+        "arc/selected_values": "arc_selected_values",
+        "arc/dense_uncompressed": "arc_dense_uncompressed",
+        "muon/result_collective": "muon_result",
+    }
+    payloads = {
+        category_names[item["category"]]: int(item["bytes"])
+        for item in observed if item["category"] in category_names
+    }
+    for item in trace_summary.get("collectives", []):
+        if item["category"] in payloads:
+            item["message_bytes"] = payloads[item["category"]]
 
 
 class _nullcontext:
