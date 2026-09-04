@@ -1,11 +1,14 @@
 """Single-process tests for ARC-TopK-EF21M-Muon integration."""
 
 import copy
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from dion import ArcTopKMuon
+import dion.muon_arctopk as muon_arctopk_module
+from dion.arc_topk_sync import ArcTopKSyncConfig
 
 
 def _identity_orthogonalizer(x, epsilon=None):
@@ -45,6 +48,54 @@ def test_arc_topk_muon_prepopulates_full_state():
     for name in ("arc_h_local", "arc_g_local", "arc_g_global"):
         assert state[name].shape == parameter.shape
         assert torch.count_nonzero(state[name]).item() == 0
+
+
+def test_arc_topk_muon_routes_sync_through_shared_adapter():
+    first = torch.nn.Parameter(torch.zeros(4, 3))
+    second = torch.nn.Parameter(torch.zeros(2, 3))
+    first_sentinel = torch.full_like(first, 2.5)
+    second_sentinel = torch.full_like(second, -3.5)
+    calls = []
+
+    def fake_synchronize(**kwargs):
+        calls.append(kwargs)
+        yield
+        return [
+            first_sentinel if kwargs["task_index"] == 0 else second_sentinel,
+        ]
+
+    optimizer = ArcTopKMuon(
+        [{"params": [first]}, {"params": [second]}],
+        arc_topk_ratio=0.2,
+        arc_projection_rank=4,
+        arc_eta=0.1,
+        arc_seed=42,
+        arc_start_compress_step=0,
+        lr=0.125,
+        mu=0.0,
+        weight_decay=0.0,
+        nesterov=False,
+        adjust_lr=None,
+        newton_schulz_func=_identity_orthogonalizer,
+    )
+    first.grad = torch.ones_like(first)
+    second.grad = torch.ones_like(second)
+
+    with patch.object(
+        muon_arctopk_module,
+        "synchronize_arc_batch_async",
+        fake_synchronize,
+        create=True,
+    ):
+        optimizer.step()
+
+    assert [call["task_index"] for call in calls] == [0, 1]
+    assert all(
+        call["config"] == ArcTopKSyncConfig(0.2, 4, 0.1, 42, 0)
+        for call in calls
+    )
+    torch.testing.assert_close(optimizer.state[first]["momentum"], first_sentinel)
+    torch.testing.assert_close(optimizer.state[second]["momentum"], second_sentinel)
 
 
 @pytest.mark.parametrize(

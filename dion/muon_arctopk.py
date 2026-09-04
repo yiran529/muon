@@ -1,14 +1,20 @@
 """DDP-only Muon with complete ARC-TopK and EF21M gradient synchronization."""
 
 import torch
-from collections import defaultdict
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh
 from torch.optim.optimizer import ParamsT
-from typing import Callable, Generator, List, Optional, Tuple, Union
+from typing import Callable, Generator, List, Optional, Union
 
-from .arc_topk import arc_topk_ef21m_async, validate_arc_topk_config
+from .arc_topk import validate_arc_topk_config
+from .arc_topk_sync import (
+    ArcTopKSyncConfig,
+    average_gradients_async,
+    group_parameters_by_shape_dtype,
+    initialize_arc_state_,
+    synchronize_arc_batch_async,
+)
 from .megabatch_base import (
     adjust_lr_rms_norm,
     adjust_lr_spectral_norm,
@@ -71,9 +77,7 @@ class ArcTopKMuon(Muon):
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
         state = super()._get_or_initialize_state(param, algo)
         if algo == "muon":
-            state.setdefault("arc_h_local", torch.zeros_like(param))
-            state.setdefault("arc_g_local", torch.zeros_like(param))
-            state.setdefault("arc_g_global", torch.zeros_like(param))
+            initialize_arc_state_(state, param)
         return state
 
     def load_state_dict(self, state_dict):
@@ -93,24 +97,20 @@ class ArcTopKMuon(Muon):
             if not all(p.ndim == 2 for p in group["params"]):
                 raise ValueError("ArcTopKMuon only supports 2D matrix parameters")
 
-            shape_groups: dict[tuple, list[Tensor]] = defaultdict(list)
-            for param in group["params"]:
-                shape_groups[(param.shape, param.dtype)].append(param)
-
-            for params in shape_groups.values():
-                gradients = [
-                    p.grad if p.grad is not None else torch.zeros_like(p)
-                    for p in params
-                ]
+            for params in group_parameters_by_shape_dtype(group["params"]):
                 states = [self._get_or_initialize_state(p, "muon") for p in params]
+                sync_config = ArcTopKSyncConfig(
+                    ratio=group["arc_topk_ratio"],
+                    projection_rank=group["arc_projection_rank"],
+                    eta=group["arc_eta"],
+                    seed=group["arc_seed"],
+                    start_compress_step=group["arc_start_compress_step"],
+                )
                 yield AsyncTask(
                     arc_topk_muon_update_megabatch_async(
                         X=params,
-                        G=gradients,
                         M=[state["momentum"] for state in states],
-                        H=[state["arc_h_local"] for state in states],
-                        G_local=[state["arc_g_local"] for state in states],
-                        G_global=[state["arc_g_global"] for state in states],
+                        states=states,
                         lr=group["lr"],
                         momentum=torch.tensor(group["mu"]),
                         weight_decay=as_scalar_tensor(group["weight_decay"]),
@@ -122,13 +122,9 @@ class ArcTopKMuon(Muon):
                         process_group=self._process_group,
                         newton_schulz_func=self._newton_schulz_func,
                         cautious_wd=group["cautious_wd"],
-                        arc_topk_ratio=group["arc_topk_ratio"],
-                        arc_projection_rank=group["arc_projection_rank"],
-                        arc_eta=group["arc_eta"],
-                        arc_seed=group["arc_seed"],
+                        sync_config=sync_config,
                         step=group["step"],
                         task_index=task_index,
-                        start_compress_step=group["arc_start_compress_step"],
                     )
                 )
                 task_index += 1
@@ -191,11 +187,8 @@ class ArcTopKMuon(Muon):
 
 def arc_topk_muon_update_megabatch_async(
     X: List[Tensor],
-    G: List[Tensor],
     M: List[Tensor],
-    H: List[Tensor],
-    G_local: List[Tensor],
-    G_global: List[Tensor],
+    states: List[dict],
     lr: Tensor,
     momentum: Tensor,
     weight_decay: Tensor,
@@ -207,27 +200,17 @@ def arc_topk_muon_update_megabatch_async(
     process_group: Optional[ProcessGroup],
     newton_schulz_func: Callable,
     cautious_wd: bool,
-    arc_topk_ratio: float,
-    arc_projection_rank: int,
-    arc_eta: float,
-    arc_seed: int,
+    sync_config: ArcTopKSyncConfig,
     step: int,
     task_index: int,
-    start_compress_step: int,
 ) -> Generator[None, None, None]:
-    synchronized_gradients = yield from arc_topk_ef21m_async(
-        gradients=G,
-        trackers=H,
-        local_estimates=G_local,
-        global_estimates=G_global,
+    synchronized_gradients = yield from synchronize_arc_batch_async(
+        params=X,
+        states=states,
         process_group=process_group,
-        ratio=arc_topk_ratio,
-        projection_rank=arc_projection_rank,
-        eta=arc_eta,
-        base_seed=arc_seed,
+        config=sync_config,
         step=step,
         task_index=task_index,
-        start_compress_step=start_compress_step,
     )
 
     updates = muon_update_pre_orthogonalize(
@@ -267,29 +250,6 @@ def arc_topk_muon_update_megabatch_async(
     )
 
 
-def _average_gradients_async(
-    gradients: List[Tensor],
-    process_group: Optional[ProcessGroup],
-) -> Generator[None, None, List[Tensor]]:
-    averaged = [gradient.clone() for gradient in gradients]
-    if process_group is None:
-        return averaged
-    world_size = torch.distributed.get_world_size(process_group)
-    if world_size == 1:
-        return averaged
-    for gradient in averaged:
-        work = torch.distributed.all_reduce(
-            gradient,
-            op=torch.distributed.ReduceOp.SUM,
-            group=process_group,
-            async_op=True,
-        )
-        yield
-        work.wait()
-        gradient.div_(world_size)
-    return averaged
-
-
 def _lion_update_allreduce_async(
     X: List[Tensor],
     G: List[Tensor],
@@ -301,7 +261,7 @@ def _lion_update_allreduce_async(
     cautious_wd: bool,
     process_group: Optional[ProcessGroup],
 ) -> Generator[None, None, None]:
-    averaged = yield from _average_gradients_async(G, process_group)
+    averaged = yield from average_gradients_async(G, process_group)
     yield from lion_update_foreach_async(
         X,
         averaged,
@@ -328,7 +288,7 @@ def _adamw_update_allreduce_async(
     cautious_wd: bool,
     process_group: Optional[ProcessGroup],
 ) -> Generator[None, None, None]:
-    averaged = yield from _average_gradients_async(G, process_group)
+    averaged = yield from average_gradients_async(G, process_group)
     yield from adamw_update_foreach_async(
         X,
         averaged,
