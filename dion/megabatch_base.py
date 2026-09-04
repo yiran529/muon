@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
 from collections import defaultdict
 from itertools import chain
 from torch import Tensor
@@ -790,9 +791,10 @@ def megabatch_orthogonalize_async(
         )
 
         output_chunks = [torch.empty_like(c) for c in input_chunks]
-        work = dist.all_to_all(
-            output_chunks, input_chunks, group=process_group, async_op=True
-        )
+        with record_function("muon/result_collective"):
+            work = dist.all_to_all(
+                output_chunks, input_chunks, group=process_group, async_op=True
+            )
         yield
         work.wait()
 
@@ -813,9 +815,10 @@ def megabatch_orthogonalize_async(
         ]
 
         recv_chunks = [torch.empty_like(c) for c in split_chunks]
-        work = dist.all_to_all(
-            recv_chunks, split_chunks, group=process_group, async_op=True
-        )
+        with record_function("muon/result_collective"):
+            work = dist.all_to_all(
+                recv_chunks, split_chunks, group=process_group, async_op=True
+            )
         yield
         work.wait()
 
@@ -847,9 +850,10 @@ def megabatch_orthogonalize_async(
         )
 
         all_chunks = [torch.empty_like(my_matrices) for _ in range(world_size)]
-        work = dist.all_gather(
-            all_chunks, my_matrices.contiguous(), group=process_group, async_op=True
-        )
+        with record_function("muon/result_collective"):
+            work = dist.all_gather(
+                all_chunks, my_matrices.contiguous(), group=process_group, async_op=True
+            )
         yield
         work.wait()
 
@@ -895,9 +899,10 @@ def muon_update_newton_schulz(
     """
     if split_sizes is not None:
         assert not flatten, "split_sizes is incompatible with flatten=True"
-        return _newton_schulz_row_blocks(
-            X, split_sizes, split_scales, newton_schulz_func, epsilon
-        )
+        with record_function("muon/newton_schulz"):
+            return _newton_schulz_row_blocks(
+                X, split_sizes, split_scales, newton_schulz_func, epsilon
+            )
 
     original_shape = X.shape
     if flatten and X.ndim >= 3:
@@ -905,7 +910,8 @@ def muon_update_newton_schulz(
     elif X.ndim >= 4:
         X = X.flatten(end_dim=-3)
 
-    return newton_schulz_func(X, epsilon=epsilon).reshape(original_shape)
+    with record_function("muon/newton_schulz"):
+        return newton_schulz_func(X, epsilon=epsilon).reshape(original_shape)
 
 
 def _newton_schulz_row_blocks(

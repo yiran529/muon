@@ -5,6 +5,7 @@ from typing import Generator, List, Optional
 
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
@@ -155,10 +156,11 @@ def arc_topk_ef21m_async(
     local_estimate_batch = torch.stack(local_estimates)
     global_estimate_batch = torch.stack(global_estimates)
 
-    if step == 1:
-        tracker_batch.copy_(gradient_batch)
-    else:
-        ef21m_update_tracker_(tracker_batch, gradient_batch, eta)
+    with record_function("arc/ef21m"):
+        if step == 1:
+            tracker_batch.copy_(gradient_batch)
+        else:
+            ef21m_update_tracker_(tracker_batch, gradient_batch, eta)
 
     world_size = dist.get_world_size(process_group) if process_group is not None else 1
     if step == 1 or step <= start_compress_step:
@@ -203,15 +205,16 @@ def arc_topk_ef21m_async(
 
     delta_batch = tracker_batch - local_estimate_batch
     rows, columns = shape
-    projection = make_gaussian_projection(
-        count,
-        columns,
-        projection_rank,
-        seed=synchronized_seed,
-        device=gradient_batch.device,
-        dtype=gradient_batch.dtype,
-    )
-    global_sketch = arc_topk_local_sketch(delta_batch, projection)
+    with record_function("arc/projection"):
+        projection = make_gaussian_projection(
+            count,
+            columns,
+            projection_rank,
+            seed=synchronized_seed,
+            device=gradient_batch.device,
+            dtype=gradient_batch.dtype,
+        )
+        global_sketch = arc_topk_local_sketch(delta_batch, projection)
     if process_group is not None and world_size > 1:
         work = dist.all_reduce(
             global_sketch,
@@ -224,8 +227,10 @@ def arc_topk_ef21m_async(
         global_sketch.div_(world_size)
 
     k = math.ceil(ratio * rows)
-    indices = arc_topk_support(global_sketch, k)
-    local_selected = gather_rows(delta_batch, indices)
+    with record_function("arc/topk"):
+        indices = arc_topk_support(global_sketch, k)
+    with record_function("arc/selected_values"):
+        local_selected = gather_rows(delta_batch, indices)
     averaged_selected = local_selected.clone()
     if process_group is not None and world_size > 1:
         work = dist.all_reduce(
@@ -240,12 +245,13 @@ def arc_topk_ef21m_async(
 
     local_compressed = scatter_rows(local_selected, indices, rows)
     averaged_compressed = scatter_rows(averaged_selected, indices, rows)
-    ef21m_apply_delta_(
-        local_estimate_batch,
-        global_estimate_batch,
-        local_compressed,
-        averaged_compressed,
-    )
+    with record_function("arc/ef21m"):
+        ef21m_apply_delta_(
+            local_estimate_batch,
+            global_estimate_batch,
+            local_compressed,
+            averaged_compressed,
+        )
 
     torch._foreach_copy_(trackers, list(tracker_batch.unbind(0)))
     torch._foreach_copy_(local_estimates, list(local_estimate_batch.unbind(0)))
