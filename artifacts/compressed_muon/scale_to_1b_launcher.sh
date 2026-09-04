@@ -34,6 +34,14 @@ for line in open(path):
     if row.get("id")==value or row.get("stale_id")==value: found=True; break
 print("1" if found else "0")' "$MANIFEST" "$1" | grep -qx 1
 }
+manifest_has_supersession() {
+  "$PYTHON" -c 'import json,sys; path,stale,corrected=sys.argv[1:]; found=False
+for line in open(path):
+    if not line.strip(): continue
+    row=json.loads(line)
+    if row.get("event") in {"superseded", "superseded_id"} and (row.get("stale_id")==stale or row.get("id")==stale) and row.get("corrected_id")==corrected: found=True; break
+print("1" if found else "0")' "$MANIFEST" "$1" "$2" | grep -qx 1
+}
 reconcile_manifest() {
   local model transport suffix corrected stale
   # Run every mapping on every resume. Each exact event is checked independently,
@@ -44,7 +52,7 @@ reconcile_manifest() {
     if ! manifest_has planned id "$corrected"; then
       event event planned id "$corrected" model "$model" transport "$transport"
     fi
-    if manifest_has_id "$stale" && ! manifest_has superseded stale_id "$stale"; then
+    if manifest_has_id "$stale" && ! manifest_has_supersession "$stale" "$corrected"; then
       event event superseded stale_id "$stale" corrected_id "$corrected" reason "corrected suffix mapping"
     fi
   done; done; done

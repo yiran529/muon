@@ -62,3 +62,10 @@ Free disk at launch was `67,082,040 KB` (about 64 GB). A concurrent `nvidia-smi`
 - Focused stale-only fixture: corrected planned=24, exact superseded mappings=24, second reconciliation unchanged at 73 lines.
 - Focused partially reconciled fixture (one corrected planned row and one mapping pre-existing): corrected planned=24, exact superseded mappings=24, second reconciliation unchanged at 73 lines.
 - Live manifest reconciliation on resume will add missing corrected planned rows and exact mappings; malformed historical `superseded_id` evidence is retained.
+
+## Review round 3 fix (2026-09-04)
+
+- Left the running `m001_arc_topk_scale_to_1b` tmux/GPU job untouched.
+- Supersession deduplication now recognizes an exact legacy event with `id=<stale ID>` as well as the canonical `stale_id=<stale ID>`, while requiring the matching exact `corrected_id`; missing canonical mappings are still appended.
+- Legacy-ID fixture check: 24 corrected planned rows and 24 existing legacy mappings were preserved, no duplicate canonical mappings were added, and the second reconciliation was unchanged at 73 lines.
+- `bash -n` and `git diff --check` passed.
