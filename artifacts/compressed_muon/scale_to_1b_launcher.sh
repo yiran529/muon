@@ -2,7 +2,7 @@
 # Serial, resumable M001 ARC-TopK scale-out through GPT-1B.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"; ARTIFACT_ROOT="${SCALE_TO_1B_ARTIFACT_ROOT:-$ROOT/artifacts/compressed_muon}"
-PYTHON="$ROOT/.venv/bin/python"; TORCHRUN="$ROOT/.venv/bin/torchrun"; GPUS="2,3,4,5"; RUN_TAG="$(date +%Y%m%dT%H%M%S%z)"
+PYTHON="${SCALE_TO_1B_PYTHON:-$ROOT/.venv/bin/python}"; TORCHRUN="${SCALE_TO_1B_TORCHRUN:-$ROOT/.venv/bin/torchrun}"; GPUS="2,3,4,5"; RUN_TAG="$(date +%Y%m%dT%H%M%S%z)"
 MANIFEST="${SCALE_TO_1B_MANIFEST:-$ARTIFACT_ROOT/scale-to-1b-manifest.jsonl}"; STATUS_LOG="${SCALE_TO_1B_STATUS_LOG:-$ARTIFACT_ROOT/scale-to-1b-status-$RUN_TAG.log}"; VALIDATOR="$ARTIFACT_ROOT/validate_scale_to_1b.py"; DRY_RUN=0; RECONCILE_ONLY=0
 MODELS=(gpt130m gpt350m gpt1b); TRANSPORTS=(normal p2p_disabled)
 cd "$ROOT" || exit 2
@@ -65,10 +65,67 @@ write_partial() {
   local model="$1" output="$ARTIFACT_ROOT/${model}-partial.json"
   "$PYTHON" -c 'import json,sys; out,model,manifest=sys.argv[1:]; events=[json.loads(x) for x in open(manifest) if x.strip()]; rows={}; [rows.setdefault(e.get("id"),[]).append(e) for e in events if e.get("event")=="cell" and model in e.get("id","") and e.get("id","")[5:6] != "-"]; classes={};
 for k,v in rows.items():
-    statuses={e.get("status") for e in v}; classes[k]="invalid" if statuses & {"invalid","failed"} else "oom" if "oom" in statuses else "skipped" if "skipped" in statuses else "completed" if {"timing_valid","profile_valid"} <= statuses else "pending"
+    statuses={e.get("status") for e in v}; classes[k]="oom" if "oom" in statuses else "skipped" if "skipped" in statuses else "failed" if "failed" in statuses else "completed" if {"timing_valid","profile_valid"} <= statuses else "invalid" if "invalid" in statuses else "pending"
 json.dump({"schema_version":1,"model":model,"status":"partial" if any(x != "completed" for x in classes.values()) else "completed","status_counts":{s:list(classes.values()).count(s) for s in sorted(set(classes.values()))},"cells":rows,"classification":classes},open(out,"w"),indent=2); open(out,"a").write("\n")' "$output" "$model" "$MANIFEST"
 }
 attempt_marker() { printf '%s/.%s-r%s-attempted' "$2" "$1" "$3"; }
+attempt_interrupted() { printf '%s/.%s-r%s-interrupted' "$2" "$1" "$3"; }
+attempt_resume_marker() { printf '%s/.%s-r%s-resume-attempted' "$2" "$1" "$3"; }
+attempt_terminal() { printf '%s/.%s-r%s-terminal' "$2" "$1" "$3"; }
+attempt_event() { event event attempt id "$1" kind "$2" rep "$3" status "$4" path "${5:-}" message "${6:-}"; }
+record_terminal() {
+  local id="$1" kind="$2" rep="$3" dir="$4" status="$5" message="${6:-}" path
+  path="$(attempt_terminal "$kind" "$dir" "$rep")"
+  [[ -e "$path" ]] || printf '%s\n' "$status" > "$path"
+  attempt_event "$id" "$kind" "$rep" "$status" "$path" "$message"
+}
+
+ACTIVE_ID=""; ACTIVE_KIND=""; ACTIVE_REP=""; ACTIVE_DIR=""; ACTIVE_OUTPUT=""; CONTROLLER_INTERRUPTED=0
+controller_interrupted() {
+  CONTROLLER_INTERRUPTED=1
+  if [[ -n "$ACTIVE_ID" ]]; then
+    local marker
+    marker="$(attempt_interrupted "$ACTIVE_KIND" "$ACTIVE_DIR" "$ACTIVE_REP")"
+    if [[ ! -e "$marker" ]]; then
+      printf '%s\n' "controller-interrupted" > "$marker"
+      attempt_event "$ACTIVE_ID" "$ACTIVE_KIND" "$ACTIVE_REP" interrupted "$marker" "controller interrupted before a completed result"
+    fi
+  fi
+}
+trap controller_interrupted INT TERM HUP
+
+prepare_attempt() {
+  local id="$1" kind="$2" rep="$3" dir="$4" marker terminal interrupted resume base retry_glob
+  marker="$(attempt_marker "$kind" "$dir" "$rep")"; terminal="$(attempt_terminal "$kind" "$dir" "$rep")"
+  interrupted="$(attempt_interrupted "$kind" "$dir" "$rep")"; resume="$(attempt_resume_marker "$kind" "$dir" "$rep")"
+  [[ "$kind" == timing ]] && base="$dir/timing-r${rep}.json" || base="$dir/profiler/profile-r${rep}-summary.json"
+  [[ "$kind" == timing ]] && retry_glob="$dir/timing-r${rep}-retry-"* || retry_glob="$dir/profiler/profile-r${rep}-summary-retry-"*
+  if [[ -e "$terminal" ]]; then
+    log "SKIP $id $kind-r$rep terminal outcome=$(head -n 1 "$terminal")"
+    return 1
+  fi
+  if [[ -e "$interrupted" ]]; then
+    if [[ "$DRY_RUN" == 1 ]]; then
+      log "DRY-RUN $id $kind-r$rep would resume controller-interrupted attempt once"
+      return 0
+    fi
+    if [[ -e "$resume" ]]; then
+      record_terminal "$id" "$kind" "$rep" "$dir" invalid "interrupted retry already consumed; no further retry"
+      cell_event "$id" invalid "$base" "interrupted retry already consumed; no retry"
+      return 1
+    fi
+    : > "$resume"
+    attempt_event "$id" "$kind" "$rep" resuming "$resume" "resuming controller-interrupted attempt exactly once"
+    return 0
+  fi
+  if [[ -e "$marker" || -e "$base" ]] || compgen -G "$retry_glob" > /dev/null; then
+    [[ "$DRY_RUN" == 1 ]] && { log "DRY-RUN $id $kind-r$rep terminal orphan would not retry"; return 1; }
+    record_terminal "$id" "$kind" "$rep" "$dir" invalid "existing launched attempt has no resumable interruption; no retry"
+    cell_event "$id" invalid "$base" "existing launched attempt failed validation; no retry"
+    return 1
+  fi
+  return 0
+}
 
 preflight() {
   local info selected disk_avail
@@ -101,10 +158,14 @@ new_path() { local kind="$1" id="$2" rep="$3" dir base trace; dir="$(cell_dir "$
 remember_command() { local dir="$1" cmd="$2"; touch "$dir/command.txt"; grep -Fqx -- "$cmd" "$dir/command.txt" || printf '%s\n' "$cmd" >> "$dir/command.txt"; }
 
 run_one() {
-  local id="$1" optimizer="$2" sync="$3" kind="$4" rep="$5" dir="$6" output="$7" command="$8" out="$dir/.${kind}-r${rep}-${RUN_TAG}.stdout" err="$dir/.${kind}-r${rep}-${RUN_TAG}.stderr" rc
+  local id="$1" optimizer="$2" sync="$3" kind="$4" rep="$5" dir="$6" output="$7" command="$8" out err rc
+  out="$dir/.${kind}-r${rep}-${RUN_TAG}.stdout"; err="$dir/.${kind}-r${rep}-${RUN_TAG}.stderr"
   remember_command "$dir" "$command"; log "START $id $kind-r$rep"; [[ "$DRY_RUN" == 1 ]] && { log "DRY-RUN $command"; return 0; }
+  ACTIVE_ID="$id"; ACTIVE_KIND="$kind"; ACTIVE_REP="$rep"; ACTIVE_DIR="$dir"; ACTIVE_OUTPUT="$output"; CONTROLLER_INTERRUPTED=0
   bash -c "$command" > "$out" 2> "$err"; rc=$?; cat "$out" >> "$dir/stdout.log"; cat "$err" >> "$dir/stderr.log"
-  if [[ "$rc" != 0 ]]; then if grep -Eiq 'CUDA out of memory|out of memory|cuda error: out of memory' "$out" "$err"; then record_oom "$optimizer" "$sync"; cell_event "$id" oom "$output" "actual CUDA OOM during $kind-r$rep"; else cell_event "$id" failed "$output" "$kind-r$rep exit=$rc"; log "FAIL $id $kind-r$rep exit=$rc"; fi; return "$rc"; fi
+  if [[ "$CONTROLLER_INTERRUPTED" == 1 ]]; then ACTIVE_ID=""; ACTIVE_KIND=""; ACTIVE_REP=""; ACTIVE_DIR=""; ACTIVE_OUTPUT=""; return 130; fi
+  ACTIVE_ID=""; ACTIVE_KIND=""; ACTIVE_REP=""; ACTIVE_DIR=""; ACTIVE_OUTPUT=""
+  if [[ "$rc" != 0 ]]; then if grep -Eiq 'CUDA out of memory|out of memory|cuda error: out of memory' "$out" "$err"; then record_oom "$optimizer" "$sync"; record_terminal "$id" "$kind" "$rep" "$dir" oom "actual CUDA OOM during $kind-r$rep"; cell_event "$id" oom "$output" "actual CUDA OOM during $kind-r$rep"; else record_terminal "$id" "$kind" "$rep" "$dir" failed "$kind-r$rep exit=$rc"; cell_event "$id" failed "$output" "$kind-r$rep exit=$rc"; log "FAIL $id $kind-r$rep exit=$rc"; fi; return "$rc"; fi
   log "END $id $kind-r$rep exit=0"; return 0
 }
 
@@ -113,25 +174,25 @@ run_timing() {
   dir="$(cell_dir "$id")"; write_metadata "$id" "$optimizer" "$sync" "$model" "$transport"
   if mode_oom "$optimizer" "$sync"; then cell_event "$id" skipped "" "corresponding mode OOM"; return; fi
   if existing="$(find_valid timing "$id" "$optimizer" "$sync" "$model" "$transport" "$rep")"; then cell_event "$id" timing_valid "$existing" reused; log "SKIP $id timing-r$rep already valid"; return; fi
-  if [[ -e "$(attempt_marker timing "$dir" "$rep")" || -e "$dir/timing-r${rep}.json" || -e "$dir/timing-r${rep}-retry-"* ]]; then : > "$(attempt_marker timing "$dir" "$rep")"; cell_event "$id" invalid "$dir/timing-r${rep}.json" "existing launched attempt failed validation; no retry"; return; fi
+  prepare_attempt "$id" timing "$rep" "$dir" || return
   output="$(new_path timing "$id" "$rep")"; [[ "$transport" == p2p_disabled ]] && prefix="env -u NCCL_DEBUG CUDA_VISIBLE_DEVICES=$GPUS NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=0" || prefix="env -u NCCL_DEBUG -u NCCL_P2P_DISABLE -u NCCL_SHM_DISABLE CUDA_VISIBLE_DEVICES=$GPUS"
   [[ "$DRY_RUN" == 0 ]] && : > "$(attempt_marker timing "$dir" "$rep")"
-  command="$prefix $TORCHRUN --standalone --nproc-per-node=4 --module benchmark.compressed_muon.benchmark_arc_2x2 --experiment-id $id --optimizer $optimizer --sync $sync --model $model --warmup-steps 20 --measure-steps 100 --seed 42 --world-size 4 --local-batch 1 --sequence-length 256 --gradient-accumulation 1 --transport $transport --no-compile-model --output $output"; run_one "$id" "$optimizer" "$sync" timing "$rep" "$dir" "$output" "$command"; rc=$?; if [[ "$DRY_RUN" == 0 && "$rc" == 0 ]]; then if [[ ! -s "$output" ]]; then cell_event "$id" invalid "$output" "successful launch produced no JSON"; elif valid_timing "$output" "$id" "$optimizer" "$sync" "$model" "$transport"; then cell_event "$id" timing_valid "$output"; else cell_event "$id" invalid "$output" "timing JSON failed validation; no retry"; fi; fi
+  command="$prefix $TORCHRUN --standalone --nproc-per-node=4 --module benchmark.compressed_muon.benchmark_arc_2x2 --experiment-id $id --optimizer $optimizer --sync $sync --model $model --warmup-steps 20 --measure-steps 100 --seed 42 --world-size 4 --local-batch 1 --sequence-length 256 --gradient-accumulation 1 --transport $transport --no-compile-model --output $output"; run_one "$id" "$optimizer" "$sync" timing "$rep" "$dir" "$output" "$command"; rc=$?; [[ "$CONTROLLER_INTERRUPTED" == 1 ]] && return "$rc"; if [[ "$DRY_RUN" == 0 && "$rc" == 0 ]]; then if [[ ! -s "$output" ]]; then record_terminal "$id" timing "$rep" "$dir" invalid "successful launch produced no JSON"; cell_event "$id" invalid "$output" "successful launch produced no JSON"; elif valid_timing "$output" "$id" "$optimizer" "$sync" "$model" "$transport"; then record_terminal "$id" timing "$rep" "$dir" completed; cell_event "$id" timing_valid "$output"; else record_terminal "$id" timing "$rep" "$dir" invalid "timing JSON failed validation; no retry"; cell_event "$id" invalid "$output" "timing JSON failed validation; no retry"; fi; fi
 }
 run_profile() {
   local id="$1" optimizer="$2" sync="$3" model="$4" transport="$5" rep="$6" dir output trace prefix command existing rc
   dir="$(cell_dir "$id")"; write_metadata "$id" "$optimizer" "$sync" "$model" "$transport"
   if mode_oom "$optimizer" "$sync"; then cell_event "$id" skipped "" "corresponding mode OOM"; return; fi
   if existing="$(find_valid profile "$id" "$optimizer" "$sync" "$model" "$transport" "$rep")"; then cell_event "$id" profile_valid "$existing" reused; log "SKIP $id profile-r$rep already valid"; return; fi
-  if [[ -e "$(attempt_marker profile "$dir" "$rep")" || -e "$dir/profiler/profile-r${rep}-summary.json" || -e "$dir/profiler/profile-r${rep}-summary-retry-"* ]]; then cell_event "$id" invalid "$dir/profiler/profile-r${rep}-summary.json" "existing launched attempt failed validation; no retry"; return; fi
+  prepare_attempt "$id" profile "$rep" "$dir" || return
   output="$(new_path profile "$id" "$rep")"; trace="${output%-summary.json}-rank0.json"; [[ "$transport" == p2p_disabled ]] && prefix="env -u NCCL_DEBUG CUDA_VISIBLE_DEVICES=$GPUS NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=0" || prefix="env -u NCCL_DEBUG -u NCCL_P2P_DISABLE -u NCCL_SHM_DISABLE CUDA_VISIBLE_DEVICES=$GPUS"
   [[ "$DRY_RUN" == 0 ]] && : > "$(attempt_marker profile "$dir" "$rep")"
-  command="$prefix $TORCHRUN --standalone --nproc-per-node=4 --module benchmark.compressed_muon.benchmark_arc_2x2 --experiment-id $id --optimizer $optimizer --sync $sync --model $model --warmup-steps 3 --measure-steps 5 --smoke --profile --seed 42 --world-size 4 --local-batch 1 --sequence-length 256 --gradient-accumulation 1 --transport $transport --output $output --profile-output $trace"; run_one "$id" "$optimizer" "$sync" profile "$rep" "$dir" "$output" "$command"; rc=$?; if [[ "$DRY_RUN" == 0 && "$rc" == 0 ]]; then if [[ ! -s "$output" ]]; then cell_event "$id" invalid "$output" "successful launch produced no profiler JSON"; elif valid_profile "$output" "$id" "$optimizer" "$sync" "$model" "$transport"; then cell_event "$id" profile_valid "$output"; else cell_event "$id" invalid "$output" "profiler JSON failed validation; no retry"; fi; fi
+  command="$prefix $TORCHRUN --standalone --nproc-per-node=4 --module benchmark.compressed_muon.benchmark_arc_2x2 --experiment-id $id --optimizer $optimizer --sync $sync --model $model --warmup-steps 3 --measure-steps 5 --smoke --profile --seed 42 --world-size 4 --local-batch 1 --sequence-length 256 --gradient-accumulation 1 --transport $transport --output $output --profile-output $trace"; run_one "$id" "$optimizer" "$sync" profile "$rep" "$dir" "$output" "$command"; rc=$?; [[ "$CONTROLLER_INTERRUPTED" == 1 ]] && return "$rc"; if [[ "$DRY_RUN" == 0 && "$rc" == 0 ]]; then if [[ ! -s "$output" ]]; then record_terminal "$id" profile "$rep" "$dir" invalid "successful launch produced no profiler JSON"; cell_event "$id" invalid "$output" "successful launch produced no profiler JSON"; elif valid_profile "$output" "$id" "$optimizer" "$sync" "$model" "$transport"; then record_terminal "$id" profile "$rep" "$dir" completed; cell_event "$id" profile_valid "$output"; else record_terminal "$id" profile "$rep" "$dir" invalid "profiler JSON failed validation; no retry"; cell_event "$id" invalid "$output" "profiler JSON failed validation; no retry"; fi; fi
 }
 
 cell_id() { local model="$1" transport="$2" suffix="$3" base; [[ "$transport" == normal ]] && case "$model" in gpt130m) base=CM004;; gpt350m) base=CM006;; gpt1b) base=CM008;; esac || case "$model" in gpt130m) base=CM005;; gpt350m) base=CM007;; gpt1b) base=CM009;; esac; case "$suffix" in a) echo "${base}a-adamw-dense-$model-ddp-ws4-s42";; b) echo "${base}b-m001-adamw-arc-$model-ddp-ws4-s42";; c) echo "${base}c-muon-dense-$model-ddp-ws4-s42";; d) echo "${base}d-m001-muon-arc-$model-ddp-ws4-s42";; esac; }
 run_matrix() {
-  local kind="$1" model="$2" transport="$3" rep suffix id optimizer sync; for rep in 1 2 3; do case "$rep" in 1) order=(a b c d);; 2) order=(d c b a);; 3) order=(b c d a);; esac; for suffix in "${order[@]}"; do id="$(cell_id "$model" "$transport" "$suffix")"; case "$suffix" in a) optimizer=adamw; sync=dense;; b) optimizer=adamw; sync=arc;; c) optimizer=muon; sync=dense;; d) optimizer=muon; sync=arc;; esac; [[ "$kind" == timing ]] && run_timing "$id" "$optimizer" "$sync" "$model" "$transport" "$rep" || run_profile "$id" "$optimizer" "$sync" "$model" "$transport" "$rep"; done; done
+  local kind="$1" model="$2" transport="$3" rep suffix id optimizer sync rc; for rep in 1 2 3; do case "$rep" in 1) order=(a b c d);; 2) order=(d c b a);; 3) order=(b c d a);; esac; for suffix in "${order[@]}"; do id="$(cell_id "$model" "$transport" "$suffix")"; case "$suffix" in a) optimizer=adamw; sync=dense;; b) optimizer=adamw; sync=arc;; c) optimizer=muon; sync=dense;; d) optimizer=muon; sync=arc;; esac; if [[ "$kind" == timing ]]; then run_timing "$id" "$optimizer" "$sync" "$model" "$transport" "$rep" || { rc=$?; [[ "$CONTROLLER_INTERRUPTED" == 1 ]] && return "$rc"; }; else run_profile "$id" "$optimizer" "$sync" "$model" "$transport" "$rep" || { rc=$?; [[ "$CONTROLLER_INTERRUPTED" == 1 ]] && return "$rc"; }; fi; done; done
 }
 
 run_probe() {
@@ -157,17 +218,17 @@ make_comparison() { local model="$1" optimizer="$2" output="$ARTIFACT_ROOT/${mod
 finalize_state() {
   local state
   for model in "${MODELS[@]}"; do write_partial "$model"; done
-  state="$($PYTHON -c 'import json,sys; planned=[json.loads(x).get("id") for x in open(sys.argv[1]) if x.strip() and json.loads(x).get("event")=="planned"]; events=[json.loads(x) for x in open(sys.argv[1]) if x.strip()]; rows={}; [rows.setdefault(e.get("id"),set()).add(e.get("status")) for e in events if e.get("event")=="cell"]; ids=[x for x in planned if x and x[5:6] != "-"]; print("completed" if len(ids)==24 and all({"timing_valid","profile_valid"} <= rows.get(x,set()) and not rows.get(x,set()) & {"invalid","failed","oom","skipped"} for x in ids) else "partial")' "$MANIFEST")"
+  state="$($PYTHON -c 'import json,sys; planned=[json.loads(x).get("id") for x in open(sys.argv[1]) if x.strip() and json.loads(x).get("event")=="planned"]; events=[json.loads(x) for x in open(sys.argv[1]) if x.strip()]; rows={}; [rows.setdefault(e.get("id"),set()).add(e.get("status")) for e in events if e.get("event")=="cell"]; ids=[x for x in planned if x and x[5:6] != "-"]; print("completed" if len(ids)==24 and all({"timing_valid","profile_valid"} <= rows.get(x,set()) and not rows.get(x,set()) & {"failed","oom","skipped"} for x in ids) else "partial")' "$MANIFEST")"
   event event launcher status "$state"; [[ "$state" == completed ]] && { : > "$ARTIFACT_ROOT/scale-to-1b-complete"; log "COMPLETE scale-out launcher"; } || log "PARTIAL scale-out launcher: see per-model partial manifests"
 }
 
 main() {
   while [[ "$#" -gt 0 ]]; do case "$1" in --dry-run) DRY_RUN=1;; --resume) :;; --reconcile-only) RECONCILE_ONLY=1;; *) echo "unknown argument: $1" >&2; return 2;; esac; shift; done
   init_manifest; reconcile_manifest; [[ "$RECONCILE_ONLY" == 1 ]] && return 0; event event launcher status running status_log "$STATUS_LOG"; [[ "$DRY_RUN" == 1 ]] && { log "DRY-RUN requested"; run_matrix timing gpt130m normal; run_matrix profile gpt130m normal; return 0; }
-  preflight || return $?; for model in gpt130m gpt350m; do for transport in "${TRANSPORTS[@]}"; do run_matrix timing "$model" "$transport"; done; done
+  preflight || return $?; for model in gpt130m gpt350m; do for transport in "${TRANSPORTS[@]}"; do run_matrix timing "$model" "$transport" || { local rc=$?; [[ "$CONTROLLER_INTERRUPTED" == 1 ]] && return "$rc"; }; done; done
   for world in 1 4; do for suffix in a b c d; do case "$suffix" in a) optimizer=adamw; sync=dense;; b) optimizer=adamw; sync=arc;; c) optimizer=muon; sync=dense;; d) optimizer=muon; sync=arc;; esac; run_probe "$optimizer" "$sync" "$world" "$suffix" || true; done; done
-  for transport in "${TRANSPORTS[@]}"; do run_matrix timing gpt1b "$transport"; done; preflight || return $?; for model in "${MODELS[@]}"; do for transport in "${TRANSPORTS[@]}"; do run_matrix profile "$model" "$transport"; done; done
+  for transport in "${TRANSPORTS[@]}"; do run_matrix timing gpt1b "$transport" || { local rc=$?; [[ "$CONTROLLER_INTERRUPTED" == 1 ]] && return "$rc"; }; done; preflight || return $?; for model in "${MODELS[@]}"; do for transport in "${TRANSPORTS[@]}"; do run_matrix profile "$model" "$transport" || { local rc=$?; [[ "$CONTROLLER_INTERRUPTED" == 1 ]] && return "$rc"; }; done; done
   for model in "${MODELS[@]}"; do for optimizer in adamw muon; do for transport in "${TRANSPORTS[@]}"; do make_summary "$model" "$optimizer" "$transport"; done; make_comparison "$model" "$optimizer"; done; done
   finalize_state; event event launcher finished_at "$(date -Is)"
 }
-main "$@"
+[[ "${SCALE_TO_1B_SOURCE_ONLY:-0}" == 1 ]] || main "$@"

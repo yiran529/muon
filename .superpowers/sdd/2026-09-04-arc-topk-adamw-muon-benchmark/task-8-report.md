@@ -69,3 +69,11 @@ Free disk at launch was `67,082,040 KB` (about 64 GB). A concurrent `nvidia-smi`
 - Supersession deduplication now recognizes an exact legacy event with `id=<stale ID>` as well as the canonical `stale_id=<stale ID>`, while requiring the matching exact `corrected_id`; missing canonical mappings are still appended.
 - Legacy-ID fixture check: 24 corrected planned rows and 24 existing legacy mappings were preserved, no duplicate canonical mappings were added, and the second reconciliation was unchanged at 73 lines.
 - `bash -n` and `git diff --check` passed.
+
+## Review round 4 fix: bounded interrupted-attempt recovery (2026-09-04)
+
+- Diagnosed `CM006b-m001-adamw-arc-gpt350m-ddp-ws4-s42`: `timing-r1.json` and `timing-r2.json` are present and valid; `.timing-r3-attempted` is present; the timestamped r3 stdout and `stdout.log` are empty; r3 stderr contains only torchrun startup warnings; `timing-r3.json` and retry JSONs are absent; the manifest contains the historical `invalid` event emitted by the pre-fix resume, but no terminal attempt outcome.
+- Added explicit per-repetition attempt state: controller signals write an `interrupted` sentinel/event; the next resume consumes a separate `resume-attempted` sentinel exactly once; process failures, CUDA OOMs, successful invalid output, and successful valid output write immutable terminal outcome sentinels/events. Unknown orphaned markers remain terminal invalid and are never retried.
+- Valid resumed output uses the existing safe output allocator, preserving timestamped stdout/stderr and any partial JSON/trace instead of overwriting evidence. Historical invalid events are tolerated only when the interrupted recovery later supplies valid timing/profile results; failed/OOM/skipped outcomes still prevent completion.
+- Seeded the diagnosed artifact with `.timing-r3-interrupted` from the verified no-result/controller-interruption evidence. No launcher, torchrun, tmux session, or GPU process was started or stopped.
+- Focused fixture checks cover one-time interrupted recovery, bounded non-OOM process failure, and orphaned-marker terminalization; shell syntax, Python compilation, and whitespace checks pass.
