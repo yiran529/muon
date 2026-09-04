@@ -43,3 +43,12 @@
   时补零初始化；AsyncRuntime 并发上限固定为 3。
 - Review focused verification：本地 19 passed；两 rank Gloo 1 passed（最小
   loopback socket 权限）；`git diff --check` 和 Python 编译检查通过。
+
+## Review round 2 修复
+
+- 将 scheduler boundary 测试改为真实消费 `AsyncRuntime` 的任务生成器，避免
+  仅构造任务而未推进 generator 的假覆盖。
+- 使用 `(4, 3), (2, 3), (4, 3)` 三个压缩参数，观察到同步器收到稳定顺序
+  `[(0, [(4, 3), (4, 3)]), (1, [(2, 3)])]`，可检测 shape 分组遗漏或
+  `task_index` 重置。
+- Round-2 focused verification：本地 19 passed；两 rank Gloo 1 passed。

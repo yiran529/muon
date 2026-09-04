@@ -171,26 +171,50 @@ def test_load_migrates_missing_or_low_precision_step_dev():
 
 
 def test_step_uses_three_way_async_runtime(monkeypatch):
-    parameter = torch.nn.Parameter(torch.zeros(4, 3))
+    first = torch.nn.Parameter(torch.zeros(4, 3))
+    second = torch.nn.Parameter(torch.zeros(2, 3))
+    repeated_shape = torch.nn.Parameter(torch.zeros(4, 3))
     optimizer = ArcTopKAdamW(
-        [{"params": [parameter], "arc_compress": True}],
+        [{"params": [first, second, repeated_shape], "arc_compress": True}],
         arc_topk_ratio=0.5,
         arc_projection_rank=2,
     )
-    parameter.grad = torch.ones_like(parameter)
+    for parameter in (first, second, repeated_shape):
+        parameter.grad = torch.ones_like(parameter)
     observed = {}
+    calls = []
 
     class RecordingRuntime:
         def __init__(self, tasks, max_concurrent_tasks):
-            observed["tasks"] = tasks
             observed["max_concurrent_tasks"] = max_concurrent_tasks
+            self._runtime = torch_opt_utils.AsyncRuntime(
+                tasks, max_concurrent_tasks=max_concurrent_tasks
+            )
 
         def run(self):
-            return None
+            return self._runtime.run()
 
+    def fake_synchronize(**kwargs):
+        # Delay recording until AsyncRuntime actually advances the task.  This
+        # ensures the test exercises task consumption, not task construction.
+        yield
+        calls.append(
+            (kwargs["task_index"], [tuple(param.shape) for param in kwargs["params"]])
+        )
+        yield
+        return [torch.zeros_like(param) for param in kwargs["params"]]
+
+    import dion.opt_utils as torch_opt_utils
+
+    monkeypatch.setattr(
+        adamw_arctopk_module,
+        "synchronize_arc_batch_async",
+        fake_synchronize,
+    )
     monkeypatch.setattr(adamw_arctopk_module, "AsyncRuntime", RecordingRuntime)
     optimizer.step()
     assert observed["max_concurrent_tasks"] == 3
+    assert calls == [(0, [(4, 3), (4, 3)]), (1, [(2, 3)])]
 
 
 def test_load_rejects_inconsistent_arc_step_across_groups():
