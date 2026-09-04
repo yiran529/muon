@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 
 _CATEGORY_NAMES = {
+    "DDP bucket All-Reduce": "ddp_gradient",
     "benchmark/forward_backward": "compute",
     "benchmark/optimizer": "optimizer",
     "arc/projection": "arc_projection",
@@ -126,6 +127,7 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
     # range and the GPU kernel. Propagate the user's category through that node
     # and its correlation/external id.
     correlation_categories = {str(r[3]): r[0] for r in ranges if r[3] is not None}
+    correlation_ranges = {str(r[3]): r[4] for r in ranges if r[3] is not None}
     for event in events:
         name = str(event.get("name", "")).lower()
         corr = _correlation(event)
@@ -135,6 +137,7 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
         parent = _args(event).get("parent_correlation", _args(event).get("parent_external_id"))
         if parent is not None and str(parent) in correlation_categories:
             correlation_categories[str(corr)] = correlation_categories[str(parent)]
+            correlation_ranges[str(corr)] = correlation_ranges.get(str(parent))
         else:
             start = float(event.get("ts", 0)); end = start + _duration(event)
             nested = [r for r in ranges if r[4].get("pid") == event.get("pid")
@@ -142,6 +145,7 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
                       and r[1] <= start and end <= r[2]]
             if nested:
                 correlation_categories[str(corr)] = min(nested, key=lambda r: r[2] - r[1])[0]
+                correlation_ranges[str(corr)] = min(nested, key=lambda r: r[2] - r[1])[4]
     groups: dict[str, dict[str, Any]] = defaultdict(lambda: {"kernel_count": 0, "duration_us": 0.0, "message_bytes": 0})
     nccl_intervals = []; compute_intervals = []
     for event in events:
@@ -156,7 +160,9 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
             item = groups[category]
             item["kernel_count"] += 1; item["duration_us"] += _duration(event)
             nccl_intervals.append((start, end))
-            metadata_ranges = candidates or [r for r in ranges if r[0] == category]
+            mapped_range = correlation_ranges.get(str(corr)) if corr is not None else None
+            metadata_ranges = candidates or ([next((r for r in ranges if r[4] is mapped_range), None)] if mapped_range is not None else [])
+            metadata_ranges = [r for r in metadata_ranges if r is not None]
             if metadata_ranges:
                 metadata = _args(metadata_ranges[-1][4])
                 item["message_bytes"] += int(next((metadata.get(k) for k in ("bytes", "message_bytes", "size_bytes", "collective_bytes") if metadata.get(k) is not None), 0) or 0)

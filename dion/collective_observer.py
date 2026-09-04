@@ -32,6 +32,10 @@ def set_active_observer(observer):
     _active_observer = observer
 
 
+def get_active_observer():
+    return _active_observer
+
+
 def observe_collective(category, operation, tensor, bytes=None):
     if _active_observer is not None:
         payload = int(tensor.numel() * tensor.element_size()) if bytes is None else int(bytes)
@@ -40,3 +44,16 @@ def observe_collective(category, operation, tensor, bytes=None):
 
 def signatures_agree(signatures):
     return bool(signatures) and all(signature == signatures[0] for signature in signatures[1:])
+
+
+def aggregate_observed(observer):
+    """Aggregate observed logical payloads without mixing them with durations."""
+    totals = {}
+    for event in observer.events:
+        key = (event.category, event.operation)
+        item = totals.setdefault(key, {"category": event.category, "operation": event.operation,
+                                       "numel": event.numel, "dtype": event.dtype,
+                                       "bytes": 0, "count": 0})
+        item["bytes"] += event.bytes
+        item["count"] += 1
+    return list(totals.values())

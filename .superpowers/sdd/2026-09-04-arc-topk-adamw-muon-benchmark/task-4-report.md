@@ -41,3 +41,13 @@ Round-1 focused verification：`71 passed, 14 warnings`（benchmark + ARC/Muon �
 - 非 profile timing 路径不再隐式 profile；profile-only 路径使用 fresh model/optimizer、固定 3 wait + 3 warmup + 5 active，并写入实际通信 metadata/signatures。
 
 Round-2 focused verification：`75 passed, 14 warnings`；compileall 与 `git diff --check` 通过。未启动正式 GPU 实验。
+
+## Round-3 修复
+
+- trace attribution 保存每个 c10d correlation 对应的 enclosing user range，消息字节从该 exact range 读取，不再按 category 取最后一个 range。
+- correctness flags 使用跨 rank MIN/AND；`_run_steps()` 的真实 loss 参与 finite-loss 判断。observer 安装封装在 try/finally scope 中，异常不会泄漏全局观察器。
+- Dense DDP comm hook 使用 SUM 后对 future value 做 world-size 平均，并增加 `DDP bucket All-Reduce` named range。
+- summarizer CLI 新增 `--profiles`，严格要求 dense/arc 两个 cell 各至少三份 timing 与 profiler 输入；新增 per-variant gradient communication 统计，缺失的通信/吞吐/显存/类别数据直接报错。
+- profile 输出保留 trace duration 与 observer 的 exact category/operation message-size aggregates 两套独立证据。
+
+Round-3 focused verification：`80 passed, 14 warnings`（benchmark 三轮测试及 ARC/Muon 回归）；compileall 与 `git diff --check` 通过。未启动正式 GPU 实验。

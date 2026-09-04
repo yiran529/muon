@@ -15,6 +15,7 @@ import re
 import statistics
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -27,7 +28,8 @@ from dion.adamw_arctopk import ArcTopKAdamW
 from dion.arc_topk_sync import ArcTopKLogicalBytes, ArcTopKSyncConfig, estimate_arc_logical_bytes, group_parameters_by_shape_dtype
 from dion.muon import Muon
 from dion.muon_arctopk import ArcTopKMuon
-from dion.collective_observer import CollectiveObserver, set_active_observer, signatures_agree, observe_collective
+from dion.collective_observer import (CollectiveObserver, aggregate_observed,
+                                      set_active_observer, signatures_agree)
 from models.gpt_model import GPT, GPTConfig
 
 MODEL_PRESETS = {
@@ -57,6 +59,7 @@ class BenchmarkConfig:
     formal: bool = True
     transport: str = "normal"
     profile_only: bool = False
+    profiles: Optional[list[str]] = None
     ratio: float = 0.2
     projection_rank: int = 4
     eta: float = 0.1
@@ -116,6 +119,7 @@ def parse_args(argv: Optional[list[str]] = None) -> BenchmarkConfig:
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--profile-output")
+    parser.add_argument("--profiles", nargs="+", help="profiler summaries associated with this timing result")
     parser.add_argument("--profile", dest="profile_only", action="store_true",
                         help="run only the independent 3+3+5 profiler schedule")
     parser.add_argument("--compile-model", dest="compile_model", action="store_true")
@@ -137,6 +141,7 @@ def parse_args(argv: Optional[list[str]] = None) -> BenchmarkConfig:
         gradient_accumulation=args.gradient_accumulation,
         formal=not args.smoke, transport=args.transport,
         profile_only=args.profile_only,
+        profiles=args.profiles,
     )
     return validate_config(config)
 
@@ -293,6 +298,26 @@ def _collective_signature(config: BenchmarkConfig) -> list[str]:
     return ["arc_seed", "arc_sketch", "arc_selected_values", "arc_dense_uncompressed"]
 
 
+def reduce_correctness_flags(finite_loss: bool, finite_parameters: bool) -> tuple[bool, bool]:
+    """Reduce correctness booleans with logical AND (MIN) across ranks."""
+    if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
+        return bool(finite_loss), bool(finite_parameters)
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    flags = torch.tensor([int(finite_loss), int(finite_parameters)], device=device)
+    dist.all_reduce(flags, op=dist.ReduceOp.MIN)
+    return bool(flags[0]), bool(flags[1])
+
+
+@contextmanager
+def observer_scope(observer):
+    """Install an observer only for the work that can emit collectives."""
+    set_active_observer(observer)
+    try:
+        yield observer
+    finally:
+        set_active_observer(None)
+
+
 def _correctness(model: torch.nn.Module, config: BenchmarkConfig, last_loss=None,
                  observer: CollectiveObserver | None = None) -> dict[str, Any]:
     params = list(_raw_model(model).parameters())
@@ -308,6 +333,7 @@ def _correctness(model: torch.nn.Module, config: BenchmarkConfig, last_loss=None
         dist.all_gather_object(checksum_values, checksum)
         checksums = checksum_values
     finite_loss = bool(last_loss is not None and torch.isfinite(last_loss).all())
+    finite_loss, finite_parameters = reduce_correctness_flags(finite_loss, finite_parameters)
     return {"finite_loss": finite_loss, "finite_parameters": finite_parameters,
             "parameter_checksum": checksum,
             "parameter_checksum_agreement": len({round(float(x), 5) for x in checksums}) == 1,
@@ -322,13 +348,15 @@ def register_dense_ddp_hook(ddp_model, observer: CollectiveObserver):
 
     def hook(state, bucket):
         buffer = bucket.buffer()
-        observer.record("ddp_gradient", "all_reduce", buffer.numel(), buffer.dtype,
-                        buffer.numel() * buffer.element_size())
-        work = dist.all_reduce(buffer, op=dist.ReduceOp.SUM, group=process_group,
-                                async_op=True)
+        with record_function("DDP bucket All-Reduce"):
+            observer.record("ddp_gradient", "all_reduce", buffer.numel(), buffer.dtype,
+                            buffer.numel() * buffer.element_size())
+            work = dist.all_reduce(buffer, op=dist.ReduceOp.SUM, group=process_group,
+                                   async_op=True)
         def average(future):
-            buffer.div_(world_size)
-            return buffer
+            value = future.value()
+            reduced = value[0] if isinstance(value, (list, tuple)) else value
+            return reduced.div(world_size)
         return work.get_future().then(average)
 
     ddp_model.register_comm_hook(None, hook)
@@ -426,17 +454,17 @@ def run_profile_mode(config: BenchmarkConfig) -> dict[str, Any]:
     observer = CollectiveObserver()
     if config.sync == "dense" and group:
         register_dense_ddp_hook(ddp_model, observer)
-    set_active_observer(observer)
     random.seed(config.seed + rank); torch.manual_seed(config.seed + rank)
     batches = [(torch.randint(0, 50304, (config.local_batch, config.sequence_length), device=device),
                 torch.randint(0, 50304, (config.local_batch, config.sequence_length), device=device)) for _ in range(11)]
-    trace_path = run_profiler(ddp_model, optimizer, batches, config, ddp_model=ddp_model)
+    with observer_scope(observer):
+        trace_path = run_profiler(ddp_model, optimizer, batches, config, ddp_model=ddp_model)
     result = build_result_skeleton(config)
     raw = _raw_model(ddp_model); compressed, uncompressed = _optimizer_parameters(raw)
     result["communication"] = communication_result(config, group_parameters_by_shape_dtype(compressed), uncompressed)
     result["profiler"]["trace_path"] = trace_path
+    result["profiler"]["observed_collectives"] = aggregate_observed(observer)
     result["correctness"] = _correctness(ddp_model, config, getattr(run_profiler, "last_loss", None), observer)
-    set_active_observer(None)
     if rank == 0:
         from benchmark.compressed_muon.profiler_trace import attribute_trace
         trace_summary = attribute_trace(trace_path)
@@ -464,7 +492,6 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
     if config.world_size > 1 and not dist.is_initialized():
         dist.init_process_group("nccl")
     group = dist.group.WORLD if dist.is_initialized() else None
-    set_active_observer(None)
     random.seed(config.seed + rank); torch.manual_seed(config.seed + rank)
     model = build_model(config, device)
     ddp_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank]) if group else model
@@ -481,11 +508,12 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
     observer = CollectiveObserver()
     if config.sync == "dense" and group:
         register_dense_ddp_hook(ddp_model, observer)
-    set_active_observer(observer)
-    _run_steps(ddp_model, optimizer, batches[:config.warmup_steps], config, ddp_model)
+    with observer_scope(observer):
+        _run_steps(ddp_model, optimizer, batches[:config.warmup_steps], config, ddp_model)
     observer.events.clear()
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats(device)
-    fwd, opt, step, last_loss = _run_steps(ddp_model, optimizer, batches[config.warmup_steps:], config, ddp_model, True)
+    with observer_scope(observer):
+        fwd, opt, step, last_loss = _run_steps(ddp_model, optimizer, batches[config.warmup_steps:], config, ddp_model, True)
     result = build_result_skeleton(config)
     result["timing_ms"].update(step_samples=step, fwd_bwd_samples=fwd, optimizer_samples=opt,
                                 step_mean=statistics.mean(step) if step else 0.0)
@@ -498,7 +526,7 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
     )
     result["environment"] = _environment()
     result["correctness"] = _correctness(ddp_model, config, last_loss, observer)
-    set_active_observer(None)
+    result["profiler"]["observed_collectives"] = aggregate_observed(observer)
     if rank == 0 and config.output:
         Path(config.output).parent.mkdir(parents=True, exist_ok=True)
         Path(config.output).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")

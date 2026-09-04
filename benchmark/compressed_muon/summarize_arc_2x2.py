@@ -38,6 +38,17 @@ def _check_invariants(results: list[dict[str, Any]], *, require_timing=False, re
             if not item.get(field): raise ValueError(f"missing {field} field")
         if require_timing and not item.get("timing_ms", {}).get("step_samples"):
             raise ValueError("missing timing samples")
+        communication = item.get("communication")
+        required_comm = ("dense_gradient_bytes", "arc_seed_bytes", "arc_sketch_bytes",
+                         "arc_selected_values_bytes", "uncompressed_bytes")
+        if not isinstance(communication, dict) or any(key not in communication or communication[key] is None for key in required_comm):
+            raise ValueError("missing communication byte field")
+        throughput = item.get("throughput")
+        memory = item.get("memory")
+        if not isinstance(throughput, dict) or throughput.get("tokens_per_second") is None:
+            raise ValueError("missing throughput field")
+        if not isinstance(memory, dict) or any(memory.get(key) is None for key in ("peak_allocated_mib", "peak_reserved_mib")):
+            raise ValueError("missing memory field")
         profiler = item.get("profiler")
         if require_profiler and (not isinstance(profiler, dict) or profiler.get("nccl_kernel_time_ms") is None or not profiler.get("collectives")):
             raise ValueError("missing profiler communication data")
@@ -52,16 +63,24 @@ def _variant_summary(results: list[dict[str, Any]], *, allow_missing_profiler=Fa
     optimizer = [per_result_samples(item, "optimizer_samples") for item in results]
     nccl = [item.get("profiler", {}).get("nccl_kernel_time_ms") for item in results]
     nccl = [v for v in nccl if v is not None]
+    gradient = []
+    if not allow_missing_profiler or nccl:
+        gradient = [_gradient_comm_ms(item, item.get("sync_mode") == "arc") for item in results]
     throughput = [item.get("throughput", {}).get("tokens_per_second", 0.0) for item in results]
     allocated = [item.get("memory", {}).get("peak_allocated_mib", 0.0) for item in results]
     reserved = [item.get("memory", {}).get("peak_reserved_mib", 0.0) for item in results]
     return {"step": sample_stats(step), "optimizer": sample_stats(optimizer),
-            "nccl": sample_stats(nccl) if nccl else (None if allow_missing_profiler else sample_stats(nccl)), "throughput": sample_stats(throughput),
+            "nccl": sample_stats(nccl) if nccl else (None if allow_missing_profiler else sample_stats(nccl)),
+            "gradient_comm": sample_stats(gradient) if gradient else (None if allow_missing_profiler else sample_stats(gradient)),
+            "throughput": sample_stats(throughput),
             "memory": {"allocated_mib": sample_stats(allocated), "reserved_mib": sample_stats(reserved)}}
 
 
 def _communication_bytes(item: dict[str, Any], arc: bool) -> float:
     c = item.get("communication", {})
+    required = ("arc_seed_bytes", "arc_sketch_bytes", "arc_selected_values_bytes", "uncompressed_bytes") if arc else ("dense_gradient_bytes", "uncompressed_bytes")
+    if any(key not in c for key in required):
+        raise ValueError("missing communication byte field")
     if arc:
         return sum(float(c.get(k, 0)) for k in ("arc_seed_bytes", "arc_sketch_bytes", "arc_selected_values_bytes", "uncompressed_bytes"))
     return float(c.get("dense_gradient_bytes", 0)) + float(c.get("uncompressed_bytes", 0))
@@ -72,8 +91,9 @@ def _gradient_comm_ms(item: dict[str, Any], arc: bool) -> float | None:
     names = {"arc_seed", "arc_sketch", "arc_selected_values", "arc_ef21m",
              "arc_dense_uncompressed", "dense_uncompressed"} if arc else {"ddp_gradient"}
     values = [float(c.get("duration_ms", 0.0)) for c in collectives if c.get("category") in names]
-    if values: return sum(values)
-    return item.get("profiler", {}).get("nccl_kernel_time_ms")
+    if not values:
+        raise ValueError("missing recognized gradient communication category")
+    return sum(values)
 
 
 def _ratio(dense: float, arc: float) -> float | None:
@@ -97,19 +117,26 @@ def summarize_results(results: list[dict[str, Any]], profiler_results=None) -> d
     for item in results: grouped[item["sync_mode"]].append(item)
     if any(len(items) < 3 for items in grouped.values()):
         raise ValueError("at least three independent files are required per optimizer/sync cell")
+    if set(grouped) != {"dense", "arc"}:
+        raise ValueError("timing inputs must contain both dense and arc cells")
     variants = {mode: _variant_summary(items, allow_missing_profiler=separate_inputs) for mode, items in grouped.items()}
     if separate_inputs:
         profile_grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in profiler_results: profile_grouped[item["sync_mode"]].append(item)
         if any(len(items) < 3 for items in profile_grouped.values()):
             raise ValueError("at least three independent profiler files are required per cell")
+        if set(profile_grouped) != {"dense", "arc"}:
+            raise ValueError("profiler inputs must contain both dense and arc cells")
         profile_stats = {}
         for mode, items in profile_grouped.items():
             nccl = [item["profiler"]["nccl_kernel_time_ms"] for item in items]
             profile_stats[mode] = sample_stats(nccl)
+            profile_gradient = [_gradient_comm_ms(item, mode == "arc") for item in items]
+            profile_stats[mode + "_gradient"] = sample_stats(profile_gradient)
         for mode in variants:
             if mode not in profile_stats: raise ValueError(f"missing profiler cell for {mode}")
             variants[mode]["nccl"] = profile_stats[mode]
+            variants[mode]["gradient_comm"] = profile_stats[mode + "_gradient"]
     primary_mode = "arc" if "arc" in variants else next(iter(variants))
     primary = variants[primary_mode]
     dense_items = grouped.get("dense", [])
@@ -141,10 +168,11 @@ def load_results(paths: Iterable[str | Path]) -> list[dict[str, Any]]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", nargs="+")
+    parser.add_argument("--profiles", nargs="+", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     try:
-        result = summarize_results(load_results(args.results))
+        result = summarize_results(load_results(args.results), load_results(args.profiles))
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         parser.error(str(exc))
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
