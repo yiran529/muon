@@ -40,3 +40,13 @@ Free disk at launch was `67,082,040 KB` (about 64 GB). A concurrent `nvidia-smi`
 
 - The detached benchmark is intentionally still running; final timing/profile summaries and any OOM outcomes are not available in this handoff. Resume with the same launcher if the tmux process is interrupted.
 - Raw artifacts, traces, event manifest, sentinels, and timestamped logs are runtime outputs under the ignored `artifacts/` tree and are not committed.
+
+## Review round 1 fix (2026-09-04)
+
+- Paused only tmux session `m001_arc_topk_scale_to_1b`; no other process was stopped.
+- Root cause confirmed for GPT-130M Muon-dense: all six timing JSONs (CM004c/CM005c, r1–r3) have `parameter_checksum_agreement=false` while collective signatures match. The validator now rejects these artifacts; evidence remains untouched and the launcher records the cells as `invalid` without changing optimizer/benchmark math.
+- Fixed launcher success handling: a zero exit with missing/invalid JSON emits an explicit machine-readable `invalid` event and does not retry an already-launched repetition. Existing invalid outputs and traces are preserved.
+- Added stale-manifest superseded/corrected events for the old `CM004-a` style IDs, per-model partial JSON output, ROOT working-directory setup, explicit `NCCL_DEBUG` unsetting, metadata creation before OOM skips, and probe OOM sentinels/attempt markers.
+- Profile retry naming now detects an existing rank-0 trace and chooses a retry summary/trace pair, so a valid trace cannot be overwritten.
+- Fresh checks: shell syntax, Python compilation, whitespace check, strict invalid-artifact rejection, corrected-event emission, and dry-run all passed. The dry-run emitted no torchrun processes and retained the required rotated order.
+- The original live outputs already used the intended three launches per timing repetition; resume will not add replacement attempts for invalid Muon-dense repetitions.
