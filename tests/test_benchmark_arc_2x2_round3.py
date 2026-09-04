@@ -42,7 +42,7 @@ def test_summary_reports_gradient_comm_statistics_from_profile_repetitions():
     for mode in ("dense", "arc"):
         for _ in range(3):
             t = copy.deepcopy(base); t["sync_mode"] = mode; t["timing_ms"]["step_samples"] = [10.0 if mode == "dense" else 7.5]; t["timing_ms"]["optimizer_samples"] = [1.0]; t["communication"]["dense_gradient_bytes"] = 100; t["communication"]["arc_seed_bytes"] = 1; t["communication"]["arc_sketch_bytes"] = 9; t["communication"]["arc_selected_values_bytes"] = 15; timing.append(t)
-            p = copy.deepcopy(base); p["sync_mode"] = mode; p["timing_ms"] = {}; p["profiler"]["nccl_kernel_time_ms"] = 10.0 if mode == "dense" else 7.5; p["profiler"]["collectives"] = [{"category": "ddp_gradient" if mode == "dense" else "arc_sketch", "duration_ms": p["profiler"]["nccl_kernel_time_ms"]}]; profiles.append(p)
+            p = copy.deepcopy(t); p["timing_ms"] = {}; p["profiler"]["nccl_kernel_time_ms"] = 10.0 if mode == "dense" else 7.5; p["profiler"]["collectives"] = [{"category": "ddp_gradient" if mode == "dense" else "arc_sketch", "duration_ms": p["profiler"]["nccl_kernel_time_ms"]}]; profiles.append(p)
     result = summarize_results(timing, profiles)
     assert result["variants"]["arc"]["gradient_comm"]["mean"] == pytest.approx(7.5)
 

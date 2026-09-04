@@ -157,7 +157,8 @@ def test_result_schema_exposes_smoke_correctness_and_profile_mode():
     result = build_result_skeleton(_config())
     assert result["correctness"] == {
         "finite_loss": None, "finite_parameters": None,
-        "parameter_checksum": None, "parameter_checksum_agreement": None,
+        "parameter_checksum": None, "parameter_checksum_squared": None,
+        "parameter_checksum_agreement": None,
         "collective_signature": {
             "all_ranks_match": None, "per_rank": []
         }

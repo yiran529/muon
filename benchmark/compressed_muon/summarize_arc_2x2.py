@@ -88,7 +88,7 @@ def _communication_bytes(item: dict[str, Any], arc: bool) -> float:
 
 def _gradient_comm_ms(item: dict[str, Any], arc: bool) -> float | None:
     collectives = item.get("profiler", {}).get("collectives", []) or []
-    names = {"arc_seed", "arc_sketch", "arc_selected_values", "arc_ef21m",
+    names = {"arc_seed", "arc_sketch", "arc_selected_values",
              "arc_dense_uncompressed", "dense_uncompressed"} if arc else {"ddp_gradient"}
     values = [float(c.get("duration_ms", 0.0)) for c in collectives if c.get("category") in names]
     if not values:
@@ -113,6 +113,12 @@ def summarize_results(results: list[dict[str, Any]], profiler_results=None) -> d
         if len(profiler_results) < 3: raise ValueError("at least three profiler summaries are required")
         _check_invariants(profiler_results, require_profiler=True)
         _check_invariants(results + profiler_results)
+        timing_comm = {item["sync_mode"]: item["communication"] for item in results}
+        for item in results + profiler_results:
+            if item["communication"] != timing_comm[item["sync_mode"]]:
+                raise ValueError(
+                    f"mismatched communication metadata for {item['sync_mode']} timing/profile inputs"
+                )
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in results: grouped[item["sync_mode"]].append(item)
     if any(len(items) < 3 for items in grouped.values()):
@@ -141,8 +147,6 @@ def summarize_results(results: list[dict[str, Any]], profiler_results=None) -> d
     primary = variants[primary_mode]
     dense_items = grouped.get("dense", [])
     arc_items = grouped.get("arc", [])
-    byte_sources = {mode: (items if not separate_inputs else items + profile_grouped.get(mode, []))
-                    for mode, items in grouped.items()}
     dense_bytes = statistics.mean([_communication_bytes(i, False) for i in dense_items]) if dense_items else None
     arc_bytes = statistics.mean([_communication_bytes(i, True) for i in arc_items]) if arc_items else None
     profile_dense = profile_grouped.get("dense", []) if separate_inputs else dense_items

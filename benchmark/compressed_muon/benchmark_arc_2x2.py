@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import random
 import re
@@ -190,7 +189,8 @@ def build_result_skeleton(config: BenchmarkConfig) -> dict[str, Any]:
                           "uncompressed_bytes": 0},
         "profiler": {"trace_path": None, "nccl_kernel_time_ms": None, "collectives": []},
         "correctness": {"finite_loss": None, "finite_parameters": None,
-                        "parameter_checksum": None, "parameter_checksum_agreement": None,
+                        "parameter_checksum": None, "parameter_checksum_squared": None,
+                        "parameter_checksum_agreement": None,
                         "collective_signature": {"all_ranks_match": None, "per_rank": []}},
         "environment": {"git_commit": "", "torch": torch.__version__,
                          "cuda": torch.version.cuda or "", "nccl": "", "gpu_names": []},
@@ -274,7 +274,10 @@ def build_optimizer(config: BenchmarkConfig, model: GPT, process_group=None):
         kwargs.update(arc_topk_ratio=config.ratio, arc_projection_rank=config.projection_rank,
                       arc_eta=config.eta, arc_seed=config.seed,
                       arc_start_compress_step=config.start_compress_step)
-    return cls(groups, distributed_mesh=process_group, **kwargs)
+    # Dense Muon is a standard DDP baseline: DDP owns gradient synchronization
+    # and Muon's internal result-sharding collectives must stay disabled.
+    distributed_mesh = process_group if config.sync == "arc" else None
+    return cls(groups, distributed_mesh=distributed_mesh, **kwargs)
 
 
 def _environment() -> dict[str, Any]:
@@ -308,6 +311,32 @@ def reduce_correctness_flags(finite_loss: bool, finite_parameters: bool) -> tupl
     return bool(flags[0]), bool(flags[1])
 
 
+def validate_actual_world_size(configured_world_size: int) -> int:
+    """Reject launch metadata that disagrees with the initialized job."""
+    actual = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    if actual != configured_world_size:
+        raise RuntimeError(
+            f"actual distributed world size {actual} does not match "
+            f"configured {configured_world_size}"
+        )
+    return actual
+
+
+def sync_context(config: BenchmarkConfig, ddp_model):
+    """Disable DDP reduction for ARC, while supporting a single-rank smoke."""
+    if config.sync == "arc" and hasattr(ddp_model, "no_sync"):
+        return ddp_model.no_sync()
+    return _nullcontext()
+
+
+def checksums_agree(checksums: list[tuple[float, float]]) -> bool:
+    """Compare two independent parameter moments across ranks."""
+    if not checksums:
+        return False
+    reference = checksums[0]
+    return all(value == reference for value in checksums[1:])
+
+
 @contextmanager
 def observer_scope(observer):
     """Install an observer only for the work that can emit collectives."""
@@ -322,21 +351,24 @@ def _correctness(model: torch.nn.Module, config: BenchmarkConfig, last_loss=None
                  observer: CollectiveObserver | None = None) -> dict[str, Any]:
     params = list(_raw_model(model).parameters())
     finite_parameters = all(bool(torch.isfinite(p).all()) for p in params)
-    checksum = float(sum(p.detach().float().sum() for p in params))
+    checksum = float(sum(p.detach().double().sum() for p in params))
+    checksum_squared = float(sum(p.detach().double().square().sum() for p in params))
+    checksum_pair = (checksum, checksum_squared)
     per_rank = [observer.signature() if observer is not None else []]
-    checksums = [checksum]
+    checksums = [checksum_pair]
     if dist.is_available() and dist.is_initialized():
         gathered = [None for _ in range(dist.get_world_size())]
         dist.all_gather_object(gathered, per_rank[0])
         per_rank = gathered
         checksum_values = [None for _ in range(dist.get_world_size())]
-        dist.all_gather_object(checksum_values, checksum)
+        dist.all_gather_object(checksum_values, checksum_pair)
         checksums = checksum_values
     finite_loss = bool(last_loss is not None and torch.isfinite(last_loss).all())
     finite_loss, finite_parameters = reduce_correctness_flags(finite_loss, finite_parameters)
     return {"finite_loss": finite_loss, "finite_parameters": finite_parameters,
             "parameter_checksum": checksum,
-            "parameter_checksum_agreement": len({round(float(x), 5) for x in checksums}) == 1,
+            "parameter_checksum_squared": checksum_squared,
+            "parameter_checksum_agreement": checksums_agree(checksums),
             "collective_signature": {"all_ranks_match": signatures_agree(per_rank),
                                       "per_rank": per_rank}}
 
@@ -377,7 +409,7 @@ def _run_steps(model, optimizer, batches, config, ddp_model=None, measure=False)
         opt_end = torch.cuda.Event(enable_timing=True)
         step_end = torch.cuda.Event(enable_timing=True)
         step_start.record(); fwd_start.record()
-        context = ddp_model.no_sync() if config.sync == "arc" and ddp_model is not None else _nullcontext()
+        context = sync_context(config, ddp_model)
         with context:
             with record_function("benchmark/forward_backward"):
                 loss = model(tokens, targets=targets)
@@ -425,7 +457,7 @@ def run_profiler(model, optimizer, batches, config, *, ddp_model=None, output=No
         schedule=schedule, on_trace_ready=on_trace_ready, record_shapes=False,
     ) as prof:
         for tokens, targets in batches[:11]:
-            context = ddp_model.no_sync() if config.sync == "arc" and ddp_model is not None else _nullcontext()
+            context = sync_context(config, ddp_model)
             with context:
                 with record_function("benchmark/forward_backward"):
                     loss = model(tokens, targets=targets)
@@ -446,6 +478,7 @@ def run_profile_mode(config: BenchmarkConfig) -> dict[str, Any]:
     rank = int(os.environ.get("RANK", "0")); local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
     torch.cuda.set_device(local_rank)
     if config.world_size > 1 and not dist.is_initialized(): dist.init_process_group("nccl")
+    validate_actual_world_size(config.world_size)
     group = dist.group.WORLD if dist.is_initialized() else None
     device = torch.device("cuda", local_rank)
     model = build_model(config, device)
@@ -491,6 +524,7 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
     device = torch.device("cuda", local_rank)
     if config.world_size > 1 and not dist.is_initialized():
         dist.init_process_group("nccl")
+    validate_actual_world_size(config.world_size)
     group = dist.group.WORLD if dist.is_initialized() else None
     random.seed(config.seed + rank); torch.manual_seed(config.seed + rank)
     model = build_model(config, device)
@@ -535,10 +569,14 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
 
 def main(argv=None):
     config = parse_args(argv)
-    if config.profile_only:
-        run_profile_mode(config)
-    else:
-        run_benchmark(config)
+    try:
+        if config.profile_only:
+            run_profile_mode(config)
+        else:
+            run_benchmark(config)
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

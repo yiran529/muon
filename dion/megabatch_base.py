@@ -793,7 +793,11 @@ def megabatch_orthogonalize_async(
 
         output_chunks = [torch.empty_like(c) for c in input_chunks]
         with record_function("muon/result_collective"):
-            observe_collective("muon/result_collective", "all_to_all", output_chunks[0])
+            observe_collective(
+                "muon/result_collective", "all_to_all", input_chunks[0],
+                numel=sum(chunk.numel() for chunk in input_chunks),
+                bytes=sum(chunk.numel() * chunk.element_size() for chunk in input_chunks),
+            )
             work = dist.all_to_all(
                 output_chunks, input_chunks, group=process_group, async_op=True
             )
@@ -818,7 +822,11 @@ def megabatch_orthogonalize_async(
 
         recv_chunks = [torch.empty_like(c) for c in split_chunks]
         with record_function("muon/result_collective"):
-            observe_collective("muon/result_collective", "all_to_all", recv_chunks[0])
+            observe_collective(
+                "muon/result_collective", "all_to_all", split_chunks[0],
+                numel=sum(chunk.numel() for chunk in split_chunks),
+                bytes=sum(chunk.numel() * chunk.element_size() for chunk in split_chunks),
+            )
             work = dist.all_to_all(
                 recv_chunks, split_chunks, group=process_group, async_op=True
             )

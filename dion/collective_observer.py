@@ -36,10 +36,11 @@ def get_active_observer():
     return _active_observer
 
 
-def observe_collective(category, operation, tensor, bytes=None):
+def observe_collective(category, operation, tensor, bytes=None, numel=None):
     if _active_observer is not None:
         payload = int(tensor.numel() * tensor.element_size()) if bytes is None else int(bytes)
-        _active_observer.record(category, operation, tensor.numel(), tensor.dtype, payload)
+        logical_numel = tensor.numel() if numel is None else int(numel)
+        _active_observer.record(category, operation, logical_numel, tensor.dtype, payload)
 
 
 def signatures_agree(signatures):
@@ -52,8 +53,9 @@ def aggregate_observed(observer):
     for event in observer.events:
         key = (event.category, event.operation)
         item = totals.setdefault(key, {"category": event.category, "operation": event.operation,
-                                       "numel": event.numel, "dtype": event.dtype,
+                                       "numel": 0, "dtype": event.dtype,
                                        "bytes": 0, "count": 0})
+        item["numel"] += event.numel
         item["bytes"] += event.bytes
         item["count"] += 1
     return list(totals.values())

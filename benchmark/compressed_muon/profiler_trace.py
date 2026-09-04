@@ -24,6 +24,11 @@ _CATEGORY_NAMES = {
     "muon/result_collective": "muon_result",
 }
 
+_COLLECTIVE_CATEGORIES = {
+    "ddp_gradient", "arc_seed", "arc_sketch", "arc_selected_values",
+    "arc_dense_uncompressed", "muon_result",
+}
+
 
 def _events(trace: Any) -> list[dict[str, Any]]:
     if isinstance(trace, (str, Path)):
@@ -126,8 +131,14 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
     # PyTorch profiler commonly inserts a c10d launch/op node between a user
     # range and the GPU kernel. Propagate the user's category through that node
     # and its correlation/external id.
-    correlation_categories = {str(r[3]): r[0] for r in ranges if r[3] is not None}
-    correlation_ranges = {str(r[3]): r[4] for r in ranges if r[3] is not None}
+    correlation_categories = {
+        str(r[3]): r[0] for r in ranges
+        if r[3] is not None and r[0] in _COLLECTIVE_CATEGORIES
+    }
+    correlation_ranges = {
+        str(r[3]): r[4] for r in ranges
+        if r[3] is not None and r[0] in _COLLECTIVE_CATEGORIES
+    }
     for event in events:
         name = str(event.get("name", "")).lower()
         corr = _correlation(event)
@@ -140,22 +151,25 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
             correlation_ranges[str(corr)] = correlation_ranges.get(str(parent))
         else:
             start = float(event.get("ts", 0)); end = start + _duration(event)
-            nested = [r for r in ranges if r[4].get("pid") == event.get("pid")
+            nested = [r for r in ranges if r[0] in _COLLECTIVE_CATEGORIES
+                      and r[4].get("pid") == event.get("pid")
                       and r[4].get("tid") == event.get("tid")
                       and r[1] <= start and end <= r[2]]
             if nested:
                 correlation_categories[str(corr)] = min(nested, key=lambda r: r[2] - r[1])[0]
                 correlation_ranges[str(corr)] = min(nested, key=lambda r: r[2] - r[1])[4]
     groups: dict[str, dict[str, Any]] = defaultdict(lambda: {"kernel_count": 0, "duration_us": 0.0, "message_bytes": 0})
-    nccl_intervals = []; compute_intervals = []
+    nccl_intervals = []; compute_intervals = []; counted_payloads = set()
     for event in events:
         if event.get("ph") not in {"X", "B"}: continue
         start = float(event.get("ts", 0)); end = start + _duration(event)
         if _is_nccl(event):
             corr = _correlation(event)
-            candidates = [r for r in ranges if corr is not None and str(r[3]) == str(corr)]
+            candidates = [r for r in ranges if r[0] in _COLLECTIVE_CATEGORIES
+                          and corr is not None and str(r[3]) == str(corr)]
             if not candidates:
-                candidates = [r for r in ranges if r[1] <= start and end <= r[2]]
+                candidates = [r for r in ranges if r[0] in _COLLECTIVE_CATEGORIES
+                              and r[1] <= start and end <= r[2]]
             category = (correlation_categories.get(str(corr)) if corr is not None else None) or (candidates[-1][0] if candidates else "unattributed")
             item = groups[category]
             item["kernel_count"] += 1; item["duration_us"] += _duration(event)
@@ -163,6 +177,12 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
             mapped_range = correlation_ranges.get(str(corr)) if corr is not None else None
             metadata_ranges = candidates or ([next((r for r in ranges if r[4] is mapped_range), None)] if mapped_range is not None else [])
             metadata_ranges = [r for r in metadata_ranges if r is not None]
+            payload_key = (category, str(corr)) if corr is not None else (
+                category, id(metadata_ranges[-1][4]) if metadata_ranges else id(event)
+            )
+            if payload_key in counted_payloads:
+                continue
+            counted_payloads.add(payload_key)
             if metadata_ranges:
                 metadata = _args(metadata_ranges[-1][4])
                 item["message_bytes"] += int(next((metadata.get(k) for k in ("bytes", "message_bytes", "size_bytes", "collective_bytes") if metadata.get(k) is not None), 0) or 0)
