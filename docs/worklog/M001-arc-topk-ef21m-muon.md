@@ -460,7 +460,7 @@ Profiler summary 的 NCCL 总 kernel 时间、gradient subset 时间和 exposed 
 - GPT-1B AdamW ARC 的 4-rank probe 在 `ArcTopKAdamW._prepopulate_group_state` 的 `torch.zeros_like(param)` 处 OOM，日志显示尝试额外分配 148 MiB、每卡约 23.39 GiB 已用；因此 CM008b/CM009b 是 model-scoped OOM skip，而不是 timing failure。保留 probe 与 formal OOM 日志，不改变 workload 以强行适配。
 - GPT-130M 与 GPT-1B dense Muon 的 exact checksum divergence 在 normal/P2P-disabled 两种 transport 均出现；已有诊断支持“局部 Polar Express/Triton shape/backend 可能放大 rank-local 差异”的 inference（130M 的 768/3072 shape 是窄相关），但 root cause 未证明。不要把 checksum gate 放宽为 allclose，也不要将这些 raw timing 当作 valid comparison。
 - 现有 launcher 仍有一个窄的 signal-vs-OOM 状态竞争窗口：controller signal 与子进程 OOM/终止若在同一边界发生，事件分类可能依赖到达顺序。该限制已记录、raw evidence 保留，本任务按用户要求不修复；不影响本次最终 partial-manifest 分类。
-- 观察（observation）：在 130M/350M 有效 AdamW pairs 与 350M 有效 Muon pairs 中，ARC logical bytes 分别减少约 33.65%/56.54%，step R 为约 18.15–28.10%。推断（inference）：本机 workload 的 measured step 受 projection、Top-K、EF21M、collective 粒度和 Muon 正交化共同影响，不能由 bytes ratio 单独解释。
+- 观察（observation）：在 130M/350M 有效 AdamW pairs 与 350M 有效 Muon pairs 中，ARC logical bytes 分别减少约 33.65%/56.54%，step R 为约 21.01–28.10%。推断（inference）：本机 workload 的 measured step 受 projection、Top-K、EF21M、collective 粒度和 Muon 正交化共同影响，不能由 bytes ratio 单独解释。
 - 限制：这是 synthetic 100-step timing/profiler benchmark，不包含收敛、time-to-quality、跨节点网络或最终模型质量证据；不得报告任何 1B paired benefit。
 
 ### 验证和关联产物
