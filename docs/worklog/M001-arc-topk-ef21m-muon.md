@@ -235,6 +235,84 @@ M001 DDP 原型达到当前阶段的自动化测试和两卡 NCCL smoke-test 完
 - 论文使用 DDP communication hook 处理 gradient bucket，而 M001 在 optimizer 路径中逐矩阵执行 projection、Top-K 和 collective。当前路径增加小 kernel 与 collective 调度开销，也较难利用标准 DDP bucket 合并和反向传播期间的通信计算重叠。
 - 论文 Table V 是 50-step 平均单步 microbenchmark，不是包含长期训练、周期验证和达到相同质量所需时间的 time-to-quality 结果。论文总体实验称 1000 iterations 后开始压缩，但 Table V 只运行 50 iterations，公开仓库也未提供完整复现该表的独立命令，因此该表实际使用的 compression-start 覆盖设置存在报告缺口。
 
+### 通信缩减没有转化为 wall-clock 收益的机制判断
+
+1. **计算与通信比例不同。** 当前每卡每个 optimizer step 在一次梯度同步前处理 262144 tokens，前向、反向和 Muon Newton–Schulz 占据主要时间；论文 wall-clock 设置每卡仅处理约 256 tokens，且主动禁用 P2P，使 dense All-Reduce 成为主要瓶颈。当前即使缩短一部分梯度通信，对约 2.2 秒完整 step 的影响也有限。
+2. **梯度累积降低了单位 token 的同步频率。** 当前梯度累积为 8，每卡完成 8 个 microbatches 后才同步一次；与 local batch 1、gradient accumulation 1 的通信受限设置相比，同样大小的梯度通信被更多计算摊薄。
+3. **压缩降低 payload，但增加计算和调度。** 每个 ARC 矩阵需要生成投影、计算 sketch、选择 Top-K、更新 EF21M 状态，并通信 sketch 和 selected values。通信字节下降不代表这些额外工作为零；当 dense collective 已较快时，额外开销可以完全抵消带宽收益。
+4. **collective 粒度和重叠方式发生变化。** dense DDP 可以将多个梯度放入 bucket，并在 backward 中异步启动 All-Reduce。M001 在 backward 和梯度累积完成后进入 optimizer，再逐矩阵执行多个 collective；这既增加 collective 启动次数和延迟，也减少通信与 backward 重叠。因而理论 payload ratio 不能直接换算为相同的 NCCL 时间比例。
+5. **ARC 只覆盖部分通信对象。** M001 优化的是二维矩阵梯度同步；未压缩张量以及 Muon 正交化任务分配、结果聚合等其他通信不会按 `ratio=0.2` 同比例下降。Muon 的 Newton–Schulz 计算也不受梯度压缩影响。
+6. **单机互联不属于论文强调的低带宽场景。** 当前 4 张 RTX 4090 使用机器的正常 NCCL 路径；论文 Table V 明确使用 SHM transport 并禁用 NVLink P2P。ARC-TopK 的收益依赖 dense 通信在关键路径中占有足够高的比例，而不是只依赖参数量或压缩率。
+7. **端到端效率还受收敛影响。** CM001 最终 validation loss 高于 dense baseline。即使未来测得单步加速，也必须比较达到相同 validation loss 所需的 wall-clock；否则只能说明通信或吞吐改善，不能说明训练效率改善。
+
+可用 Amdahl 近似解释预期上限。设 dense step 中可被 ARC 优化的梯度通信占比为 `f_comm`，ARC 对该部分的实际时间降幅为 `R_grad_comm`，额外压缩开销占完整 dense step 的比例为 `o_arc`，则：
+
+```text
+R_step ≈ f_comm × R_grad_comm - o_arc
+```
+
+即使乐观假设 `R_grad_comm=80%` 且 `o_arc=0`，要达到 `60%` 的端到端降时也要求 dense baseline 中可压缩通信至少占 `75%`。考虑 projection、Top-K、EF21M、更多 collective 和不可压缩通信后，所需通信占比还会更高。CM001 约 `0.97%` 的负收益说明当前 `f_comm × R_grad_comm` 不足以覆盖 `o_arc`，但仅凭端到端时间还不能确定各项的具体占比，需要 profiler 验证。
+
+### 推荐给后续 agent 的测试设置
+
+#### 研究问题和比较矩阵
+
+目标是判断在论文式通信受限设置下，ARC-TopK+Muon 能否获得与 ARC-TopK+AdamW 相近的**梯度通信收益**，并进一步判断该收益能否转化为相近的**端到端收益**。至少完成以下 2×2 对照：
+
+| 优化器 | Dense | ARC-TopK |
+|---|---|---|
+| AdamW | AdamW Dense | AdamW ARC-TopK |
+| Muon | Muon Dense | Muon ARC-TopK |
+
+四组必须固定模型结构、数据、dtype、随机种子、world size、GPU、NCCL transport、local batch、sequence length、gradient accumulation 和测量区间。ARC 两组还必须固定 compression ratio、projection rank、EF21M 参数、compression-start 语义及压缩张量集合。
+
+若 AdamW 使用 DDP bucket comm hook、Muon 使用当前逐矩阵 optimizer 路径，结果只能解释为两套实际系统的比较，不能把差异全部归因于 optimizer。为了回答“同一 ARC 通信实现对两个 optimizer 是否有同等收益”，优先让两者共用同一压缩层和 collective 组织；若当前阶段做不到，必须同时记录 bucket 数量、逐矩阵 collective 数量和通信重叠差异，并明确结论边界。
+
+#### 第一阶段：论文式通信受限短 benchmark
+
+- 使用 4 张经检查为空闲的 GPU；模型先测约 60M、130M、350M，显存允许再测 1B。同一模型规模的四个实验必须使用完全相同的 GPU。
+- `local_batch_size=1`、`sequence_length=256`、`gradient_accumulation=1`，使每次梯度同步前的计算量接近论文 wall-clock 设置。
+- 设置 `NCCL_P2P_DISABLE=1`、确认 `NCCL_SHM_DISABLE=0`。首次运行可用 `NCCL_DEBUG=INFO` 保存 transport 证据，正式计时关闭冗余 debug 输出。
+- dtype 在四组间必须一致并写入产物。论文 Table V 未清楚报告 dtype，因此当前硬件上的结果用于验证相对趋势，不宣称绝对复现其秒数。
+- ARC 使用 `ratio=0.2`、projection rank `r=4`。短 benchmark 必须保证正式计时区间已经启用压缩；可设 compression start 为 0，但丢弃首步 dense 初始化和编译阶段。
+- 至少进行 20 个不计时 warmup steps，再测量至少 100 个稳定 steps。每个配置使用独立进程重复至少 3 次，报告均值、标准差和变异系数；若变异系数超过 5%，继续排查资源竞争或增加重复次数。
+- 测量区间关闭 validation、checkpoint 和其他周期任务；W&B 和日志不得把同步 I/O 放入计时区间。计时边界使用 CUDA event 或显式 `torch.cuda.synchronize()`，不能只依赖未同步的 CPU wall clock。
+- 先在正常 NCCL transport 下跑一组，再在禁用 P2P 的论文式 transport 下跑一组，用于区分实际部署收益和人为通信受限收益。
+
+#### 必须采集的指标
+
+1. 每 step 理论/实测通信字节，分别列出 dense gradient、ARC sketch、selected values、未压缩张量和 Muon 其他通信。
+2. collective 类型、次数、消息大小和 NCCL GPU kernel 总时间。
+3. backward 中被覆盖的通信时间，以及真正暴露在 step 关键路径上的通信时间。
+4. ARC projection、norm/Top-K、EF21M 状态更新和压缩/解压的 GPU 时间。
+5. forward、backward、Muon Newton–Schulz、optimizer 和完整 step 时间。
+6. tokens/s、峰值显存，并保存至少一个代表性 PyTorch Profiler 或 Nsight Systems trace。
+
+对 AdamW 和 Muon 分别计算：
+
+```text
+R_bytes     = 1 - ARC通信字节 / Dense通信字节
+R_grad_comm = 1 - ARC梯度同步时间 / Dense梯度同步时间
+R_step      = 1 - ARC完整step时间 / Dense完整step时间
+```
+
+#### 预先约定的判定方式
+
+- 若 Muon 与 AdamW 的 `R_bytes` 相差不超过 5 个百分点，可认为两者获得近似相同的理论梯度通信量缩减。
+- 若两者 `R_grad_comm` 相差不超过 5 个百分点，且 3 次重复的误差范围不改变结论，可认为 ARC-TopK+Muon 获得与 AdamW 相近的实际梯度通信收益。
+- 若 `R_grad_comm` 接近但 Muon 的 `R_step` 明显更低，应将差异归因到 Muon 非通信计算、不可压缩通信、ARC 实现开销或通信重叠，而不能得出“ARC 对 Muon 不压缩”的结论。
+- 只有两者 `R_step` 也接近且均为正，才能声称 ARC-TopK+Muon 在该设置下获得与 AdamW 类似的 wall-clock 收益。
+- 若目标是训练效率而非 microbenchmark，必须另做足够长的收敛实验，比较达到同一 validation loss 所需的总时间；短 benchmark 不用于证明模型质量。
+
+#### 执行和产物要求
+
+- 开始前重新阅读 `AGENTS.md` 和 `docs/compressed_muon/RESEARCH_GUIDE.md`，检查 GPU 与既有进程，不得干扰其他用户任务。
+- 在 `docs/compressed_muon/EXPERIMENTS.md` 选择下一个未使用的 `CMxxx` 编号。同一 2×2 比较组可使用 `a`–`d` 后缀，并保证本地目录、W&B run name 与实验编号对应。
+- 长任务使用 `tmux`；原始日志、配置、命令、环境信息、计时数据和 profiler trace 放入 `artifacts/compressed_muon/<experiment-id>/`。
+- 可复用 benchmark/profiler 脚本放入 `benchmark/compressed_muon/`，不要放在仓库根目录；一次性 launcher 可放在对应 artifacts 目录。
+- 先完成最小模型的 2×2 smoke/benchmark 并检查四组均走预期通信路径，再扩展模型规模。collective 调用顺序、张量大小和各 rank step 数必须一致。
+- 实验结束后更新 `EXPERIMENTS.md`，并将成功、失败或结论不明确的结果都追加到本 worklog；只在证据具有正式比较价值后再整理到 `RESULTS.md` 或 `PAPER_NOTES.md`。
+
 ### 结论和下一步
 
 CM001 没有观察到端到端加速；在当前单机 4 卡、162M 模型、大 batch、长序列和 Muon 额外正交化计算的组合下，梯度通信不是足够大的瓶颈，ARC-TopK 节省的通信时间不足以覆盖 sketch、Top-K、EF21M 状态和逐矩阵 collective 的额外成本。该结果不否定 ARC-TopK 在大模型、更多节点或低带宽环境中的潜在收益，但目前不能宣称 ARC-TopK+Muon 具有论文所报告的 wall-clock 加速。
