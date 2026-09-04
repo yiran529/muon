@@ -31,3 +31,13 @@
 - 结果新增有限性、参数 checksum agreement 和 per-rank collective signature 字段；模型初始化使用 `config.seed`，Muon 显式记录 accelerated kernel 选择。
 
 Round-1 focused verification：`71 passed, 14 warnings`（benchmark + ARC/Muon 回归）；compileall 与 `git diff --check` 通过。正式 GPU 实验仍未启动。
+
+## Round-2 修复
+
+- 新增 process-local collective observer，记录实际 `(category, operation, numel, dtype, bytes)`；dense DDP 使用 SUM/world-size averaging comm hook，ARC/Muon collective 调用均记录真实事件。
+- `_run_steps()` 保存实际 detached loss；correctness 输出真实 finite-loss、参数有限性、跨 rank checksum agreement 与 observed per-rank signature agreement。
+- trace attribution 支持 named user range → nested c10d launch/op → GPU NCCL correlation/external ID，补齐 seed 与 dense-uncompressed 分类；不从 kernel 时长推断通信字节。
+- summarizer 支持独立 timing JSON 与 profiler-summary JSON 输入：step/CV 仅来自 timing，NCCL 与 `R_grad_comm` 仅来自 profiler，严格拒绝缺失/不足/不匹配的 profile cell。
+- 非 profile timing 路径不再隐式 profile；profile-only 路径使用 fresh model/optimizer、固定 3 wait + 3 warmup + 5 active，并写入实际通信 metadata/signatures。
+
+Round-2 focused verification：`75 passed, 14 warnings`；compileall 与 `git diff --check` 通过。未启动正式 GPU 实验。

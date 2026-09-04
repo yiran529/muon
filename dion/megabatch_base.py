@@ -6,6 +6,7 @@ from collections import defaultdict
 from itertools import chain
 from torch import Tensor
 from torch.distributed import ProcessGroup
+from .collective_observer import observe_collective
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
@@ -792,6 +793,7 @@ def megabatch_orthogonalize_async(
 
         output_chunks = [torch.empty_like(c) for c in input_chunks]
         with record_function("muon/result_collective"):
+            observe_collective("muon/result_collective", "all_to_all", output_chunks[0])
             work = dist.all_to_all(
                 output_chunks, input_chunks, group=process_group, async_op=True
             )
@@ -816,6 +818,7 @@ def megabatch_orthogonalize_async(
 
         recv_chunks = [torch.empty_like(c) for c in split_chunks]
         with record_function("muon/result_collective"):
+            observe_collective("muon/result_collective", "all_to_all", recv_chunks[0])
             work = dist.all_to_all(
                 recv_chunks, split_chunks, group=process_group, async_op=True
             )
@@ -851,6 +854,7 @@ def megabatch_orthogonalize_async(
 
         all_chunks = [torch.empty_like(my_matrices) for _ in range(world_size)]
         with record_function("muon/result_collective"):
+            observe_collective("muon/result_collective", "all_gather", my_matrices)
             work = dist.all_gather(
                 all_chunks, my_matrices.contiguous(), group=process_group, async_op=True
             )

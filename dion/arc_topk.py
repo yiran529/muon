@@ -8,6 +8,7 @@ import torch.distributed as dist
 from torch.profiler import record_function
 from torch import Tensor
 from torch.distributed import ProcessGroup
+from .collective_observer import observe_collective
 
 
 def validate_arc_topk_config(
@@ -167,6 +168,7 @@ def arc_topk_ef21m_async(
         local_estimate_batch.copy_(tracker_batch)
         global_estimate_batch.copy_(tracker_batch)
         if process_group is not None and world_size > 1:
+            observe_collective("arc/dense_uncompressed", "all_reduce", global_estimate_batch)
             with record_function("arc/dense_uncompressed"):
                 work = dist.all_reduce(
                     global_estimate_batch,
@@ -194,6 +196,7 @@ def arc_topk_ef21m_async(
     if group_rank == 0:
         seed_tensor.fill_(seed_value)
     if process_group is not None and world_size > 1:
+        observe_collective("arc/seed", "broadcast", seed_tensor)
         with record_function("arc/seed"):
             work = dist.broadcast(
                 seed_tensor,
@@ -218,6 +221,7 @@ def arc_topk_ef21m_async(
         )
     global_sketch = arc_topk_local_sketch(delta_batch, projection)
     if process_group is not None and world_size > 1:
+        observe_collective("arc/sketch", "all_reduce", global_sketch)
         with record_function("arc/sketch"):
             work = dist.all_reduce(
                 global_sketch,
@@ -236,6 +240,7 @@ def arc_topk_ef21m_async(
         local_selected = gather_rows(delta_batch, indices)
     averaged_selected = local_selected.clone()
     if process_group is not None and world_size > 1:
+        observe_collective("arc/selected_values", "all_reduce", averaged_selected)
         with record_function("arc/selected_values"):
             work = dist.all_reduce(
                 averaged_selected,

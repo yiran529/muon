@@ -14,8 +14,10 @@ _CATEGORY_NAMES = {
     "benchmark/forward_backward": "compute",
     "benchmark/optimizer": "optimizer",
     "arc/projection": "arc_projection",
+    "arc/seed": "arc_seed",
     "arc/topk": "arc_topk",
     "arc/selected_values": "arc_selected_values",
+    "arc/dense_uncompressed": "arc_dense_uncompressed",
     "arc/ef21m": "arc_ef21m",
     "muon/newton_schulz": "muon_newton_schulz",
     "muon/result_collective": "muon_result",
@@ -133,6 +135,13 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
         parent = _args(event).get("parent_correlation", _args(event).get("parent_external_id"))
         if parent is not None and str(parent) in correlation_categories:
             correlation_categories[str(corr)] = correlation_categories[str(parent)]
+        else:
+            start = float(event.get("ts", 0)); end = start + _duration(event)
+            nested = [r for r in ranges if r[4].get("pid") == event.get("pid")
+                      and r[4].get("tid") == event.get("tid")
+                      and r[1] <= start and end <= r[2]]
+            if nested:
+                correlation_categories[str(corr)] = min(nested, key=lambda r: r[2] - r[1])[0]
     groups: dict[str, dict[str, Any]] = defaultdict(lambda: {"kernel_count": 0, "duration_us": 0.0, "message_bytes": 0})
     nccl_intervals = []; compute_intervals = []
     for event in events:
@@ -147,8 +156,9 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
             item = groups[category]
             item["kernel_count"] += 1; item["duration_us"] += _duration(event)
             nccl_intervals.append((start, end))
-            if candidates:
-                metadata = _args(candidates[-1][4])
+            metadata_ranges = candidates or [r for r in ranges if r[0] == category]
+            if metadata_ranges:
+                metadata = _args(metadata_ranges[-1][4])
                 item["message_bytes"] += int(next((metadata.get(k) for k in ("bytes", "message_bytes", "size_bytes", "collective_bytes") if metadata.get(k) is not None), 0) or 0)
             else:
                 metadata = _args(event)

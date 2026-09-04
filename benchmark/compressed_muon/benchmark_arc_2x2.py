@@ -27,6 +27,7 @@ from dion.adamw_arctopk import ArcTopKAdamW
 from dion.arc_topk_sync import ArcTopKLogicalBytes, ArcTopKSyncConfig, estimate_arc_logical_bytes, group_parameters_by_shape_dtype
 from dion.muon import Muon
 from dion.muon_arctopk import ArcTopKMuon
+from dion.collective_observer import CollectiveObserver, set_active_observer, signatures_agree, observe_collective
 from models.gpt_model import GPT, GPTConfig
 
 MODEL_PRESETS = {
@@ -81,6 +82,10 @@ def validate_config(config: BenchmarkConfig) -> BenchmarkConfig:
         raise ValueError("local_batch and sequence_length must be positive")
     if config.gradient_accumulation != 1:
         raise ValueError("gradient_accumulation must be exactly 1")
+    if config.profile_output and not config.profile_only:
+        raise ValueError("profile_output requires explicit --profile mode")
+    if config.profile_only and not config.profile_output:
+        raise ValueError("--profile requires --profile-output")
     if config.transport == "p2p_disabled" and (
         os.environ.get("NCCL_P2P_DISABLE") != "1" or os.environ.get("NCCL_SHM_DISABLE") != "0"
     ):
@@ -288,11 +293,12 @@ def _collective_signature(config: BenchmarkConfig) -> list[str]:
     return ["arc_seed", "arc_sketch", "arc_selected_values", "arc_dense_uncompressed"]
 
 
-def _correctness(model: torch.nn.Module, config: BenchmarkConfig) -> dict[str, Any]:
+def _correctness(model: torch.nn.Module, config: BenchmarkConfig, last_loss=None,
+                 observer: CollectiveObserver | None = None) -> dict[str, Any]:
     params = list(_raw_model(model).parameters())
     finite_parameters = all(bool(torch.isfinite(p).all()) for p in params)
     checksum = float(sum(p.detach().float().sum() for p in params))
-    per_rank = [(_collective_signature(config))]
+    per_rank = [observer.signature() if observer is not None else []]
     checksums = [checksum]
     if dist.is_available() and dist.is_initialized():
         gathered = [None for _ in range(dist.get_world_size())]
@@ -301,11 +307,32 @@ def _correctness(model: torch.nn.Module, config: BenchmarkConfig) -> dict[str, A
         checksum_values = [None for _ in range(dist.get_world_size())]
         dist.all_gather_object(checksum_values, checksum)
         checksums = checksum_values
-    return {"finite_loss": True, "finite_parameters": finite_parameters,
+    finite_loss = bool(last_loss is not None and torch.isfinite(last_loss).all())
+    return {"finite_loss": finite_loss, "finite_parameters": finite_parameters,
             "parameter_checksum": checksum,
             "parameter_checksum_agreement": len({round(float(x), 5) for x in checksums}) == 1,
-            "collective_signature": {"all_ranks_match": len({str(x) for x in per_rank}) == 1,
+            "collective_signature": {"all_ranks_match": signatures_agree(per_rank),
                                       "per_rank": per_rank}}
+
+
+def register_dense_ddp_hook(ddp_model, observer: CollectiveObserver):
+    """Register SUM/world-size averaging while observing real DDP buckets."""
+    process_group = getattr(ddp_model, "process_group", None)
+    world_size = dist.get_world_size(process_group) if process_group is not None else 1
+
+    def hook(state, bucket):
+        buffer = bucket.buffer()
+        observer.record("ddp_gradient", "all_reduce", buffer.numel(), buffer.dtype,
+                        buffer.numel() * buffer.element_size())
+        work = dist.all_reduce(buffer, op=dist.ReduceOp.SUM, group=process_group,
+                                async_op=True)
+        def average(future):
+            buffer.div_(world_size)
+            return buffer
+        return work.get_future().then(average)
+
+    ddp_model.register_comm_hook(None, hook)
+    return ddp_model
 
 
 def _run_steps(model, optimizer, batches, config, ddp_model=None, measure=False):
@@ -313,6 +340,7 @@ def _run_steps(model, optimizer, batches, config, ddp_model=None, measure=False)
         raise RuntimeError("benchmark execution requires CUDA; configuration helpers are CPU-safe")
     measured_events = []
     fwd_samples, opt_samples, step_samples = [], [], []
+    last_loss = None
     for tokens, targets in batches:
         step_start = torch.cuda.Event(enable_timing=True)
         fwd_start = torch.cuda.Event(enable_timing=True)
@@ -326,6 +354,7 @@ def _run_steps(model, optimizer, batches, config, ddp_model=None, measure=False)
             with record_function("benchmark/forward_backward"):
                 loss = model(tokens, targets=targets)
                 loss.backward()
+                last_loss = loss.detach()
         fwd_end.record(); opt_start.record()
         with record_function("benchmark/optimizer"):
             optimizer.step()
@@ -343,7 +372,7 @@ def _run_steps(model, optimizer, batches, config, ddp_model=None, measure=False)
             sample_tensor = torch.tensor(samples, device=torch.cuda.current_device(), dtype=torch.float64)
             dist.all_reduce(sample_tensor, op=dist.ReduceOp.MAX)
             samples[:] = sample_tensor.cpu().tolist()
-    return fwd_samples, opt_samples, step_samples
+    return fwd_samples, opt_samples, step_samples, last_loss
 
 
 def run_profiler(model, optimizer, batches, config, *, ddp_model=None, output=None):
@@ -362,6 +391,7 @@ def run_profiler(model, optimizer, batches, config, *, ddp_model=None, output=No
     schedule = torch.profiler.schedule(wait=3, warmup=3, active=5, repeat=1)
     if len(batches) < 11:
         batches = (list(batches) * ((11 + len(batches) - 1) // len(batches)))[:11]
+    last_loss = None
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
         schedule=schedule, on_trace_ready=on_trace_ready, record_shapes=False,
@@ -372,9 +402,11 @@ def run_profiler(model, optimizer, batches, config, *, ddp_model=None, output=No
                 with record_function("benchmark/forward_backward"):
                     loss = model(tokens, targets=targets)
                     loss.backward()
+                    last_loss = loss.detach()
             with record_function("benchmark/optimizer"):
                 optimizer.step(); optimizer.zero_grad(set_to_none=True)
             prof.step()
+    run_profiler.last_loss = last_loss
     return trace_path
 
 
@@ -391,13 +423,20 @@ def run_profile_mode(config: BenchmarkConfig) -> dict[str, Any]:
     model = build_model(config, device)
     ddp_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank]) if group else model
     optimizer = build_optimizer(config, model, group)
+    observer = CollectiveObserver()
+    if config.sync == "dense" and group:
+        register_dense_ddp_hook(ddp_model, observer)
+    set_active_observer(observer)
     random.seed(config.seed + rank); torch.manual_seed(config.seed + rank)
     batches = [(torch.randint(0, 50304, (config.local_batch, config.sequence_length), device=device),
                 torch.randint(0, 50304, (config.local_batch, config.sequence_length), device=device)) for _ in range(11)]
     trace_path = run_profiler(ddp_model, optimizer, batches, config, ddp_model=ddp_model)
     result = build_result_skeleton(config)
+    raw = _raw_model(ddp_model); compressed, uncompressed = _optimizer_parameters(raw)
+    result["communication"] = communication_result(config, group_parameters_by_shape_dtype(compressed), uncompressed)
     result["profiler"]["trace_path"] = trace_path
-    result["correctness"] = _correctness(ddp_model, config)
+    result["correctness"] = _correctness(ddp_model, config, getattr(run_profiler, "last_loss", None), observer)
+    set_active_observer(None)
     if rank == 0:
         from benchmark.compressed_muon.profiler_trace import attribute_trace
         trace_summary = attribute_trace(trace_path)
@@ -425,6 +464,7 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
     if config.world_size > 1 and not dist.is_initialized():
         dist.init_process_group("nccl")
     group = dist.group.WORLD if dist.is_initialized() else None
+    set_active_observer(None)
     random.seed(config.seed + rank); torch.manual_seed(config.seed + rank)
     model = build_model(config, device)
     ddp_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank]) if group else model
@@ -438,9 +478,14 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
     _run_steps(ddp_model, optimizer, batches[:config.warmup_steps], config, ddp_model)
     model = build_model(config, device); ddp_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank]) if group else model
     optimizer = build_optimizer(config, model, group)
+    observer = CollectiveObserver()
+    if config.sync == "dense" and group:
+        register_dense_ddp_hook(ddp_model, observer)
+    set_active_observer(observer)
     _run_steps(ddp_model, optimizer, batches[:config.warmup_steps], config, ddp_model)
+    observer.events.clear()
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats(device)
-    fwd, opt, step = _run_steps(ddp_model, optimizer, batches[config.warmup_steps:], config, ddp_model, True)
+    fwd, opt, step, last_loss = _run_steps(ddp_model, optimizer, batches[config.warmup_steps:], config, ddp_model, True)
     result = build_result_skeleton(config)
     result["timing_ms"].update(step_samples=step, fwd_bwd_samples=fwd, optimizer_samples=opt,
                                 step_mean=statistics.mean(step) if step else 0.0)
@@ -452,11 +497,8 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
         config, group_parameters_by_shape_dtype(compressed), uncompressed,
     )
     result["environment"] = _environment()
-    result["correctness"] = _correctness(ddp_model, config)
-    if config.profile_output:
-        run_profiler(ddp_model, optimizer, batches[config.warmup_steps:], config,
-                     ddp_model=ddp_model, output=config.profile_output)
-        result["profiler"]["trace_path"] = config.profile_output if rank == 0 else None
+    result["correctness"] = _correctness(ddp_model, config, last_loss, observer)
+    set_active_observer(None)
     if rank == 0 and config.output:
         Path(config.output).parent.mkdir(parents=True, exist_ok=True)
         Path(config.output).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")

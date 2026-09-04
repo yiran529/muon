@@ -23,7 +23,7 @@ def sample_stats(values: Iterable[float]) -> dict[str, float]:
             "cv": abs(std / mean) if mean else 0.0, "n": len(values)}
 
 
-def _check_invariants(results: list[dict[str, Any]]) -> None:
+def _check_invariants(results: list[dict[str, Any]], *, require_timing=False, require_profiler=False) -> None:
     if not results: raise ValueError("no benchmark result files supplied")
     for field in (*INVARIANTS, "optimizer"):
         if field not in results[0] or any(field not in item for item in results):
@@ -36,12 +36,14 @@ def _check_invariants(results: list[dict[str, Any]]) -> None:
             raise ValueError("unsupported or missing schema_version")
         for field in ("optimizer", "sync_mode"):
             if not item.get(field): raise ValueError(f"missing {field} field")
+        if require_timing and not item.get("timing_ms", {}).get("step_samples"):
+            raise ValueError("missing timing samples")
         profiler = item.get("profiler")
-        if not isinstance(profiler, dict) or profiler.get("nccl_kernel_time_ms") is None or not profiler.get("collectives"):
+        if require_profiler and (not isinstance(profiler, dict) or profiler.get("nccl_kernel_time_ms") is None or not profiler.get("collectives")):
             raise ValueError("missing profiler communication data")
 
 
-def _variant_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+def _variant_summary(results: list[dict[str, Any]], *, allow_missing_profiler=False) -> dict[str, Any]:
     def per_result_samples(item, key):
         values = item.get("timing_ms", {}).get(key, [])
         if not values: raise ValueError(f"missing timing_ms.{key} samples")
@@ -54,7 +56,7 @@ def _variant_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     allocated = [item.get("memory", {}).get("peak_allocated_mib", 0.0) for item in results]
     reserved = [item.get("memory", {}).get("peak_reserved_mib", 0.0) for item in results]
     return {"step": sample_stats(step), "optimizer": sample_stats(optimizer),
-            "nccl": sample_stats(nccl), "throughput": sample_stats(throughput),
+            "nccl": sample_stats(nccl) if nccl else (None if allow_missing_profiler else sample_stats(nccl)), "throughput": sample_stats(throughput),
             "memory": {"allocated_mib": sample_stats(allocated), "reserved_mib": sample_stats(reserved)}}
 
 
@@ -67,7 +69,8 @@ def _communication_bytes(item: dict[str, Any], arc: bool) -> float:
 
 def _gradient_comm_ms(item: dict[str, Any], arc: bool) -> float | None:
     collectives = item.get("profiler", {}).get("collectives", []) or []
-    names = {"arc_sketch", "arc_selected_values", "arc_ef21m"} if arc else {"ddp_gradient"}
+    names = {"arc_seed", "arc_sketch", "arc_selected_values", "arc_ef21m",
+             "arc_dense_uncompressed", "dense_uncompressed"} if arc else {"ddp_gradient"}
     values = [float(c.get("duration_ms", 0.0)) for c in collectives if c.get("category") in names]
     if values: return sum(values)
     return item.get("profiler", {}).get("nccl_kernel_time_ms")
@@ -77,25 +80,48 @@ def _ratio(dense: float, arc: float) -> float | None:
     return None if dense == 0 else 1.0 - arc / dense
 
 
-def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_results(results: list[dict[str, Any]], profiler_results=None) -> dict[str, Any]:
     """Summarize three-or-more repetitions, optionally containing dense and ARC variants."""
     if results and not isinstance(results[0], dict):
         results = load_results(results)
+    if profiler_results is not None and profiler_results and not isinstance(profiler_results[0], dict):
+        profiler_results = load_results(profiler_results)
     if len(results) < 3: raise ValueError("at least three result JSON files are required")
-    _check_invariants(results)
+    separate_inputs = profiler_results is not None
+    _check_invariants(results, require_timing=True, require_profiler=not separate_inputs)
+    if separate_inputs:
+        if len(profiler_results) < 3: raise ValueError("at least three profiler summaries are required")
+        _check_invariants(profiler_results, require_profiler=True)
+        _check_invariants(results + profiler_results)
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in results: grouped[item["sync_mode"]].append(item)
     if any(len(items) < 3 for items in grouped.values()):
         raise ValueError("at least three independent files are required per optimizer/sync cell")
-    variants = {mode: _variant_summary(items) for mode, items in grouped.items()}
+    variants = {mode: _variant_summary(items, allow_missing_profiler=separate_inputs) for mode, items in grouped.items()}
+    if separate_inputs:
+        profile_grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in profiler_results: profile_grouped[item["sync_mode"]].append(item)
+        if any(len(items) < 3 for items in profile_grouped.values()):
+            raise ValueError("at least three independent profiler files are required per cell")
+        profile_stats = {}
+        for mode, items in profile_grouped.items():
+            nccl = [item["profiler"]["nccl_kernel_time_ms"] for item in items]
+            profile_stats[mode] = sample_stats(nccl)
+        for mode in variants:
+            if mode not in profile_stats: raise ValueError(f"missing profiler cell for {mode}")
+            variants[mode]["nccl"] = profile_stats[mode]
     primary_mode = "arc" if "arc" in variants else next(iter(variants))
     primary = variants[primary_mode]
     dense_items = grouped.get("dense", [])
     arc_items = grouped.get("arc", [])
+    byte_sources = {mode: (items if not separate_inputs else items + profile_grouped.get(mode, []))
+                    for mode, items in grouped.items()}
     dense_bytes = statistics.mean([_communication_bytes(i, False) for i in dense_items]) if dense_items else None
     arc_bytes = statistics.mean([_communication_bytes(i, True) for i in arc_items]) if arc_items else None
-    dense_grad = statistics.mean([_gradient_comm_ms(i, False) for i in dense_items if _gradient_comm_ms(i, False) is not None]) if dense_items else None
-    arc_grad = statistics.mean([_gradient_comm_ms(i, True) for i in arc_items if _gradient_comm_ms(i, True) is not None]) if arc_items else None
+    profile_dense = profile_grouped.get("dense", []) if separate_inputs else dense_items
+    profile_arc = profile_grouped.get("arc", []) if separate_inputs else arc_items
+    dense_grad = statistics.mean([_gradient_comm_ms(i, False) for i in profile_dense if _gradient_comm_ms(i, False) is not None]) if profile_dense else None
+    arc_grad = statistics.mean([_gradient_comm_ms(i, True) for i in profile_arc if _gradient_comm_ms(i, True) is not None]) if profile_arc else None
     ratios = {
         "R_bytes": _ratio(dense_bytes, arc_bytes) if dense_bytes is not None and arc_bytes is not None else None,
         "R_grad_comm": _ratio(dense_grad, arc_grad) if dense_grad is not None and arc_grad is not None else None,

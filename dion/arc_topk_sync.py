@@ -9,6 +9,7 @@ import torch.distributed as dist
 from torch.profiler import record_function
 from torch import Tensor
 from torch.distributed import ProcessGroup
+from .collective_observer import observe_collective
 
 from .arc_topk import arc_topk_ef21m_async, validate_arc_topk_config
 
@@ -115,6 +116,7 @@ def average_gradients_async(
     if world_size == 1:
         return averaged
     for gradient in averaged:
+        observe_collective("arc/dense_uncompressed", "all_reduce", gradient)
         with record_function("arc/dense_uncompressed"):
             work = dist.all_reduce(
                 gradient,
