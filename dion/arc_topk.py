@@ -167,12 +167,13 @@ def arc_topk_ef21m_async(
         local_estimate_batch.copy_(tracker_batch)
         global_estimate_batch.copy_(tracker_batch)
         if process_group is not None and world_size > 1:
-            work = dist.all_reduce(
-                global_estimate_batch,
-                op=dist.ReduceOp.SUM,
-                group=process_group,
-                async_op=True,
-            )
+            with record_function("arc/dense_uncompressed"):
+                work = dist.all_reduce(
+                    global_estimate_batch,
+                    op=dist.ReduceOp.SUM,
+                    group=process_group,
+                    async_op=True,
+                )
             yield
             work.wait()
             global_estimate_batch.div_(world_size)
@@ -193,12 +194,13 @@ def arc_topk_ef21m_async(
     if group_rank == 0:
         seed_tensor.fill_(seed_value)
     if process_group is not None and world_size > 1:
-        work = dist.broadcast(
-            seed_tensor,
-            src=source_rank,
-            group=process_group,
-            async_op=True,
-        )
+        with record_function("arc/seed"):
+            work = dist.broadcast(
+                seed_tensor,
+                src=source_rank,
+                group=process_group,
+                async_op=True,
+            )
         yield
         work.wait()
     synchronized_seed = int(seed_tensor.item())
@@ -214,14 +216,15 @@ def arc_topk_ef21m_async(
             device=gradient_batch.device,
             dtype=gradient_batch.dtype,
         )
-        global_sketch = arc_topk_local_sketch(delta_batch, projection)
+    global_sketch = arc_topk_local_sketch(delta_batch, projection)
     if process_group is not None and world_size > 1:
-        work = dist.all_reduce(
-            global_sketch,
-            op=dist.ReduceOp.SUM,
-            group=process_group,
-            async_op=True,
-        )
+        with record_function("arc/sketch"):
+            work = dist.all_reduce(
+                global_sketch,
+                op=dist.ReduceOp.SUM,
+                group=process_group,
+                async_op=True,
+            )
         yield
         work.wait()
         global_sketch.div_(world_size)
@@ -233,12 +236,13 @@ def arc_topk_ef21m_async(
         local_selected = gather_rows(delta_batch, indices)
     averaged_selected = local_selected.clone()
     if process_group is not None and world_size > 1:
-        work = dist.all_reduce(
-            averaged_selected,
-            op=dist.ReduceOp.SUM,
-            group=process_group,
-            async_op=True,
-        )
+        with record_function("arc/selected_values"):
+            work = dist.all_reduce(
+                averaged_selected,
+                op=dist.ReduceOp.SUM,
+                group=process_group,
+                async_op=True,
+            )
         yield
         work.wait()
         averaged_selected.div_(world_size)

@@ -64,17 +64,30 @@ def _interval_union(intervals: Iterable[tuple[float, float]]) -> float:
             start, end = a, b
         else:
             end = max(end, b)
+    if start is not None:
+        total += end - start
     return total
 
 
 def _overlap(a: Iterable[tuple[float, float]], b: Iterable[tuple[float, float]]) -> float:
-    aa = sorted(a); bb = sorted(b); i = j = 0; total = 0.0
+    aa = _merge_intervals(a); bb = _merge_intervals(b); i = j = 0; total = 0.0
     while i < len(aa) and j < len(bb):
         left, right = max(aa[i][0], bb[j][0]), min(aa[i][1], bb[j][1])
         if right > left: total += right - left
         if aa[i][1] < bb[j][1]: i += 1
         else: j += 1
     return total
+
+
+def _merge_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
+    ordered = sorted((float(a), float(b)) for a, b in intervals if b > a)
+    merged = []
+    for start, end in ordered:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _range_category(name: str) -> str | None:
@@ -107,6 +120,19 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
         if category:
             start = float(event.get("ts", 0)); end = start + _duration(event)
             ranges.append((category, start, end, _correlation(event), event))
+    # PyTorch profiler commonly inserts a c10d launch/op node between a user
+    # range and the GPU kernel. Propagate the user's category through that node
+    # and its correlation/external id.
+    correlation_categories = {str(r[3]): r[0] for r in ranges if r[3] is not None}
+    for event in events:
+        name = str(event.get("name", "")).lower()
+        corr = _correlation(event)
+        if corr is None or ("c10d" not in name and "allreduce" not in name
+                            and "allgather" not in name and "broadcast" not in name):
+            continue
+        parent = _args(event).get("parent_correlation", _args(event).get("parent_external_id"))
+        if parent is not None and str(parent) in correlation_categories:
+            correlation_categories[str(corr)] = correlation_categories[str(parent)]
     groups: dict[str, dict[str, Any]] = defaultdict(lambda: {"kernel_count": 0, "duration_us": 0.0, "message_bytes": 0})
     nccl_intervals = []; compute_intervals = []
     for event in events:
@@ -117,7 +143,7 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
             candidates = [r for r in ranges if corr is not None and str(r[3]) == str(corr)]
             if not candidates:
                 candidates = [r for r in ranges if r[1] <= start and end <= r[2]]
-            category = candidates[-1][0] if candidates else "unattributed"
+            category = (correlation_categories.get(str(corr)) if corr is not None else None) or (candidates[-1][0] if candidates else "unattributed")
             item = groups[category]
             item["kernel_count"] += 1; item["duration_us"] += _duration(event)
             nccl_intervals.append((start, end))
@@ -145,8 +171,8 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
         "nccl_union_time_ms": union_us / 1000.0,
         "compute_overlap_ms": overlap_us / 1000.0,
         "nccl_compute_overlap_ms": overlap_us / 1000.0,
-        "exposed_nccl_time_ms": (union_us - overlap_us) / 1000.0,
-        "exposed_time_ms": (union_us - overlap_us) / 1000.0,
+        "exposed_nccl_time_ms": max(0.0, union_us - overlap_us) / 1000.0,
+        "exposed_time_ms": max(0.0, union_us - overlap_us) / 1000.0,
         "exposed_is_trace_estimate": True,
         "collectives": collectives,
     }

@@ -6,6 +6,7 @@ from typing import Generator, Iterable, Optional
 
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
@@ -114,12 +115,13 @@ def average_gradients_async(
     if world_size == 1:
         return averaged
     for gradient in averaged:
-        work = dist.all_reduce(
-            gradient,
-            op=dist.ReduceOp.SUM,
-            group=process_group,
-            async_op=True,
-        )
+        with record_function("arc/dense_uncompressed"):
+            work = dist.all_reduce(
+                gradient,
+                op=dist.ReduceOp.SUM,
+                group=process_group,
+                async_op=True,
+            )
         yield
         work.wait()
         gradient.div_(world_size)

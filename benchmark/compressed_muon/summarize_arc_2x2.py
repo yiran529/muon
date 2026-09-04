@@ -25,7 +25,7 @@ def sample_stats(values: Iterable[float]) -> dict[str, float]:
 
 def _check_invariants(results: list[dict[str, Any]]) -> None:
     if not results: raise ValueError("no benchmark result files supplied")
-    for field in INVARIANTS:
+    for field in (*INVARIANTS, "optimizer"):
         if field not in results[0] or any(field not in item for item in results):
             raise ValueError(f"missing {field} field")
         expected = results[0].get(field)
@@ -36,6 +36,9 @@ def _check_invariants(results: list[dict[str, Any]]) -> None:
             raise ValueError("unsupported or missing schema_version")
         for field in ("optimizer", "sync_mode"):
             if not item.get(field): raise ValueError(f"missing {field} field")
+        profiler = item.get("profiler")
+        if not isinstance(profiler, dict) or profiler.get("nccl_kernel_time_ms") is None or not profiler.get("collectives"):
+            raise ValueError("missing profiler communication data")
 
 
 def _variant_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -51,7 +54,7 @@ def _variant_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     allocated = [item.get("memory", {}).get("peak_allocated_mib", 0.0) for item in results]
     reserved = [item.get("memory", {}).get("peak_reserved_mib", 0.0) for item in results]
     return {"step": sample_stats(step), "optimizer": sample_stats(optimizer),
-            "nccl": sample_stats(nccl or [0.0]), "throughput": sample_stats(throughput),
+            "nccl": sample_stats(nccl), "throughput": sample_stats(throughput),
             "memory": {"allocated_mib": sample_stats(allocated), "reserved_mib": sample_stats(reserved)}}
 
 
@@ -82,6 +85,8 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     _check_invariants(results)
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in results: grouped[item["sync_mode"]].append(item)
+    if any(len(items) < 3 for items in grouped.values()):
+        raise ValueError("at least three independent files are required per optimizer/sync cell")
     variants = {mode: _variant_summary(items) for mode, items in grouped.items()}
     primary_mode = "arc" if "arc" in variants else next(iter(variants))
     primary = variants[primary_mode]

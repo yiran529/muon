@@ -2,6 +2,7 @@ import json
 import math
 
 import pytest
+import torch
 
 from benchmark.compressed_muon.benchmark_arc_2x2 import (
     MODEL_PRESETS,
@@ -9,8 +10,9 @@ from benchmark.compressed_muon.benchmark_arc_2x2 import (
     build_result_skeleton,
     parse_args,
     validate_config,
+    communication_result,
 )
-from benchmark.compressed_muon.profiler_trace import attribute_trace
+from benchmark.compressed_muon.profiler_trace import attribute_trace, _interval_union
 from benchmark.compressed_muon.summarize_arc_2x2 import summarize_results
 
 
@@ -61,12 +63,47 @@ def test_cli_parses_required_switches():
     assert config.optimizer == "muon" and config.sync == "arc"
 
 
+def test_cli_exposes_independent_profile_mode():
+    config = parse_args([
+        "--experiment-id", "CM002d-m001-muon-arc-gpt60m-ddp-ws4-s42",
+        "--optimizer", "muon", "--sync", "arc", "--model", "gpt60m",
+        "--warmup-steps", "5", "--measure-steps", "5", "--seed", "42",
+        "--output", "profile-summary.json", "--profile-output", "trace.json",
+        "--profile", "--smoke",
+    ])
+    assert config.profile_only is True
+
+
 def test_result_skeleton_has_schema_and_metadata():
     result = build_result_skeleton(_config())
     assert result["schema_version"] == 1
     assert result["model"]["label"] == "gpt60m"
     assert result["workload"]["dtype"] == "bfloat16"
     assert result["optimizer_config"] == {"lr": 1e-3, "betas": [0.9, 0.999], "weight_decay": 0.01}
+    assert set(result["communication"]) == {
+        "dense_gradient_bytes", "arc_seed_bytes", "arc_sketch_bytes",
+        "arc_selected_values_bytes", "uncompressed_bytes",
+    }
+
+
+def test_communication_result_uses_compressed_step_and_schema_keys():
+    result = communication_result(_config(sync="arc"), [[torch.zeros(10, 8, dtype=torch.bfloat16)]], [torch.zeros(7, 8, dtype=torch.bfloat16)])
+    assert result["arc_seed_bytes"] == 8
+    assert result["arc_sketch_bytes"] > 0
+    assert result["arc_selected_values_bytes"] > 0
+
+
+def test_formal_plan_id_and_accumulation_validation():
+    validate_config(_config(sync="arc", experiment_id="CM002b-m001-adamw-arc-gpt60m-ddp-ws4-s42"))
+    with pytest.raises(ValueError, match="gradient_accumulation"):
+        validate_config(_config(gradient_accumulation=2, formal=False))
+
+
+def test_p2p_transport_requires_expected_environment(monkeypatch):
+    monkeypatch.setenv("NCCL_P2P_DISABLE", "0")
+    monkeypatch.setenv("NCCL_SHM_DISABLE", "0")
+    with pytest.raises(ValueError, match="NCCL_P2P_DISABLE"):
+        validate_config(_config(transport="p2p_disabled"))
 
 
 def _trace_fixture():
@@ -97,9 +134,34 @@ def test_trace_attribution_preserves_unattributed_kernel_and_overlap_math():
     assert by_category["arc_selected_values"]["kernel_count"] == 1
     assert by_category["muon_result"]["kernel_count"] == 1
     assert by_category["unattributed"]["kernel_count"] == 1
+    assert summary["nccl_union_time_ms"] == pytest.approx(0.077)
+    assert summary["compute_overlap_ms"] == pytest.approx(0.02)
+    assert summary["exposed_nccl_time_ms"] == pytest.approx(0.057)
+
+
+def test_trace_union_flushes_tail_and_overlap_merges_concurrent_intervals():
+    assert _interval_union([(0, 10)]) == pytest.approx(10)
+    trace = {"traceEvents": [
+        {"name": "arc/sketch", "ph": "X", "ts": 0, "dur": 100, "args": {"correlation": 1, "bytes": 1}},
+        {"name": "ncclKernel_AllReduce", "ph": "X", "ts": 0, "dur": 50, "args": {"correlation": 1}},
+        {"name": "ncclKernel_AllReduce", "ph": "X", "ts": 20, "dur": 50, "args": {"correlation": 1}},
+        {"name": "compute_kernel", "cat": "kernel", "ph": "X", "ts": 40, "dur": 20},
+    ]}
+    summary = attribute_trace(trace)
     assert summary["nccl_union_time_ms"] == pytest.approx(0.07)
     assert summary["compute_overlap_ms"] == pytest.approx(0.02)
     assert summary["exposed_nccl_time_ms"] == pytest.approx(0.05)
+
+
+def test_result_schema_exposes_smoke_correctness_and_profile_mode():
+    result = build_result_skeleton(_config())
+    assert result["correctness"] == {
+        "finite_loss": None, "finite_parameters": None,
+        "parameter_checksum": None, "parameter_checksum_agreement": None,
+        "collective_signature": {
+            "all_ranks_match": None, "per_rank": []
+        }
+    }
 
 
 def test_summary_math_and_invariant_validation():
@@ -116,6 +178,7 @@ def test_summary_math_and_invariant_validation():
         item["communication"]["arc_sketch_bytes"] = 9
         item["communication"]["arc_selected_values_bytes"] = 15
         item["profiler"]["nccl_kernel_time_ms"] = value
+        item["profiler"]["collectives"] = [{"category": "ddp_gradient", "duration_ms": value}]
         cells.append(item)
     for value in (7.5, 7.5, 7.5):
         item = json.loads(json.dumps(base))
@@ -128,6 +191,7 @@ def test_summary_math_and_invariant_validation():
         item["communication"]["arc_sketch_bytes"] = 9
         item["communication"]["arc_selected_values_bytes"] = 15
         item["profiler"]["nccl_kernel_time_ms"] = value
+        item["profiler"]["collectives"] = [{"category": "arc_sketch", "duration_ms": value}]
         cells.append(item)
     summary = summarize_results(cells)
     assert summary["variants"]["dense"]["step"]["mean_ms"] == pytest.approx(10.0)
@@ -141,3 +205,12 @@ def test_summary_math_and_invariant_validation():
     bad["transport"] = "p2p_disabled"
     with pytest.raises(ValueError, match="transport"):
         summarize_results(cells + [bad])
+
+
+def test_summary_rejects_missing_profiler_and_short_variant_cell():
+    base = build_result_skeleton(_config())
+    item = json.loads(json.dumps(base))
+    item["timing_ms"]["step_samples"] = [10.0]
+    item["timing_ms"]["optimizer_samples"] = [5.0]
+    with pytest.raises(ValueError, match="profiler"):
+        summarize_results([item, json.loads(json.dumps(item)), json.loads(json.dumps(item))])

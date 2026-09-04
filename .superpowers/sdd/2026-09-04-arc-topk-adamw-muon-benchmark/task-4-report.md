@@ -20,3 +20,14 @@
 - 本任务按要求未启动正式 GPU/2x2 实验；runner/profile 的 CUDA 路径仅完成代码级实现。
 - trace attribution 对不同 profiler 版本采用 correlation 与时间包含回退；无法识别 parent 的 NCCL kernel 会显式归为 `unattributed`。
 - profiler 的 exposed communication 是 trace-derived estimate，不应解读为独立的端到端通信时间。
+
+## Round-1 修复
+
+- 修正结果 communication schema keys，并确保逻辑字节估算使用压缩阶段 step（默认 step 2）。
+- 增加独立 `--profile` 模式：fresh model/optimizer，固定 3 wait + 3 warmup + 5 active steps，解析并写入 profiler summary。
+- 修复 NCCL/compute interval union 尾段 flush、并发区间合并及 exposed 非负约束；补齐 c10d correlation 传递和 seed/sketch/selected/dense/Muon ranges。
+- summarizer 现在要求每个 optimizer/sync cell 至少 3 个独立结果，严格校验 invariant 与 profiler 通信数据。
+- 接受 `CM002b-m001-adamw-arc-...` / `CM002d-m001-muon-arc-...` 语义 ID，拒绝非 1 gradient accumulation，校验 P2P transport 环境。
+- 结果新增有限性、参数 checksum agreement 和 per-rank collective signature 字段；模型初始化使用 `config.seed`，Muon 显式记录 accelerated kernel 选择。
+
+Round-1 focused verification：`71 passed, 14 warnings`（benchmark + ARC/Muon 回归）；compileall 与 `git diff --check` 通过。正式 GPU 实验仍未启动。
