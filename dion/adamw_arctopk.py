@@ -82,10 +82,12 @@ class ArcTopKAdamW(Optimizer):
 
         self._process_group = process_group
         self._arc_step = 0
+        self._hyperparam_tensors: dict[tuple[int, str], Tensor] = {}
         self._state_prepopulated = False
         for group in self.param_groups:
             self._validate_group(group)
             self._prepopulate_group_state(group)
+        self._sync_hyperparam_tensors()
         self._state_prepopulated = True
 
     def _validate_group(self, group: dict) -> None:
@@ -114,11 +116,40 @@ class ArcTopKAdamW(Optimizer):
         state = self.state[param]
         state.setdefault("momentum", torch.zeros_like(param))
         state.setdefault("variance", torch.zeros_like(param))
-        state.setdefault(
-            "step_dev",
-            torch.zeros((), dtype=torch.float32, device=to_local(param).device),
-        )
+        device = to_local(param).device
+        step_dev = state.get("step_dev")
+        if step_dev is None:
+            step_dev = torch.zeros((), dtype=torch.float32, device=device)
+        elif not isinstance(step_dev, Tensor):
+            step_dev = torch.tensor(step_dev, dtype=torch.float32, device=device)
+        elif step_dev.dtype != torch.float32 or step_dev.device != device:
+            step_dev = step_dev.to(device=device, dtype=torch.float32)
+        state["step_dev"] = step_dev
         return state
+
+    def _ensure_lr_tensor(self, index: int) -> Optional[Tensor]:
+        group = self.param_groups[index]
+        params = group["params"]
+        if not params:
+            return None
+        value = group["lr"]
+        tensor = self._hyperparam_tensors.get((index, "lr"))
+        device = to_local(params[0]).device
+        if value is tensor and tensor is not None and tensor.device == device:
+            return tensor
+        if tensor is None or tensor.device != device:
+            tensor = torch.empty((), dtype=torch.float32, device=device)
+            self._hyperparam_tensors[(index, "lr")] = tensor
+        if isinstance(value, Tensor):
+            tensor.copy_(value)
+        else:
+            tensor.fill_(value)
+        group["lr"] = tensor
+        return tensor
+
+    def _sync_hyperparam_tensors(self) -> None:
+        for index in range(len(self.param_groups)):
+            self._ensure_lr_tensor(index)
 
     def add_param_group(self, param_group: dict) -> None:
         super().add_param_group(param_group)
@@ -128,10 +159,13 @@ class ArcTopKAdamW(Optimizer):
         group["arc_step"] = self._arc_step
         self._validate_group(group)
         self._prepopulate_group_state(group)
+        self._ensure_lr_tensor(len(self.param_groups) - 1)
 
     def state_dict(self):
         result = super().state_dict()
         for group in result["param_groups"]:
+            if isinstance(group.get("lr"), Tensor):
+                group["lr"] = float(group["lr"].item())
             group["arc_step"] = self._arc_step
         return result
 
@@ -163,6 +197,7 @@ class ArcTopKAdamW(Optimizer):
         for group in self.param_groups:
             self._validate_group(group)
             self._prepopulate_group_state(group)
+        self._sync_hyperparam_tensors()
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -171,6 +206,7 @@ class ArcTopKAdamW(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        self._sync_hyperparam_tensors()
         self._arc_step += 1
         for group in self.param_groups:
             group["arc_step"] = self._arc_step

@@ -32,3 +32,14 @@
 ## 注意事项
 
 当前环境无可用 CUDA；全仓库既有 Triton/Inductor wrapper 测试仍有上述环境/依赖相关失败。
+
+## Review round 1 修复
+
+- RED：新增持久 LR tensor、BF16/缺失 `step_dev`、梯度不变、非 bool
+  `arc_compress`、调度器并发边界以及分布式 ratio=1/状态恢复测试；原实现
+  对 LR tensor 和 BF16 `step_dev` 测试分别失败。
+- GREEN：每组 LR 现持有参数本地设备上的持久 FP32 0-d tensor，支持调度器
+  重新赋值而保持 tensor identity；加载后 `step_dev` 强制为本地 FP32，缺失
+  时补零初始化；AsyncRuntime 并发上限固定为 3。
+- Review focused verification：本地 19 passed；两 rank Gloo 1 passed（最小
+  loopback socket 权限）；`git diff --check` 和 Python 编译检查通过。

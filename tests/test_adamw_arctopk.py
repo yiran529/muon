@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from dion import ArcTopKAdamW
+import dion.adamw_arctopk as adamw_arctopk_module
 
 
 def _make_optimizer(*params, **kwargs):
@@ -47,6 +48,12 @@ def test_compressed_groups_require_2d_parameters():
     parameter = torch.nn.Parameter(torch.zeros(2, 3, 4))
     with pytest.raises(ValueError, match="2D"):
         ArcTopKAdamW([{"params": [parameter], "arc_compress": True}])
+
+
+def test_arc_compress_must_be_bool():
+    parameter = torch.nn.Parameter(torch.zeros(4, 3))
+    with pytest.raises(ValueError, match="arc_compress"):
+        ArcTopKAdamW([{"params": [parameter], "arc_compress": 1}])
 
 
 def test_prepopulates_adamw_state_and_arc_state_only_for_compressed_group():
@@ -98,6 +105,92 @@ def test_state_dict_carries_one_optimizer_wide_arc_step_and_restores_it():
     )
     restored.load_state_dict(saved)
     assert restored._arc_step == 1
+
+
+def test_lr_is_persistent_device_tensor_and_tracks_scheduler_reassignment():
+    parameter = torch.nn.Parameter(torch.zeros(4, 3))
+    optimizer = ArcTopKAdamW([parameter], lr=0.05)
+
+    lr_tensor = optimizer._hyperparam_tensors[(0, "lr")]
+    assert isinstance(lr_tensor, torch.Tensor)
+    assert lr_tensor.ndim == 0
+    assert lr_tensor.dtype == torch.float32
+    assert lr_tensor.device == parameter.device
+    assert optimizer.param_groups[0]["lr"] is lr_tensor
+
+    optimizer.param_groups[0]["lr"] = 0.025
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    assert optimizer.param_groups[0]["lr"] is lr_tensor
+    assert lr_tensor.item() == pytest.approx(0.025)
+
+
+def test_optimizer_step_does_not_replace_or_mutate_param_grad():
+    parameter = torch.nn.Parameter(torch.zeros(4, 3))
+    optimizer = ArcTopKAdamW(
+        [{"params": [parameter], "arc_compress": True}],
+        arc_topk_ratio=0.5,
+        arc_projection_rank=2,
+    )
+    gradient = torch.arange(12.0).reshape(4, 3)
+    parameter.grad = gradient.clone()
+    grad_identity = parameter.grad
+    optimizer.step()
+    assert parameter.grad is grad_identity
+    torch.testing.assert_close(parameter.grad, gradient)
+
+    dense_parameter = torch.nn.Parameter(torch.zeros(3))
+    dense_optimizer = ArcTopKAdamW([dense_parameter])
+    dense_gradient = torch.arange(3.0)
+    dense_parameter.grad = dense_gradient.clone()
+    dense_grad_identity = dense_parameter.grad
+    dense_optimizer.step()
+    assert dense_parameter.grad is dense_grad_identity
+    torch.testing.assert_close(dense_parameter.grad, dense_gradient)
+
+
+def test_load_migrates_missing_or_low_precision_step_dev():
+    parameter = torch.nn.Parameter(torch.zeros(4, 3, dtype=torch.bfloat16))
+    optimizer = ArcTopKAdamW([parameter])
+    saved = optimizer.state_dict()
+    saved["state"][0]["step_dev"] = torch.tensor(3.0, dtype=torch.bfloat16)
+
+    restored_parameter = torch.nn.Parameter(torch.zeros(4, 3, dtype=torch.bfloat16))
+    restored = ArcTopKAdamW([restored_parameter])
+    restored.load_state_dict(saved)
+    step_dev = restored.state[restored_parameter]["step_dev"]
+    assert step_dev.dtype == torch.float32
+    assert step_dev.device == restored_parameter.device
+    assert step_dev.item() == pytest.approx(3.0)
+
+    del saved["state"][0]["step_dev"]
+    restored.load_state_dict(saved)
+    step_dev = restored.state[restored_parameter]["step_dev"]
+    assert step_dev.dtype == torch.float32
+    assert step_dev.item() == pytest.approx(0.0)
+
+
+def test_step_uses_three_way_async_runtime(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 3))
+    optimizer = ArcTopKAdamW(
+        [{"params": [parameter], "arc_compress": True}],
+        arc_topk_ratio=0.5,
+        arc_projection_rank=2,
+    )
+    parameter.grad = torch.ones_like(parameter)
+    observed = {}
+
+    class RecordingRuntime:
+        def __init__(self, tasks, max_concurrent_tasks):
+            observed["tasks"] = tasks
+            observed["max_concurrent_tasks"] = max_concurrent_tasks
+
+        def run(self):
+            return None
+
+    monkeypatch.setattr(adamw_arctopk_module, "AsyncRuntime", RecordingRuntime)
+    optimizer.step()
+    assert observed["max_concurrent_tasks"] == 3
 
 
 def test_load_rejects_inconsistent_arc_step_across_groups():
