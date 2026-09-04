@@ -1,0 +1,16 @@
+# M001 ARC-TopK-EF21M-Muon：scale-out 稳定证据（2026-09-05）
+
+本节只纳入具有完整 3 次 timing、3 次 profiler、有限值、collective signature 和 exact parameter checksum agreement 的成对 cell。共同配置为 BF16、4 卡 DDP、local batch 1、sequence length 256、gradient accumulation 1、20 warmup + 100 measured steps、seed 42、ARC `ratio=0.2`、`projection_rank=4`、`eta=0.1`、`start_compress_step=0`。均值后的 `mean±std (CV)` 为三次独立 process repeat 的样本统计；step 和 throughput 来自 timing JSON，NCCL 来自 profiler summary。
+
+| 成对证据 | Dense step → ARC step (ms) | Dense → ARC throughput (tokens/s) | Dense → ARC peak allocated / reserved (MiB) | logical bytes Dense → ARC | profiler gradient NCCL Dense → ARC (ms) | profiler total NCCL Dense → ARC (ms) | R_bytes / R_grad_comm / R_step |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GPT-130M AdamW normal | 39.992±1.540 (3.85%) → 29.401±1.130 (3.84%) | 25629.7±969.0 → 34862.9±1317.7 | 1835.8±0.5 / 5009.3±79.9 → 2277.8±0.0 / 2878.0±0.0 | 267780096 → 177672216 | 154.065±11.148 → 126.108±13.176 | 154.065±11.148 → 126.108±13.176 | 0.3365 / 0.1815 / 0.2648 |
+| GPT-130M AdamW P2P-disabled | 39.924±1.788 (4.48%) → 28.745±0.316 (1.10%) | 25682.6±1135.5 → 35627.0±391.5 | 1835.3±0.0 / 5044.0±0.0 → 2277.8±0.0 / 2878.0±0.0 | 267780096 → 177672216 | 159.504±2.056 → 127.369±7.914 | 159.504±2.056 → 127.369±7.914 | 0.3365 / 0.2015 / 0.2800 |
+| GPT-350M AdamW normal | 103.959±0.987 (0.95%) → 75.578±1.691 (2.24%) | 9850.6±94.0 → 13553.4±303.9 | 4756.1±0.0 / 11498.0±0.0 → 7691.1±0.0 / 10632.0±0.0 | 709361664 → 308281368 | 413.803±26.158 → 231.813±3.919 | 413.803±26.158 → 231.813±3.919 | 0.5654 / 0.4398 / 0.2730 |
+| GPT-350M AdamW P2P-disabled | 106.521±3.330 (3.13%) → 76.587±1.214 (1.59%) | 9619.4±303.9 → 13372.7±210.1 | 4756.1±0.0 / 11498.0±0.0 → 7691.1±0.0 / 10632.0±0.0 | 709361664 → 308281368 | 418.947±27.947 → 234.583±12.846 | 418.947±27.947 → 234.583±12.846 | 0.5654 / 0.4401 / 0.2810 |
+| GPT-350M Muon normal | 143.888±6.856 (4.76%) → 113.655±1.931 (1.70%) | 7127.2±330.9 → 9011.4±153.8 | 4396.6±0.0 / 10964.0±41.6 → 7211.0±0.0 / 9672.0±0.0 | 709361664 → 308281368 | 425.991±19.477 → 205.261±14.015 | 425.991±19.477 → 377.209±24.670 | 0.5654 / 0.5182 / 0.2101 |
+| GPT-350M Muon P2P-disabled | 143.753±2.018 (1.40%) → 113.365±1.544 (1.36%) | 7124.3±100.7 → 9033.9±123.4 | 4396.6±0.0 / 10940.0±0.0 → 7211.0±0.0 / 9672.0±0.0 | 709361664 → 308281368 | 440.632±23.855 → 212.484±17.692 | 440.632±23.855 → 392.111±29.265 | 0.5654 / 0.5178 / 0.2114 |
+
+`R_x = 1 - ARC/Dense`。`R_bytes` 是 logical per-step communication bytes 的观察；`R_grad_comm` 只统计 DDP gradient 或 ARC seed/sketch/selected-values/dense-uncompressed 类别，不包含 Muon ARC 的 `muon_result`。因此 GPT-350M Muon 的 total NCCL 比 gradient NCCL 大，不能把 `R_grad_comm` 解释为完整 NCCL reduction。Profiler gradient CV 在部分 cell 超过 5%（最高约 10.45%），这里保留其不确定性；scale-out 按用户指示未因该指标回溯拒绝，预先的正式 step-CV 只作报告。
+
+这些结果支持“在本机、本 synthetic workload 下，四个 AdamW/ARC 配对和两个 GPT-350M Muon/ARC 配对均有稳定的短 benchmark 观测”，但不是收敛或 time-to-quality 证据。130M Muon dense 的 exact checksum agreement 失败，不能形成 130M Muon 的正式 paired R；1B AdamW ARC 4-rank probe OOM，且 1B Muon dense checksum agreement 失败，因此不报告任何 1B paired benefit。更多限制与 raw evidence 见 `.superpowers/sdd/2026-09-04-arc-topk-adamw-muon-benchmark/task-9-scale-results-report.md`。

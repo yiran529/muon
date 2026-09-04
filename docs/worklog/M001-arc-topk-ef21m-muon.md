@@ -414,3 +414,58 @@ Profiler summary 的 NCCL 总 kernel 时间、gradient subset 时间和 exposed 
 - Task 6/7 ledger：`.superpowers/sdd/2026-09-04-arc-topk-adamw-muon-benchmark/progress.md`
 - 实验登记：`docs/compressed_muon/EXPERIMENTS.md`
 - timing/profiler raw：`artifacts/compressed_muon/CM002a-adamw-dense-gpt60m-ddp-ws4-s42/` 至 `CM003d-m001-muon-arc-gpt60m-ddp-ws4-s42/`
+
+## 2026-09-05：CM004a–CM009d serial scale-out 结果整理
+
+### 目的和口径
+
+本轮按 serial launcher 完成 GPT-130M、350M、1B 的 normal 与 `NCCL_P2P_DISABLE=1, NCCL_SHM_DISABLE=0` 两种 transport。所有 formal cell 使用 4 卡 DDP、BF16、local batch 1、sequence length 256、gradient accumulation 1、20 warmup + 100 measured steps、seed 42；ARC 使用 `ratio=0.2`、`projection_rank=4`、`eta=0.1`、`start_compress_step=0`。原始 timing JSON、profiler summary/Chrome trace、环境文件、失败/OOM 日志、事件 manifest 和 per-model partial manifest 均保留在 `artifacts/compressed_muon/`，未改 benchmark 或 optimizer math。
+
+### 24 个 formal cell 的最终分类
+
+| 模型 / transport | AdamW dense | AdamW ARC | Muon dense | Muon ARC |
+|---|---|---|---|---|
+| GPT-130M normal（CM004a–d） | CM004a completed | CM004b completed | CM004c failed：三次 timing/profile 的 exact `parameter_checksum_agreement=false` | CM004d completed（但无有效 dense-Muon 对） |
+| GPT-130M P2P-disabled（CM005a–d） | CM005a completed | CM005b completed | CM005c failed：三次 timing/profile 的 exact `parameter_checksum_agreement=false` | CM005d completed（但无有效 dense-Muon 对） |
+| GPT-350M normal（CM006a–d） | CM006a completed | CM006b completed | CM006c completed | CM006d completed |
+| GPT-350M P2P-disabled（CM007a–d） | CM007a completed | CM007b completed | CM007c completed | CM007d completed |
+| GPT-1B normal（CM008a–d） | CM008a completed | CM008b stopped：4-rank AdamW ARC probe 在 optimizer-state prepopulation OOM；formal cell 未启动 | CM008c failed：timing r1–r3 exact `parameter_checksum_agreement=false`；profiler checksum field true 但 timing gate 失败 | CM008d completed（但无有效 dense-Muon 对） |
+| GPT-1B P2P-disabled（CM009a–d） | CM009a completed | CM009b stopped：沿用同一 model-scoped AdamW ARC OOM gate；formal cell 未启动 | CM009c failed：timing r1–r3 exact `parameter_checksum_agreement=false`；profiler checksum field true 但 timing gate 失败 | CM009d completed（但无有效 dense-Muon 对） |
+
+独立按 raw timing/profile evidence 统计为 18 个 completed、4 个 checksum-invalid failed、2 个 OOM-stopped。partial manifest 的 `status_counts` 当前分别为 `4/2/2`、`6/0/2`、`4/2/2`（completed/invalid/skipped）；其中 GPT-130M 的 CM004b/CM005b 和 GPT-350M 的 CM006b/CM007b 含有历史 skip 事件但最终 timing/profile 已 valid，故不能直接把该字段当作终态。登记表按逐 cell 的最终 raw evidence 把 `invalid` 写为 `failed`、对应 OOM gate 写为 `stopped`，并保留 manifest 历史事件。
+
+### 六个完整成对 summary
+
+六个已有 summary（GPT-130M AdamW 两种 transport；GPT-350M AdamW 两种 transport；GPT-350M Muon 两种 transport）用 `benchmark/compressed_muon/summarize_arc_2x2.py` 从各自 6 个 timing/profile 输入重算，JSON 与已有文件逐字段 exact match。下表仅列稳定、有效的 paired R；数值为 `mean±sample std (CV)`，step/throughput 来自 timing，gradient NCCL 来自 profiler 的相应类别，logical bytes 为每步通信字节。
+
+| pair | step Dense → ARC (ms) | throughput Dense → ARC (tokens/s) | peak allocated / reserved Dense → ARC (MiB) | logical bytes Dense → ARC | gradient NCCL Dense → ARC (ms) | total NCCL Dense → ARC (ms) | R_bytes / R_grad_comm / R_step |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GPT-130M AdamW normal | 39.992±1.540 (3.85%) → 29.401±1.130 (3.84%) | 25629.7±969.0 → 34862.9±1317.7 | 1835.8±0.5 / 5009.3±79.9 → 2277.8±0.0 / 2878.0±0.0 | 267780096 → 177672216 | 154.065±11.148 → 126.108±13.176 | 154.065±11.148 → 126.108±13.176 | 0.3365 / 0.1815 / 0.2648 |
+| GPT-130M AdamW P2P-disabled | 39.924±1.788 (4.48%) → 28.745±0.316 (1.10%) | 25682.6±1135.5 → 35627.0±391.5 | 1835.3±0.0 / 5044.0±0.0 → 2277.8±0.0 / 2878.0±0.0 | 267780096 → 177672216 | 159.504±2.056 → 127.369±7.914 | 159.504±2.056 → 127.369±7.914 | 0.3365 / 0.2015 / 0.2800 |
+| GPT-350M AdamW normal | 103.959±0.987 (0.95%) → 75.578±1.691 (2.24%) | 9850.6±94.0 → 13553.4±303.9 | 4756.1±0.0 / 11498.0±0.0 → 7691.1±0.0 / 10632.0±0.0 | 709361664 → 308281368 | 413.803±26.158 → 231.813±3.919 | 413.803±26.158 → 231.813±3.919 | 0.5654 / 0.4398 / 0.2730 |
+| GPT-350M AdamW P2P-disabled | 106.521±3.330 (3.13%) → 76.587±1.214 (1.59%) | 9619.4±303.9 → 13372.7±210.1 | 4756.1±0.0 / 11498.0±0.0 → 7691.1±0.0 / 10632.0±0.0 | 709361664 → 308281368 | 418.947±27.947 → 234.583±12.846 | 418.947±27.947 → 234.583±12.846 | 0.5654 / 0.4401 / 0.2810 |
+| GPT-350M Muon normal | 143.888±6.856 (4.76%) → 113.655±1.931 (1.70%) | 7127.2±330.9 → 9011.4±153.8 | 4396.6±0.0 / 10964.0±41.6 → 7211.0±0.0 / 9672.0±0.0 | 709361664 → 308281368 | 425.991±19.477 → 205.261±14.015 | 425.991±19.477 → 377.209±24.670 | 0.5654 / 0.5182 / 0.2101 |
+| GPT-350M Muon P2P-disabled | 143.753±2.018 (1.40%) → 113.365±1.544 (1.36%) | 7124.3±100.7 → 9033.9±123.4 | 4396.6±0.0 / 10940.0±0.0 → 7211.0±0.0 / 9672.0±0.0 | 709361664 → 308281368 | 440.632±23.855 → 212.484±17.692 | 440.632±23.855 → 392.111±29.265 | 0.5654 / 0.5178 / 0.2114 |
+
+这里 `R_x=1-ARC/Dense`。Muon ARC 的 total NCCL 包含 `muon_result`，而 gradient NCCL 只含 gradient communication 类别；因此二者必须分开解释。部分 profiler gradient/NCCL CV 超过 5%（最高约 10.45%），保留为 uncertainty；按用户要求未回溯拒绝 scale-out，正式成对 validity 以 checksum/finite/signature 和 timing/profile 完整性为准。
+
+其余通过 validator 但没有有效 paired R 的 completed cell 也保留如下：CM004d step `37.875±1.114 ms`（CV 2.94%，27051.9±803.2 tokens/s，alloc/reserved `2167.1±0.4/2669.3±9.2 MiB`，logical bytes `177672216`，gradient/total NCCL `114.226±13.268/154.084±15.440 ms`）；CM005d step `35.985±0.567 ms`（1.57%，28461.1±452.3 tokens/s，`2166.9±0.0/2664.0±0.0 MiB`，`177672216` bytes，`110.682±11.335/150.658±15.300 ms`）。1B standalone cells：CM008a `299.496±5.549 ms`（1.85%，3419.8±62.7 tokens/s，`13532.5/23386.0 MiB`，`2007760896` bytes，`1213.642±17.805 ms`）；CM008d `313.485±0.097 ms`（0.03%，3266.5±1.0 tokens/s，`22457.3/23200.0 MiB`，`652732440` bytes，gradient/total `448.908±29.500/1069.532±66.971 ms`）；CM009a `306.819±12.349 ms`（4.02%，3341.2±137.6 tokens/s，`13532.5/23386.0 MiB`，`2007760896` bytes，`1246.154±34.759 ms`）；CM009d `311.104±9.427 ms`（3.03%，3293.6±101.6 tokens/s，`22457.3/23200.0 MiB`，`652732440` bytes，`483.374±20.446/1114.913±12.254 ms`）。这些 standalone 观测不用于推导任何 paired R。
+
+### Invalid cell 的 exploratory raw timing（不得用于 paired R）
+
+以下仅帮助审计原始运行，不是正式比较：CM004c `45.410±0.593 ms`（CV 1.31%，22552.8 tokens/s）、CM005c `44.862±1.988 ms`（4.43%，22855.0 tokens/s）、CM008c `463.131±7.855 ms`（1.70%，2211.5 tokens/s）、CM009c `471.954±6.564 ms`（1.39%，2170.0 tokens/s）。四个 cell 的 timing r1–r3 均有 finite loss/parameters 和 matching collective signatures，但 exact checksum agreement 为 false；130M profiler 也为 false，1B profiler checksum field 为 true，cell 仍因 timing gate 失败。因而四者不能与 ARC cell 组成有效 Muon paired R，也不能据此宣称 130M 或 1B Muon 收益。对应 rank-0 130M checksum 为 `-5961.451935559417`，1B 为 `-170494.38884379686`；raw evidence 未包含非零 rank 的 checksum 或参数差分幅度。
+
+### OOM、checksum 和解释边界
+
+- GPT-1B AdamW ARC 的 4-rank probe 在 `ArcTopKAdamW._prepopulate_group_state` 的 `torch.zeros_like(param)` 处 OOM，日志显示尝试额外分配 148 MiB、每卡约 23.39 GiB 已用；因此 CM008b/CM009b 是 model-scoped OOM skip，而不是 timing failure。保留 probe 与 formal OOM 日志，不改变 workload 以强行适配。
+- GPT-130M 与 GPT-1B dense Muon 的 exact checksum divergence 在 normal/P2P-disabled 两种 transport 均出现；已有诊断支持“局部 Polar Express/Triton shape/backend 可能放大 rank-local 差异”的 inference（130M 的 768/3072 shape 是窄相关），但 root cause 未证明。不要把 checksum gate 放宽为 allclose，也不要将这些 raw timing 当作 valid comparison。
+- 现有 launcher 仍有一个窄的 signal-vs-OOM 状态竞争窗口：controller signal 与子进程 OOM/终止若在同一边界发生，事件分类可能依赖到达顺序。该限制已记录、raw evidence 保留，本任务按用户要求不修复；不影响本次最终 partial-manifest 分类。
+- 观察（observation）：在 130M/350M 有效 AdamW pairs 与 350M 有效 Muon pairs 中，ARC logical bytes 分别减少约 33.65%/56.54%，step R 为约 18.15–28.10%。推断（inference）：本机 workload 的 measured step 受 projection、Top-K、EF21M、collective 粒度和 Muon 正交化共同影响，不能由 bytes ratio 单独解释。
+- 限制：这是 synthetic 100-step timing/profiler benchmark，不包含收敛、time-to-quality、跨节点网络或最终模型质量证据；不得报告任何 1B paired benefit。
+
+### 验证和关联产物
+
+- 对全部 18 个 completed cell 的 108 个 timing/profile JSON 运行 `validate_scale_to_1b.validate`：identity/configuration、100 个正 step samples、finite/checksum/signature、required collective category、trace JSON、observer/trace byte agreement 和 zero unattributed active NCCL 均通过。4 个 invalid cell 的 12 个 timing JSON 均因 exact checksum gate 被拒绝；130M 的 6 个 profiler JSON 也被拒绝，1B 的 6 个 profiler JSON 通过但不改变 timing-invalid 分类；2 个 stopped OOM cell 无 timing/profile JSON。
+- 六个 summary 通过 `summarize_arc_2x2.py` fresh recompute，并与既有 summary 逐字段 exact match；`R_bytes/R_grad_comm/R_step`、CV 和 sample std 均由脚本重算。
+- 原始 evidence：`artifacts/compressed_muon/CM004a...` 至 `CM009d...` 各 cell 目录、`gpt130m-partial.json`、`gpt350m-partial.json`、`gpt1b-partial.json`、`scale-to-1b-manifest.jsonl`、最新 status log、以及 `.superpowers/sdd/2026-09-04-arc-topk-adamw-muon-benchmark/muon-dense-checksum-diagnosis.md`。
+- 稳定结果入口：`docs/compressed_muon/RESULTS.md`；24 行登记：`docs/compressed_muon/EXPERIMENTS.md`；本任务完整报告：`.superpowers/sdd/2026-09-04-arc-topk-adamw-muon-benchmark/task-9-scale-results-report.md`。
