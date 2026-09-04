@@ -209,3 +209,43 @@ M001 DDP 原型达到当前阶段的自动化测试和两卡 NCCL smoke-test 完
 - 配置：`configs/compressed_muon/m001_arc_topk_muon_ddp.yaml`
 - 实验登记：`docs/compressed_muon/EXPERIMENTS.md`
 - 产物：`artifacts/compressed_muon/CM001-m001-gpt160m-ddp-ws4-s42/`
+
+## 2026-09-04：CM001 完成及与论文 wall-clock 结果的解释
+
+### 目的与假设
+
+整理 CM001 完整训练结果，并判断 ARC-TopK 在当前 Muon DDP 训练中是否带来与论文 Table V 类似的 wall-clock 收益。比较时区分理论通信量、通信受限 microbenchmark 和端到端训练时间，避免将论文的最高降时比例直接外推到当前硬件与负载。
+
+### 实验配置与对照口径
+
+- ARC-TopK 实验：`CM001-m001-gpt160m-ddp-ws4-s42`，4 张 RTX 4090，GPT 162M，Muon + AdamW，global batch size 1024，device batch size 32，梯度累积 8，sequence length 1024，共 3000 steps。
+- dense baseline：`trial-baseline-gpt160m-ddp-ws4-wandb`，W&B `hpo9y2w4`；除 ARC-TopK 专属设置和 optimizer-side DDP gradient sync 外，核心训练超参数相同。
+- CM001 前 300 steps 使用 dense tracker 同步，第 301 个 optimizer step 开始 `ratio=0.2`、projection rank `r=4` 的 ARC-TopK。
+- 论文 Table V 测量 4 张 A100 40 GB 上 LLaMA 60M、130M、350M 和 1B 的 50-step 平均时间；使用 Adam、local batch size 1、C4 sequence length 256、NCCL SHM transport，并明确禁用 NVLink P2P 来模拟低带宽多机环境。
+
+### 验证、结果与观察
+
+- CM001 于 2026-09-04 03:08 CST 正常结束，`exit_code=0`，完成全部 3000 steps。
+- dense Muon baseline：平均 step time `2186.40 ms`，约 `479590 tokens/s`，训练计时 `6537.327 s`，最终 validation loss `3.3469`，峰值显存 `18033 MiB`。
+- ARC-TopK Muon：平均 step time `2207.68 ms`，约 `474967 tokens/s`，训练计时 `6600.960 s`，最终 validation loss `3.6581`，峰值显存 `19023 MiB`。
+- 在完整 3000 steps 口径下，ARC-TopK Muon 比 dense baseline 慢约 `0.97%`；只比较压缩稳定启用后的 step 500–3000，平均 step time 分别约为 `2204.24 ms` 和 `2185.52 ms`，ARC-TopK 仍慢约 `0.86%`。因此差异不能归因于前 300-step dense warmup。
+- ARC-TopK 的峰值显存增加 `990 MiB`，约 `5.5%`；当前参数下 validation loss 比 baseline 高 `0.3112`。
+- 论文 Table V 中，ARC-TopK 相对 dense 的单步降时随模型规模增长：60M 为 `27.8%`、130M 为 `44.6%`、350M 为 `57.3%`、1B 为 `60.7%`。该趋势符合其刻意构造的通信占主导条件：local batch 很小、模型逐渐增大、P2P 被禁用，dense 梯度同步占比随模型规模上升。
+- 当前训练每卡每个 optimizer step 处理 `32 × 8 × 1024 = 262144` tokens，而论文 wall-clock 设置按 local batch 1、sequence length 256 仅处理约 256 tokens。当前每次梯度同步之前的计算量大约高三个数量级，通信成本被前向、反向和 Muon Newton–Schulz 正交化摊薄。
+- 论文使用 DDP communication hook 处理 gradient bucket，而 M001 在 optimizer 路径中逐矩阵执行 projection、Top-K 和 collective。当前路径增加小 kernel 与 collective 调度开销，也较难利用标准 DDP bucket 合并和反向传播期间的通信计算重叠。
+- 论文 Table V 是 50-step 平均单步 microbenchmark，不是包含长期训练、周期验证和达到相同质量所需时间的 time-to-quality 结果。论文总体实验称 1000 iterations 后开始压缩，但 Table V 只运行 50 iterations，公开仓库也未提供完整复现该表的独立命令，因此该表实际使用的 compression-start 覆盖设置存在报告缺口。
+
+### 结论和下一步
+
+CM001 没有观察到端到端加速；在当前单机 4 卡、162M 模型、大 batch、长序列和 Muon 额外正交化计算的组合下，梯度通信不是足够大的瓶颈，ARC-TopK 节省的通信时间不足以覆盖 sketch、Top-K、EF21M 状态和逐矩阵 collective 的额外成本。该结果不否定 ARC-TopK 在大模型、更多节点或低带宽环境中的潜在收益，但目前不能宣称 ARC-TopK+Muon 具有论文所报告的 wall-clock 加速。
+
+下一步若继续性能研究，应先使用 profiler 分离前向、反向、dense gradient All-Reduce、ARC sketch/selected-values collective、Muon Newton–Schulz 和 Muon 结果聚合的时间，再决定是否开展更大模型、更多节点和通信受限环境下的公平对照。性能比较还应同时报告 optimizer-step 时间、端到端吞吐、通信时间、显存，以及达到相同 validation loss 所需的 wall-clock 时间。
+
+### 关联位置
+
+- ARC-TopK 论文：`https://arxiv.org/pdf/2510.26709`
+- 官方实现：`https://github.com/pkumelon/ARC-TopK-release`
+- ARC-TopK 配置：`configs/compressed_muon/m001_arc_topk_muon_ddp.yaml`
+- ARC-TopK 产物：`artifacts/compressed_muon/CM001-m001-gpt160m-ddp-ws4-s42/`
+- dense baseline 产物：`artifacts/compressed_muon/trial-baseline-gpt160m-ddp-ws4-wandb/`
+- W&B：ARC-TopK `21qkn1do`；dense baseline `hpo9y2w4`
