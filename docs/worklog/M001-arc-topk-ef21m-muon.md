@@ -556,3 +556,4 @@ allocator 配置可以消除最早的初始化 OOM，但当前 24GB 卡仍不足
 - OOM 防护：controller 先对 ARC 按 device batch 1、2、4、8 逐级执行 1-step 完整初始化/训练/验证 probe，选择首个 OOM 前的最大值，再用相同 device batch 验证 dense Muon；只有两侧 probe 都通过才启动正式训练。
 - 执行：CM018a dense Muon 与 CM018b ARC-TopK+Muon 使用 GPU 2–5 串行运行；CM018b 仅在 CM018a 正常完成后启动。controller、probe 配置和状态日志保存在 `artifacts/compressed_muon/CM018-gpt1b-muon-formal-training-controller/`。
 - Probe 结果：ARC 在最小 device batch 1 的首次 compiled forward OOM（每卡约 23.49 GiB 已用，仅余 20.56 MiB，Triton autotune 申请 72 MiB 失败）。启用 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 后再次 OOM（约 23.50 GiB 已用，仅余 4.56 MiB，申请 18 MiB 失败），说明不是单纯 allocator 碎片；CM018b 按 gate 停止。dense Muon 相同模型、seq 1024、device batch 1 的 1-step probe 通过，峰值显存 20587 MiB，因此 CM018a 单独进入正式训练。
+- CM018a 已于 2026-09-05 21:41（Asia/Shanghai）在 tmux `cm018a_dense_1b` 启动，W&B run `3blckr4g`；正式配置的 global batch 1024 对应 256 次梯度累积，日志与环境快照位于 `artifacts/compressed_muon/CM018a-muon-dense-gpt1b-train-ddp-ws4-s42-db1/`。
