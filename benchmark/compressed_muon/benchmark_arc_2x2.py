@@ -63,6 +63,13 @@ class BenchmarkConfig:
     projection_rank: int = 4
     eta: float = 0.1
     start_compress_step: int = 0
+    # Optional dense-Muon diagnostics. The supported benchmark path shards
+    # Muon's orthogonalization results over the DDP process group; attribution
+    # runs may explicitly select the rank-local path with "none".
+    muon_distributed_mesh: str = "ddp_process_group"
+    muon_use_triton: Optional[bool] = None
+    register_custom_ddp_hook: bool = True
+    include_rank_details: bool = False
 
 
 def validate_config(config: BenchmarkConfig) -> BenchmarkConfig:
@@ -84,6 +91,8 @@ def validate_config(config: BenchmarkConfig) -> BenchmarkConfig:
         raise ValueError("local_batch and sequence_length must be positive")
     if config.gradient_accumulation != 1:
         raise ValueError("gradient_accumulation must be exactly 1")
+    if config.muon_distributed_mesh not in {"none", "ddp_process_group"}:
+        raise ValueError("muon_distributed_mesh must be none or ddp_process_group")
     if config.profile_output and not config.profile_only:
         raise ValueError("profile_output requires explicit --profile mode")
     if config.profile_only and not config.profile_output:
@@ -162,7 +171,9 @@ def build_result_skeleton(config: BenchmarkConfig) -> dict[str, Any]:
     )
     if config.optimizer == "muon":
         from dion.newton_schulz_triton import TRITON_AVAILABLE
-        optimizer_config["use_triton"] = bool(TRITON_AVAILABLE)
+        optimizer_config["use_triton"] = (
+            bool(TRITON_AVAILABLE) if config.muon_use_triton is None else config.muon_use_triton
+        )
         optimizer_config["use_polar_express"] = True
     return {
         "schema_version": 1,
@@ -268,15 +279,18 @@ def build_optimizer(config: BenchmarkConfig, model: GPT, process_group=None):
               {"params": uncompressed, "algorithm": "adamw"}]
     cls = ArcTopKMuon if config.sync == "arc" else Muon
     from dion.newton_schulz_triton import TRITON_AVAILABLE
+    use_triton = bool(TRITON_AVAILABLE) if config.muon_use_triton is None else config.muon_use_triton
     kwargs = dict(lr=0.02, mu=0.95, weight_decay=0.01, adjust_lr="spectral_norm",
-                  use_triton=bool(TRITON_AVAILABLE), use_polar_express=True)
+                  use_triton=use_triton, use_polar_express=True)
     if cls is ArcTopKMuon:
         kwargs.update(arc_topk_ratio=config.ratio, arc_projection_rank=config.projection_rank,
                       arc_eta=config.eta, arc_seed=config.seed,
                       arc_start_compress_step=config.start_compress_step)
-    # Dense Muon is a standard DDP baseline: DDP owns gradient synchronization
-    # and Muon's internal result-sharding collectives must stay disabled.
-    distributed_mesh = process_group if config.sync == "arc" else None
+    # DDP owns gradient synchronization, while Muon's separate result
+    # collective shards orthogonalization work. Both dense and ARC use it.
+    distributed_mesh = process_group if (
+        config.sync == "arc" or config.muon_distributed_mesh == "ddp_process_group"
+    ) else None
     return cls(groups, distributed_mesh=distributed_mesh, **kwargs)
 
 
@@ -297,8 +311,12 @@ def _environment() -> dict[str, Any]:
 
 def _collective_signature(config: BenchmarkConfig) -> list[str]:
     if config.sync == "dense":
-        return ["ddp_gradient"]
-    return ["arc_seed", "arc_sketch", "arc_selected_values", "arc_dense_uncompressed"]
+        categories = ["ddp_gradient"]
+    else:
+        categories = ["arc_seed", "arc_sketch", "arc_selected_values", "arc_dense_uncompressed"]
+    if config.optimizer == "muon":
+        categories.append("muon_result")
+    return categories
 
 
 def reduce_correctness_flags(finite_loss: bool, finite_parameters: bool) -> tuple[bool, bool]:
@@ -348,7 +366,8 @@ def observer_scope(observer):
 
 
 def _correctness(model: torch.nn.Module, config: BenchmarkConfig, last_loss=None,
-                 observer: CollectiveObserver | None = None) -> dict[str, Any]:
+                 observer: CollectiveObserver | None = None,
+                 include_rank_details: bool = False) -> dict[str, Any]:
     params = list(_raw_model(model).parameters())
     finite_parameters = all(bool(torch.isfinite(p).all()) for p in params)
     checksum = float(sum(p.detach().double().sum() for p in params))
@@ -364,13 +383,22 @@ def _correctness(model: torch.nn.Module, config: BenchmarkConfig, last_loss=None
         dist.all_gather_object(checksum_values, checksum_pair)
         checksums = checksum_values
     finite_loss = bool(last_loss is not None and torch.isfinite(last_loss).all())
+    finite_flags = [(finite_loss, finite_parameters)]
+    if dist.is_available() and dist.is_initialized() and include_rank_details:
+        gathered_finite = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered_finite, (finite_loss, finite_parameters))
+        finite_flags = gathered_finite
     finite_loss, finite_parameters = reduce_correctness_flags(finite_loss, finite_parameters)
-    return {"finite_loss": finite_loss, "finite_parameters": finite_parameters,
+    result = {"finite_loss": finite_loss, "finite_parameters": finite_parameters,
             "parameter_checksum": checksum,
             "parameter_checksum_squared": checksum_squared,
             "parameter_checksum_agreement": checksums_agree(checksums),
             "collective_signature": {"all_ranks_match": signatures_agree(per_rank),
                                       "per_rank": per_rank}}
+    if include_rank_details:
+        result["rank_checksum_pairs"] = [list(pair) for pair in checksums]
+        result["rank_finite_flags"] = [list(flags) for flags in finite_flags]
+    return result
 
 
 def register_dense_ddp_hook(ddp_model, observer: CollectiveObserver):
@@ -492,7 +520,7 @@ def run_profile_mode(config: BenchmarkConfig) -> dict[str, Any]:
     ddp_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank]) if group else model
     optimizer = build_optimizer(config, model, group)
     observer = CollectiveObserver()
-    if config.sync == "dense" and group:
+    if config.sync == "dense" and group and config.register_custom_ddp_hook:
         register_dense_ddp_hook(ddp_model, observer)
     random.seed(config.seed + rank); torch.manual_seed(config.seed + rank)
     batches = [(torch.randint(0, 50304, (config.local_batch, config.sequence_length), device=device),
@@ -508,7 +536,10 @@ def run_profile_mode(config: BenchmarkConfig) -> dict[str, Any]:
     result["profiler"]["trace_path"] = trace_path
     observed_collectives = aggregate_observed(observer)
     result["profiler"]["observed_collectives"] = observed_collectives
-    result["correctness"] = _correctness(ddp_model, config, getattr(run_profiler, "last_loss", None), observer)
+    result["correctness"] = _correctness(
+        ddp_model, config, getattr(run_profiler, "last_loss", None), observer,
+        include_rank_details=config.include_rank_details,
+    )
     if rank == 0:
         from benchmark.compressed_muon.profiler_trace import attribute_trace
         trace_summary = attribute_trace(trace_path)
@@ -571,7 +602,7 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
     model = build_model(config, device); ddp_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank]) if group else model
     optimizer = build_optimizer(config, model, group)
     observer = CollectiveObserver()
-    if config.sync == "dense" and group:
+    if config.sync == "dense" and group and config.register_custom_ddp_hook:
         register_dense_ddp_hook(ddp_model, observer)
     with observer_scope(observer):
         _run_steps(ddp_model, optimizer, batches[:config.warmup_steps], config, ddp_model)
@@ -590,7 +621,10 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
         config, group_parameters_by_shape_dtype(compressed), uncompressed,
     )
     result["environment"] = _environment()
-    result["correctness"] = _correctness(ddp_model, config, last_loss, observer)
+    result["correctness"] = _correctness(
+        ddp_model, config, last_loss, observer,
+        include_rank_details=config.include_rank_details,
+    )
     result["profiler"]["observed_collectives"] = aggregate_observed(observer)
     if rank == 0 and config.output:
         Path(config.output).parent.mkdir(parents=True, exist_ok=True)

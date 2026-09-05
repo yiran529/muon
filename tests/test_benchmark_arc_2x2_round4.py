@@ -9,7 +9,7 @@ from benchmark.compressed_muon.summarize_arc_2x2 import summarize_results
 from dion.collective_observer import CollectiveObserver, aggregate_observed
 
 
-def test_dense_muon_disables_internal_distributed_mesh(monkeypatch):
+def test_dense_muon_uses_ddp_process_group_for_result_sharding(monkeypatch):
     captured = {}
 
     class FakeMuon:
@@ -24,8 +24,9 @@ def test_dense_muon_disables_internal_distributed_mesh(monkeypatch):
         measure_steps=100, seed=42, output=None, profile_output=None,
         world_size=4, formal=True,
     )
-    bench.build_optimizer(config, object(), process_group=object())
-    assert captured["distributed_mesh"] is None
+    process_group = object()
+    bench.build_optimizer(config, object(), process_group=process_group)
+    assert captured["distributed_mesh"] is process_group
 
 
 def test_actual_world_size_must_match_configuration(monkeypatch):

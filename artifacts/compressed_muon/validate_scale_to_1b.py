@@ -30,7 +30,10 @@ def finite(value, name: str) -> None:
 
 def expected_categories(optimizer: str, sync: str) -> set[str]:
     if sync == "dense":
-        return {"ddp_gradient"}
+        categories = {"ddp_gradient"}
+        if optimizer == "muon":
+            categories.add("muon_result")
+        return categories
     categories = {"arc_seed", "arc_sketch", "arc_selected_values", "arc_dense_uncompressed"}
     if optimizer == "muon":
         categories.add("muon_result")

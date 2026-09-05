@@ -7,6 +7,7 @@ import torch
 from benchmark.compressed_muon.benchmark_arc_2x2 import (
     MODEL_PRESETS,
     BenchmarkConfig,
+    _collective_signature,
     build_result_skeleton,
     parse_args,
     validate_config,
@@ -14,6 +15,7 @@ from benchmark.compressed_muon.benchmark_arc_2x2 import (
 )
 from benchmark.compressed_muon.profiler_trace import attribute_trace, _interval_union
 from benchmark.compressed_muon.summarize_arc_2x2 import summarize_results
+from artifacts.compressed_muon.validate_scale_to_1b import expected_categories
 
 
 def test_model_presets_are_exact():
@@ -72,6 +74,25 @@ def test_cli_exposes_independent_profile_mode():
         "--profile", "--smoke",
     ])
     assert config.profile_only is True
+
+
+def test_dense_muon_profile_requires_gradient_and_result_collectives():
+    assert expected_categories("muon", "dense") == {"ddp_gradient", "muon_result"}
+    assert expected_categories("adamw", "dense") == {"ddp_gradient"}
+
+
+def test_muon_collective_signature_includes_result_sharding():
+    dense = _config(
+        experiment_id="CM002c-muon-dense-gpt60m-ddp-ws4-s42",
+        optimizer="muon",
+    )
+    arc = _config(
+        experiment_id="CM002d-m001-muon-arc-gpt60m-ddp-ws4-s42",
+        optimizer="muon",
+        sync="arc",
+    )
+    assert _collective_signature(dense) == ["ddp_gradient", "muon_result"]
+    assert "muon_result" in _collective_signature(arc)
 
 
 def test_result_skeleton_has_schema_and_metadata():

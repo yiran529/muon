@@ -525,3 +525,27 @@ allocator 配置可以消除最早的初始化 OOM，但当前 24GB 卡仍不足
 脚本于 12:14:33 完成，12 个 job 均产出 JSON/trace。CM010b ARC 的 3 timing/3 profiler 全部通过 validator；CM010a dense 的 3 profiler 通过，但 3 timing 均因 exact `parameter_checksum_agreement=false` 被拒绝，rank-0 checksum `-170494.38884379686` 与 CM008c 完全相同。两侧 loss/parameters 均 finite，collective signature 均全 rank 一致。dense step CV `5.44%` 也超过 5% 稳定性阈值；脚本正确写入 `PARTIAL` 并拒绝生成 paired summary。
 
 探索性 raw 均值为：dense → ARC step `465.933±25.325 → 313.546±1.861 ms`（表面降低 32.71%），throughput `2202.1±120.5 → 3265.9±19.4 tokens/s`（提高 48.31%），logical bytes `2007760896 → 652732440`（降低 67.49%），profiler gradient NCCL `1361.856±9.801 → 502.375±33.305 ms`（降低 63.11%），total NCCL `1361.856±9.801 → 1144.152±80.410 ms`（降低 15.99%）。peak allocated `12586.2 → 22450.9 MiB`（增加 78.38%），reserved `20632 → 22852 MiB`（增加 10.76%）。这些数字复现旧 CM008 的方向，但不得作为正式 paired R 或算法质量结论。
+
+## 2026-09-05：dense Muon checksum 五 cell 归因短跑
+
+### 目的与配置
+
+用 GPT-130M、4 卡 DDP、BF16、local batch 1、sequence length 256、seed 42 和 `2 warmup + 12 measured steps` 做单次低成本归因，逐项隔离 Muon `distributed_mesh`、benchmark 自定义 DDP hook 和 Triton backend。五个 cell 串行使用 GPU 2–5，均退出码 0、loss/参数 finite。工具与原始结果位于 `benchmark/compressed_muon/dense_muon_attribution.py`、`benchmark/compressed_muon/run_dense_muon_attribution.sh` 和 `artifacts/compressed_muon/dense_muon_attribution/`。
+
+### 结果
+
+| mode | Muon process group | DDP reducer | Triton | exact checksum agreement |
+|---|---|---|---|---|
+| `rank_local_custom_hook` | 无 | benchmark custom | 开 | false |
+| `process_group_custom_hook` | DDP process group | benchmark custom | 开 | true |
+| `rank_local_default_reducer` | 无 | PyTorch default | 开 | false |
+| `rank_local_no_triton` | 无 | benchmark custom | 关 | false |
+| `upstream_ddp` | DDP process group | PyTorch default | 开 | true |
+
+三个 rank-local cell 都只有 rank 1 与 rank 0/2/3 不同。自定义 hook 和默认 reducer 的四个 checksum pair 逐值完全相同，对应 sum/squared-sum 的跨 rank range 为 `0.0131173/0.000596821`；关闭 Triton 后仍失败，range 为 `0.0375733/0.0228399`。两个 process-group cell 的四 rank pair 完全一致，range 均为 0。
+
+### 结论与边界
+
+当前自定义 DDP hook 不是主因，Triton 也不是必要条件；最强的决定因素是 dense benchmark 是否将 Muon 配置成 rank-local `distributed_mesh=None`。原仓库 `train.py` 支持的 DDP 配置会传入 process group，Muon 内部的 result all-gather 使四 rank 最终更新 exact 一致；它可能在同步结果的同时掩盖了更早的 rank-local 数值差异。所有 cell 均为 dense `Muon`，没有经过 ARC 同步层，故结果不支持“ARC 修改导致该问题”。
+
+该结论来自单 seed、单模型、单次短跑；现有证据没有 post-DDP gradient/post-NS 边界值或参数 `max_abs_diff`/relative L2/unequal count，因此还不能确定 rank-local 差异首次出现在哪个算子，也不能判定它是否会影响长训练质量。
