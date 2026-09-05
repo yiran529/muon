@@ -564,3 +564,4 @@ allocator 配置可以消除最早的初始化 OOM，但当前 24GB 卡仍不足
 - 使用已有 benchmark GPT-350M preset：dim 1024、20 layers、16 heads，共 354,680,832 参数；保持 device batch 1、global batch 1024 和其余原仓库 Muon/M001 配置。
 - 先按 seq 1024、512、256 从长到短测试 ARC；每个 probe 覆盖两次 micro-step、梯度常驻后的 forward、以及至少一次实际 ARC 压缩 step。找到最长安全 seq 后，用同一 seq 验证 dense，并串行运行 CM019a dense 与 CM019b ARC 正式 3000-step 训练。
 - Probe 结果：无需缩短 seq。ARC 在 seq 1024 的 20-step debug probe 中实际启用压缩并通过，峰值显存 14406 MiB；dense 相同 seq/device batch/两次梯度累积 probe 通过，峰值 8760 MiB。controller 选择 seq 1024，并于 21:53 启动 CM019a（W&B `b7g8rfy6`）；CM019b 将在 CM019a 成功完成后自动接续。
+- 用户将每个正式 run 的墙钟上限调整为 8 小时。原 CM019a 无时限 attempt 在 step 12 主动停止，相关文件完整移至 `attempt1-unbounded-interrupted/`。新 controller 使用 GNU `timeout` 为 dense 和 ARC 分别设置 8h 上限；dense 即使因达到时间上限退出也会继续启动 ARC，ARC 同样最多运行 8h。
