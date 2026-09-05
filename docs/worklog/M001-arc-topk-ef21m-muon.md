@@ -469,3 +469,59 @@ Profiler summary 的 NCCL 总 kernel 时间、gradient subset 时间和 exposed 
 - 六个 summary 通过 `summarize_arc_2x2.py` fresh recompute，并与既有 summary 逐字段 exact match；`R_bytes/R_grad_comm/R_step`、CV 和 sample std 均由脚本重算。
 - 原始 evidence：`artifacts/compressed_muon/CM004a...` 至 `CM009d...` 各 cell 目录、`gpt130m-partial.json`、`gpt350m-partial.json`、`gpt1b-partial.json`、`scale-to-1b-manifest.jsonl`、最新 status log、以及 `.superpowers/sdd/2026-09-04-arc-topk-adamw-muon-benchmark/muon-dense-checksum-diagnosis.md`。
 - 稳定结果入口：`docs/compressed_muon/RESULTS.md`；24 行登记：`docs/compressed_muon/EXPERIMENTS.md`；本任务完整报告：`.superpowers/sdd/2026-09-04-arc-topk-adamw-muon-benchmark/task-9-scale-results-report.md`。
+
+## 2026-09-05：GPT-1B AdamW ARC 显存缓解阶梯测试
+
+### 目的与停止条件
+
+在不改变 GPT-1B workload、ARC 数学语义和 4 卡 DDP 规模的前提下，依次测试低风险显存缓解方案。每一级使用同一个 `warmup_steps=1`、`measure_steps=1` smoke probe；任一级成功即停止，全部仍 OOM 则停止，不继续进入 ZeRO/FSDP 或 ARC 状态复用等架构改造。
+
+### 阶梯结果
+
+1. 仅设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`：仍 OOM，但从原 probe 的 optimizer-state prepopulation（申请 148 MiB）推进到首个 ARC step；最终在 `arc_topk.scatter_rows` 创建 `local_compressed` 时申请 540 MiB 失败。每卡约 23.19 GiB 已用、322.62 MiB free、PyTorch allocated 22.45 GiB、reserved-but-unallocated 151.47 MiB。
+2. 在第一级基础上为 benchmark DDP 加 `gradient_as_bucket_view=True`：仍在同一 540 MiB `scatter_rows` 分配处 OOM，显存数字与第一级一致。当前 ARC 路径在 `DDP.no_sync()` 下运行，未观察到 bucket view 带来可用显存收益；该试验性 benchmark 改动已回退，避免改变后续 benchmark 口径。
+3. 再消除 optimizer/ARC 已存在状态的 eager `dict.setdefault(..., torch.zeros_like(param))` 默认值分配：聚焦红测确认旧实现会重复分配，改为显式 key 判断后测试通过；GPT-1B probe 仍在同一 540 MiB `scatter_rows` 处 OOM，显存数字不变。
+
+三次运行均使用 GPU 2–5，启动前四卡空闲；日志分别保存在：
+
+- `artifacts/compressed_muon/oom_recovery_gpt1b/allocator/`
+- `artifacts/compressed_muon/oom_recovery_gpt1b/bucket_view/`
+- `artifacts/compressed_muon/oom_recovery_gpt1b/state_init/`
+
+### 保留修改与验证
+
+- `dion/adamw_arctopk.py`：已存在 momentum/variance 时不再构造无用的同形默认 tensor。
+- `dion/arc_topk_sync.py`：已存在三个 ARC tracker 时不再构造无用的同形默认 tensor。
+- 新增相应回归测试；直接相关的 `arc_topk_sync`、`adamw_arctopk` 和 benchmark 测试共 `48 passed`；扩大到 M001 本地与两 rank Gloo 同步测试后为 `91 passed`。
+
+### 结论
+
+allocator 配置可以消除最早的初始化 OOM，但当前 24GB 卡仍不足以承受首个压缩 step 的 540 MiB full-batch scatter 临时张量。DDP bucket view 和消除 eager 默认 tensor 都没有改变该处的可用显存。按预定停止条件，本轮不再启动更多实验；若后续继续，应把 `scatter_rows` 的 full-size 临时张量复用/原位更新作为新的、有独立语义与峰值显存测试的实现任务，或将 ZeRO/FSDP 作为新的系统配置实验。
+
+## 2026-09-05：GPT-1B Muon ARC 补充 smoke probe
+
+### 目的与配置
+
+验证同一 GPT-1B、4 卡 DDP、BF16、local batch 1、sequence length 256 workload 改用 Muon ARC 后是否仍 OOM。使用 `warmup_steps=1`、`measure_steps=1`、`ratio=0.2`、`projection_rank=4`、`eta=0.1`、`start_compress_step=0`，并保留 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。该运行是短 smoke probe，不是新的正式性能比较。
+
+### 结果
+
+运行成功，退出码为 0，没有 OOM。单个 measured step 为 `411.430 ms`；峰值 allocated `22450.44 MiB`、reserved `22852 MiB`。`finite_loss=true`、`finite_parameters=true`、`parameter_checksum_agreement=true`、collective signature 全 rank 一致；观察到 ARC seed/sketch/selected-values、dense-uncompressed 和 Muon result collective。
+
+原始 JSON 与日志：`artifacts/compressed_muon/oom_recovery_gpt1b/muon_arc/`。
+
+### 结论
+
+在当前 4×RTX 4090 环境和 smoke workload 下，GPT-1B Muon ARC 可以运行而不 OOM，显存仍接近上限。该结果只证明短路径可执行；单样本 step time 不用于替代 CM008d 的正式重复结果，也不与 OOM 的 AdamW ARC 形成 optimizer 性能优劣结论。
+
+## 2026-09-05：启动 CM010 GPT-1B Muon dense/ARC 配对重测
+
+为补齐 1B Muon 的有效 paired 指标，新增串行 launcher `artifacts/compressed_muon/gpt1b_muon_pair_launcher.sh`，使用 GPU 2–5 交错运行 CM010a dense Muon 与 CM010b ARC Muon，各 3 次 timing（20+100 steps）和 3 次 profiler（3+3+5 schedule）。两侧统一使用 normal NCCL、BF16、local batch 1、sequence length 256、seed 42 和 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`；ARC 参数保持 `ratio=0.2`、projection rank 4、eta 0.1、start step 0。
+
+脚本逐 artifact 调用已有 validator；只有 12 个 artifact 全部通过 finite/checksum/signature/schema/trace gate 才生成 `CM010-muon-gpt1b-normal-summary.json`。若 dense Muon 重现历史 checksum divergence，脚本仍保留所有 raw timing/profile，但明确拒绝 paired summary。实验在 tmux 会话 `cm010_gpt1b_muon_pair` 中串行执行，不需要持续监控。
+
+### CM010 完成结果
+
+脚本于 12:14:33 完成，12 个 job 均产出 JSON/trace。CM010b ARC 的 3 timing/3 profiler 全部通过 validator；CM010a dense 的 3 profiler 通过，但 3 timing 均因 exact `parameter_checksum_agreement=false` 被拒绝，rank-0 checksum `-170494.38884379686` 与 CM008c 完全相同。两侧 loss/parameters 均 finite，collective signature 均全 rank 一致。dense step CV `5.44%` 也超过 5% 稳定性阈值；脚本正确写入 `PARTIAL` 并拒绝生成 paired summary。
+
+探索性 raw 均值为：dense → ARC step `465.933±25.325 → 313.546±1.861 ms`（表面降低 32.71%），throughput `2202.1±120.5 → 3265.9±19.4 tokens/s`（提高 48.31%），logical bytes `2007760896 → 652732440`（降低 67.49%），profiler gradient NCCL `1361.856±9.801 → 502.375±33.305 ms`（降低 63.11%），total NCCL `1361.856±9.801 → 1144.152±80.410 ms`（降低 15.99%）。peak allocated `12586.2 → 22450.9 MiB`（增加 78.38%），reserved `20632 → 22852 MiB`（增加 10.76%）。这些数字复现旧 CM008 的方向，但不得作为正式 paired R 或算法质量结论。

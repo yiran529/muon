@@ -24,4 +24,20 @@
 
 这里的“表面 `R_step`”仍按 `1 - ARC/Dense` 计算，但 dense 侧不同 rank 的最终参数并非 exact 一致，故数字只能用于观察性能趋势，不用于证明算法等价性、收敛性或正式 wall-clock 收益。现有证据推测该分歧可能与 130M 的 `768/3072` 形状在 rank-local Triton Polar Express 路径上的数值行为有关，但根因尚未证明。
 
+## GPT-1B Muon CM010 探索性重测（checksum 特殊情况）
+
+CM010 使用 allocator expandable segments，在 normal NCCL 下重新交错执行 dense/ARC 各 3 次 timing 和 3 次 profiler。ARC 的 timing/profiler 全部通过 correctness gate；dense 的 profiler 通过，但 3 次 timing 再次出现 exact `parameter_checksum_agreement=false`，rank-0 checksum 与 CM008c 相同，且 dense step CV 为 5.44%。因此脚本按预注册规则拒绝生成正式 paired summary。下列变化仅为 raw observation：
+
+| 指标 | Dense raw → ARC | 表面变化 |
+|---|---:|---:|
+| step | 465.933±25.325 ms（CV 5.44%）→ 313.546±1.861 ms（0.59%） | 降低 32.71% |
+| throughput | 2202.1±120.5 → 3265.9±19.4 tokens/s | 提高 48.31% |
+| logical gradient bytes | 2007760896 → 652732440 | 降低 67.49% |
+| profiler gradient NCCL | 1361.856±9.801 → 502.375±33.305 ms | 降低 63.11% |
+| profiler total NCCL | 1361.856±9.801 → 1144.152±80.410 ms | 降低 15.99% |
+| peak allocated | 12586.2 → 22450.9 MiB | 增加 78.38% |
+| peak reserved | 20632 → 22852 MiB | 增加 10.76% |
+
+Dense DDP 把梯度同步计入 forward/backward，而 ARC 把压缩通信放在 optimizer step；因此不能把两侧的 fwd/bwd 或 optimizer 分项单独解释成计算加速/减速。`R_grad_comm` 也不包含 Muon result collective；完整通信趋势应看 total NCCL。CM010 复现了 CM008 的性能方向和 dense checksum 问题，但没有补齐可用于正式 1B paired benefit 的正确性证据。
+
 这些结果支持“在本机、本 synthetic workload 下，四个 AdamW/ARC 配对和两个 GPT-350M Muon/ARC 配对均有稳定的短 benchmark 观测”，但不是收敛或 time-to-quality 证据。130M Muon dense 的 exact checksum agreement 失败，不能形成 130M Muon 的正式 paired R；1B AdamW ARC 4-rank probe OOM，且 1B Muon dense checksum agreement 失败，因此不报告任何 1B paired benefit。更多限制与 raw evidence 见 `.superpowers/sdd/2026-09-04-arc-topk-adamw-muon-benchmark/task-9-scale-results-report.md`。
