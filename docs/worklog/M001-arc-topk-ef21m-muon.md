@@ -557,3 +557,9 @@ allocator 配置可以消除最早的初始化 OOM，但当前 24GB 卡仍不足
 - 执行：CM018a dense Muon 与 CM018b ARC-TopK+Muon 使用 GPU 2–5 串行运行；CM018b 仅在 CM018a 正常完成后启动。controller、probe 配置和状态日志保存在 `artifacts/compressed_muon/CM018-gpt1b-muon-formal-training-controller/`。
 - Probe 结果：ARC 在最小 device batch 1 的首次 compiled forward OOM（每卡约 23.49 GiB 已用，仅余 20.56 MiB，Triton autotune 申请 72 MiB 失败）。启用 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 后再次 OOM（约 23.50 GiB 已用，仅余 4.56 MiB，申请 18 MiB 失败），说明不是单纯 allocator 碎片；CM018b 按 gate 停止。dense Muon 相同模型、seq 1024、device batch 1 的 1-step probe 通过，峰值显存 20587 MiB，因此 CM018a 单独进入正式训练。
 - CM018a 已于 2026-09-05 21:41（Asia/Shanghai）在 tmux `cm018a_dense_1b` 启动，W&B run `3blckr4g`；正式配置的 global batch 1024 对应 256 次梯度累积，日志与环境快照位于 `artifacts/compressed_muon/CM018a-muon-dense-gpt1b-train-ddp-ws4-s42-db1/`。
+- CM018a 随后在梯度累积阶段 OOM：先前 probe 的 global batch 4 只有一次 micro-step，未覆盖“梯度 tensor 已常驻后再次 forward”的峰值；正式训练在下一次 compiled forward 申请 18 MiB buffer 时，每卡仅余约 10.56 MiB。该 probe 缺口在 CM019 中修正为至少两次梯度累积，ARC probe 还会强制执行一次压缩 optimizer step。
+
+## 2026-09-05：350M 正式训练队列（CM019）
+
+- 使用已有 benchmark GPT-350M preset：dim 1024、20 layers、16 heads，共 354,680,832 参数；保持 device batch 1、global batch 1024 和其余原仓库 Muon/M001 配置。
+- 先按 seq 1024、512、256 从长到短测试 ARC；每个 probe 覆盖两次 micro-step、梯度常驻后的 forward、以及至少一次实际 ARC 压缩 step。找到最长安全 seq 后，用同一 seq 验证 dense，并串行运行 CM019a dense 与 CM019b ARC 正式 3000-step 训练。
