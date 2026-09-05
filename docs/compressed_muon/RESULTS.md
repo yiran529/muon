@@ -13,4 +13,15 @@
 
 `R_x = 1 - ARC/Dense`。`R_bytes` 是 logical per-step communication bytes 的观察；`R_grad_comm` 只统计 DDP gradient 或 ARC seed/sketch/selected-values/dense-uncompressed 类别，不包含 Muon ARC 的 `muon_result`。因此 GPT-350M Muon 的 total NCCL 比 gradient NCCL 大，不能把 `R_grad_comm` 解释为完整 NCCL reduction。Profiler gradient CV 在部分 cell 超过 5%（最高约 10.45%），这里保留其不确定性；scale-out 按用户指示未因该指标回溯拒绝，预先的正式 step-CV 只作报告。
 
+## GPT-130M Muon 探索性结果（checksum 特殊情况）
+
+下面两组实际完成了各 3 次 timing，但 dense Muon 在四个 rank 间出现 exact `parameter_checksum_agreement=false`；ARC Muon 的 checksum/signature 检查通过。因此这里按原始 step timing 给出结果，同时将其明确标为**探索性结果**，不能视为满足正确性门槛的正式 paired 结论。
+
+| 探索性比较 | Dense step (ms) | ARC step (ms) | 表面 R_step |
+|---|---:|---:|---:|
+| GPT-130M Muon normal | 45.410±0.593 (CV 1.31%) | 37.875±1.114 (CV 2.94%) | 16.59% |
+| GPT-130M Muon P2P-disabled | 44.862±1.988 (CV 4.43%) | 35.985±0.567 (CV 1.57%) | 19.79% |
+
+这里的“表面 `R_step`”仍按 `1 - ARC/Dense` 计算，但 dense 侧不同 rank 的最终参数并非 exact 一致，故数字只能用于观察性能趋势，不用于证明算法等价性、收敛性或正式 wall-clock 收益。现有证据推测该分歧可能与 130M 的 `768/3072` 形状在 rank-local Triton Polar Express 路径上的数值行为有关，但根因尚未证明。
+
 这些结果支持“在本机、本 synthetic workload 下，四个 AdamW/ARC 配对和两个 GPT-350M Muon/ARC 配对均有稳定的短 benchmark 观测”，但不是收敛或 time-to-quality 证据。130M Muon dense 的 exact checksum agreement 失败，不能形成 130M Muon 的正式 paired R；1B AdamW ARC 4-rank probe OOM，且 1B Muon dense checksum agreement 失败，因此不报告任何 1B paired benefit。更多限制与 raw evidence 见 `.superpowers/sdd/2026-09-04-arc-topk-adamw-muon-benchmark/task-9-scale-results-report.md`。
