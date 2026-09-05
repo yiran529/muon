@@ -67,6 +67,21 @@ def test_initialize_arc_state_preserves_existing_values():
     assert torch.count_nonzero(existing["arc_g_global"]) == 0
 
 
+def test_initialize_arc_state_does_not_allocate_when_state_exists(monkeypatch):
+    param = torch.ones(4, 3)
+    state = {
+        "arc_h_local": torch.zeros_like(param),
+        "arc_g_local": torch.zeros_like(param),
+        "arc_g_global": torch.zeros_like(param),
+    }
+
+    def unexpected_allocation(*args, **kwargs):
+        raise AssertionError("existing ARC state must not allocate defaults")
+
+    monkeypatch.setattr(torch, "zeros_like", unexpected_allocation)
+    initialize_arc_state_(state, param)
+
+
 def test_arc_logical_bytes_count_dense_and_compressed_payloads():
     config = ArcTopKSyncConfig(ratio=0.2, projection_rank=4)
     compressed = [[torch.zeros(10, 8, dtype=torch.bfloat16) for _ in range(2)]]

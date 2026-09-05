@@ -79,6 +79,17 @@ def test_prepopulates_adamw_state_and_arc_state_only_for_compressed_group():
     assert optimizer.state[matrix]["step_dev"].device == matrix.device
 
 
+def test_existing_adamw_state_lookup_does_not_allocate_defaults(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 3))
+    optimizer = _make_optimizer(parameter)
+
+    def unexpected_allocation(*args, **kwargs):
+        raise AssertionError("existing AdamW state must not allocate defaults")
+
+    monkeypatch.setattr(adamw_arctopk_module.torch, "zeros_like", unexpected_allocation)
+    optimizer._get_or_initialize_state(parameter)
+
+
 def test_state_dict_carries_one_optimizer_wide_arc_step_and_restores_it():
     matrix = torch.nn.Parameter(torch.zeros(4, 3))
     vector = torch.nn.Parameter(torch.zeros(3))

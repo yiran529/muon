@@ -114,8 +114,10 @@ class ArcTopKAdamW(Optimizer):
 
     def _get_or_initialize_state(self, param: Tensor) -> dict:
         state = self.state[param]
-        state.setdefault("momentum", torch.zeros_like(param))
-        state.setdefault("variance", torch.zeros_like(param))
+        if "momentum" not in state:
+            state["momentum"] = torch.zeros_like(param)
+        if "variance" not in state:
+            state["variance"] = torch.zeros_like(param)
         device = to_local(param).device
         step_dev = state.get("step_dev")
         if step_dev is None:

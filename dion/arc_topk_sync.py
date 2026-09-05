@@ -47,9 +47,12 @@ class ArcTopKLogicalBytes:
 def initialize_arc_state_(state: dict, param: Tensor) -> None:
     """Initialize ARC-TopK EF21M state entries without replacing existing values."""
 
-    state.setdefault("arc_h_local", torch.zeros_like(param))
-    state.setdefault("arc_g_local", torch.zeros_like(param))
-    state.setdefault("arc_g_global", torch.zeros_like(param))
+    if "arc_h_local" not in state:
+        state["arc_h_local"] = torch.zeros_like(param)
+    if "arc_g_local" not in state:
+        state["arc_g_local"] = torch.zeros_like(param)
+    if "arc_g_global" not in state:
+        state["arc_g_global"] = torch.zeros_like(param)
 
 
 def group_parameters_by_shape_dtype(
