@@ -549,3 +549,9 @@ allocator 配置可以消除最早的初始化 OOM，但当前 24GB 卡仍不足
 当前自定义 DDP hook 不是主因，Triton 也不是必要条件；最强的决定因素是 dense benchmark 是否将 Muon 配置成 rank-local `distributed_mesh=None`。原仓库 `train.py` 支持的 DDP 配置会传入 process group，Muon 内部的 result all-gather 使四 rank 最终更新 exact 一致；它可能在同步结果的同时掩盖了更早的 rank-local 数值差异。所有 cell 均为 dense `Muon`，没有经过 ARC 同步层，故结果不支持“ARC 修改导致该问题”。
 
 该结论来自单 seed、单模型、单次短跑；现有证据没有 post-DDP gradient/post-NS 边界值或参数 `max_abs_diff`/relative L2/unequal count，因此还不能确定 rank-local 差异首次出现在哪个算子，也不能判定它是否会影响长训练质量。
+## 2026-09-05：启动 1B 原仓库设置正式训练（CM018）
+
+- 目的：比较普通 Muon 与 M001 ARC-TopK+Muon 在 GPT-1B、4 卡 DDP 完整 3000-step 训练中的验证损失、吞吐和峰值显存。
+- 设置：沿用 `train.py` / `train_arctopk.py` 及各自原仓库配置；仅覆盖模型为 dim 1536、30 layers、24 heads，数据为 FineWeb10B。保留 seq 1024、global batch 1024、BF16、compile、学习率调度、每 125 step 验证和 W&B 默认设置。
+- OOM 防护：controller 先对 ARC 按 device batch 1、2、4、8 逐级执行 1-step 完整初始化/训练/验证 probe，选择首个 OOM 前的最大值，再用相同 device batch 验证 dense Muon；只有两侧 probe 都通过才启动正式训练。
+- 执行：CM018a dense Muon 与 CM018b ARC-TopK+Muon 使用 GPU 2–5 串行运行；CM018b 仅在 CM018a 正常完成后启动。controller、probe 配置和状态日志保存在 `artifacts/compressed_muon/CM018-gpt1b-muon-formal-training-controller/`。
