@@ -1,12 +1,15 @@
 # ARC-TopK + Muon DDP Bucket Hook 设计
 
-状态：修订后待二次评审
+状态：二次独立评审通过，可进入 implementation plan
 
 日期：2026-09-06
 
 关联方法：M001 ARC-TopK-EF21M-Muon
 
-修订记录：2026-09-06 根据首次独立架构审阅，补充训练循环现状核验、EF21M full-support 语义、跨 bucket 全局 collective 顺序、rank-local DCP schema 和首版 unused-parameter 支持边界。
+修订记录：
+
+- 2026-09-06 首次独立架构审阅后，补充训练循环现状核验、EF21M full-support 语义、跨 bucket 全局 collective 顺序、rank-local DCP schema 和首版 unused-parameter 支持边界。
+- 2026-09-06 二次独立架构审阅后，补充 dense accumulation 基线、compiled 正式入口、有限精度、Future 生命周期和 checkpoint snapshot 约束；审阅结论为无新增架构阻断。
 
 ## 1. 背景与问题
 
@@ -34,7 +37,7 @@ backward 中的 dense DDP all-reduce
 optimizer.step() 中的 ARC-TopK 同步
 ```
 
-若核实为双重同步，则当前长训练中的 ARC 输入已经不是预期的 rank-local 累积梯度，且其 wall-clock 不能用于评价纯 optimizer-side ARC。专用 benchmark 的 `sync_context` 已经把 forward/backward 一起放入 `no_sync()`，所以 benchmark 结果与正式训练入口不能在修复前直接类比。修复后的 optimizer-side 路线才是 DDP-hook 路线的有效对照基线；既有实验需标记其具体入口和同步行为。
+若核实为双重同步，则当前长训练中的 ARC 输入已经不是预期的 rank-local 累积梯度，且其 wall-clock 不能用于评价纯 optimizer-side ARC。该错误也影响普通 dense DDP 的 gradient accumulation：前 N-1 个 micro-batch 原本应禁止同步，却可能仍触发 reducer。专用 benchmark 的 `sync_context` 已经把 forward/backward 一起放入 `no_sync()`，所以 benchmark 结果与正式训练入口不能在修复前直接类比。修复后的 dense 与 optimizer-side ARC 必须分别重建基线；既有实验需标记其具体入口和同步行为。
 
 目标路线是把“数据并行梯度同步”迁移到 DDP communication hook。某个 DDP bucket 就绪后，ARC-TopK 可以立即开始处理该 bucket；与此同时，autograd 可以继续计算更早层的梯度。
 
@@ -201,7 +204,7 @@ hook 使用 `GradBucket.parameters()`、`gradients()` 和 buffer views 建立 bu
 - `arc_matrix`：由 Muon 更新且满足 ARC-TopK 支持条件的矩阵参数。
 - `dense_aux`：由 AdamW/Lion 等分支更新的参数，或 ARC 不支持而回退到 dense 的参数。
 
-首版不定义动态 unused parameter 的压缩语义：要求 `find_unused_parameters=False`，并要求注册到 optimizer 的训练参数在每个 optimizer step 静态参与反向传播。构造期拒绝已知冲突配置；运行期若发现更新集合不完整或 rank 间不一致则快速失败，而不是静默归入 `ignored`。`find_unused_parameters=True`、locally unused 和不同 micro-batch 使用不同参数留作后续扩展。
+首版不定义动态 unused parameter 的压缩语义：要求 `find_unused_parameters=False`，并要求注册到 optimizer 的训练参数在每个 optimizer step 静态参与反向传播。构造期拒绝已知冲突配置。实际漏用参数可能使 bucket 永远不 ready，不能承诺 hook 内一定能“快速失败”；implementation plan 必须定义 backward 后的 coverage 检查、分布式 timeout 和一致退出边界，且不得为了诊断向同一 process group 插入破坏顺序的临时 collective。`find_unused_parameters=True`、locally unused 和不同 micro-batch 使用不同参数留作后续扩展。
 
 压缩阶段开启后，不允许为了方便而对整个 bucket 先做 dense all-reduce，再覆盖矩阵切片；那会保留主要通信量，失去压缩意义。正确做法是：
 
@@ -236,6 +239,8 @@ step == 1 或 step <= start_compress_step:
 
 `ratio=1` 在压缩阶段表示 full support；它使 `g_global` 等于跨 rank 的 tracker 平均，而一般不等于当前原始梯度平均。只有 `eta=1`（以及首步初始化）时，才可把 ARC 参数结果与标准 DDP 原始梯度平均直接对照。
 
+full-support 通过“同步 delta 后累加”和直接同步 tracker 在实数数学中等价，但 BF16/FP16 下可能因运算顺序产生舍入差异。测试按 dtype 设定容差并比较有限步轨迹，不要求逐 bit 或任意长轨迹相同。
+
 如果整个 bucket 进入 warmup/full-support 路线，可以使用一次整桶 dense all-reduce，但在发起 collective 前必须先把 ARC slices 写成更新后的 tracker；`dense_aux` slices 仍写入原始梯度。完成后分别恢复 ARC state 并把结果散回。单 rank 仅省略 collective，不能省略上述 EF21M 状态转换。
 
 进入稀疏压缩阶段后，仅 `dense_aux` 走原始梯度 dense 路线。任何运行时不支持情况应在所有 rank 上依据一致的静态元数据作出相同回退决定，避免 collective 顺序分叉。
@@ -266,7 +271,7 @@ bucket 2 ready
 
 所有 rank 必须具有相同的 **全局 collective 发射序列**，而不仅是各 bucket 内局部顺序相同。callback 中的分支只能依赖各 rank 一致的元数据或 collective 结果，不能依赖 rank-local 的数值条件决定是否发起通信。
 
-`Work.get_future()` 的值可能是 tensor list，而 DDP hook 最终要求单个 `Future[Tensor]`。`Future.then()` 的 callback 返回另一个 Future 时不会自动 flatten。实现必须使用显式的 CUDA-aware bridge/completion Future 或等价状态机，把内部 collective Future 的成功和异常传递到最终 Future；最终 completion 必须覆盖 scatter 所在 CUDA stream 的工作。
+`Work.get_future()` 的值可能是 tensor list，而 DDP hook 最终要求单个 `Future[Tensor]`。`Future.then()` 的 callback 返回另一个 Future 时不会自动 flatten。实现必须使用显式的 CUDA-aware bridge/completion Future 或等价状态机，把内部 collective Future 的成功和异常传递到最终 Future；最终 completion 必须覆盖 scatter 所在 CUDA stream 的工作。state 初始化为 completed tail；每个 backward/step 都要定义 tail 的开始、完成和清理时点，任一 bucket 异常必须使后续 bucket 和 DDP 返回 Future 一致失败。
 
 bucket views、projection、delta、local selected、averaged selected 和 packing buffers 必须由 bucket context 强引用到最终 Future 完成。`local_selected` 与参与 all-reduce 的 `averaged_selected` 必须分离，避免原地 collective 污染 `g_local` 所需的 rank-local delta。
 
@@ -292,7 +297,7 @@ bucket views、projection、delta、local selected、averaged selected 和 packi
 
 每个参数的投影 seed 由 `base_seed`、optimizer step 和稳定参数序号确定，各 rank 本地得到相同值，不额外广播 seed。bucket 重排不改变某个参数的 seed。
 
-取消逐任务 seed broadcast 的前提是：hook 注册时对 process group、base seed、ARC 配置、稳定参数名/序号、角色和 optimizer parameter coverage 生成 fingerprint，并在所有 rank 上做一致性校验；恢复 checkpoint 时再次校验。不一致立即报错，不能继续训练。
+取消逐任务 seed broadcast 的前提是：hook 注册时对 process group 的有序 rank membership、base seed、ARC 配置、稳定参数名/序号、shape/dtype、角色和 optimizer parameter coverage 生成 canonical fingerprint，并在所有 rank 上做一致性校验；不能使用各进程不同的 process-group 对象身份。恢复 checkpoint 时再次校验。不一致立即报错，不能继续训练。
 
 这保证 hook 模式自身可重复，但不承诺与旧 shape-batched 路线在 `ratio < 1` 时使用完全相同的随机投影。
 
@@ -320,7 +325,7 @@ checkpoint
 
 当前 `CheckpointManager` 使用 DCP 默认 planner；若每个 rank 以相同 metadata key 提供普通 tensor，replicated-tensor 去重会丢失 rank-local 差异。因此 rank-local tensor 必须使用 rank namespace，或采用明确的 rank-sharded 表示，不能只把同名字典附加到公共 state dict。
 
-加载时按 global rank 和稳定参数名匹配，并校验 schema version、DP world size、rank mapping、配置 fingerprint、shape/dtype/角色。首版不支持改变 DP world size 后精确续训。缺失、重复或不兼容状态默认报错；只有显式选择“重新初始化压缩器状态”时才允许丢弃。
+checkpoint snapshot 只能在本 optimizer step 的所有 hook Future 和 Muon 通信完成后生成，不能复制仍被 callback 更新的状态。保存时每个 rank 提供自己的 namespace；加载时按 global rank 和稳定参数名匹配，并校验 schema version、DP world size、rank mapping、配置 fingerprint、shape/dtype/角色。首版不支持改变 DP world size 后精确续训。缺失、重复或不兼容状态默认报错；只有显式选择“重新初始化压缩器状态”时才允许丢弃。
 
 ## 10. 配置与兼容性
 
@@ -383,6 +388,7 @@ arc_sync_mode: ddp_hook   # 新路线
 - 两个以上 bucket，人为引入不同 rank 的 prepare/callback 延迟，验证全局 collective 标签、shape、顺序和完成 Future。
 - gradient accumulation，验证前 N-1 次 forward/backward 不触发 hook，最后一次恰好触发并同步累积梯度。
 - mixed optimizer roles、`gradient_as_bucket_view` 和 DDP bucket rebuild；首版对 unused 配置做 fail-fast 测试。
+- 配置合法但某个 rank 实际漏用参数时，验证 timeout/错误传播和一致退出，不要求 hook 在 bucket-ready 前诊断不可能观察到的状态。
 - 使用真实 `CheckpointManager`/DCP 做 checkpoint round-trip：保存前令各 rank 的本地状态明显不同，恢复后比较状态和后续多步轨迹。
 - 旧 `ArcTopKMuon` 路线回归不受影响。
 
@@ -398,14 +404,15 @@ arc_sync_mode: ddp_hook   # 新路线
 - backward 与 ARC collective 的 profiler timeline；
 - dense DDP、optimizer-side ARC、DDP-hook ARC 三方对照；
 - 通信字节、bucket 数、bucket size、gradient accumulation 和压缩率。
+- eager 与正式 `model.compile()` 入口的 bucket-ready 时序、hook trace 和 wall-clock；不能从 eager 骨架直接外推 compiled 路径。
 
-三方对照中的 optimizer-side ARC 必须使用修复后的 forward+backward `no_sync()`；历史入口行为和修复后行为分开报告。正式训练还需记录 hook 调用次数和实际 collective signature，排除 dense DDP 与 ARC 双重同步。
+三方对照中的 dense DDP 和 optimizer-side ARC 都必须使用修复后的 accumulation context；历史入口行为和修复后行为分开报告。正式训练还需记录 hook 调用次数和实际 collective signature，排除 dense DDP 与 ARC 双重同步。
 
 只有 profiler 显示 ARC collective 位于 backward 区间并与后续反向计算重叠，才能声称恢复了 DDP overlap。只有端到端 wall-clock 改善，才能声称该路线带来训练加速。专门 benchmark 的单步改善不能自动外推到长训练；数据加载、验证、checkpoint、日志、不同 gradient accumulation/bucket layout 和系统抖动都需分别核对。
 
 ## 13. 分阶段交付
 
-1. 为当前 `no_sync()` 写两 rank 回归测试，修复 shared training loop，并重新建立 optimizer-side ARC 基线。
+1. 为当前 `no_sync()` 写两 rank 回归测试，修复 shared training loop，并分别重新建立 dense DDP 与 optimizer-side ARC 基线。
 2. 用 dummy payload 实现全局 tail Future、多 bucket、多 collective 的最小骨架；先验证 Gloo/NCCL 顺序、异常传播和 CUDA completion。
 3. 抽离可复用的 ARC 本地数学原语，以多步 EF21M oracle 保持旧语义。
 4. 实现 hook state、静态参数角色/fingerprint 和 fail-fast unused 支持边界。
@@ -429,6 +436,7 @@ arc_sync_mode: ddp_hook   # 新路线
 - **算法轨迹与旧路线不同**：固定 hook 路线的参数级 seed；文档和实验中明确只要求统计/收敛可比，不要求压缩场景逐 bit 相同。
 - **正式训练仍发生双重同步**：同步 context 由 mode 唯一派生，并用 hook count/collective signature 作为启动前 correctness gate。
 - **CUDA Future 提前完成或临时 buffer 被释放**：显式 completion bridge、异常传播和 bucket context 强引用；用 allocator/stream 压力测试验证。
+- **eager 有 overlap 但 compiled 正式入口没有**：把 compile 开关作为独立实验变量，最终验收以正式入口 profiler 为准。
 
 ## 15. 验收标准
 
@@ -438,8 +446,9 @@ arc_sync_mode: ddp_hook   # 新路线
 - NCCL 多 bucket/stream 压力测试无死锁、无未完成 Future、rank 参数一致。
 - `eta=1, ratio=1` 与标准 DDP 在规定容差内一致；一般 eta 的 full-support 与多步 EF21M oracle 一致。
 - accumulation、mixed bucket、rank-local DCP round-trip、bucket rebuild 和跨 rank 延迟有自动化覆盖。
-- profiler 与 hook count 证明 optimizer-side 基线没有 dense DDP 双重同步。
+- profiler 与 hook count 证明 dense accumulation 的前 N-1 个 micro-batch 不通信，并证明 optimizer-side ARC 基线没有 dense DDP 双重同步。
 - profiler 证明 ARC 同步在 backward 的 bucket-ready 时刻启动，并至少与一部分后续反向计算重叠。
+- eager 和正式 compiled 入口分别通过同步时序验收；性能结论以实际部署配置为准。
 - 旧 optimizer-side 模式仍可运行，且配置不会造成双重同步。
 - GPT 350M 正式实验完整记录环境、吞吐、step time、通信量和 timeline；不预设新路线一定改善 wall clock。
 
