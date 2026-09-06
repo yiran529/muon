@@ -565,3 +565,11 @@ allocator 配置可以消除最早的初始化 OOM，但当前 24GB 卡仍不足
 - 先按 seq 1024、512、256 从长到短测试 ARC；每个 probe 覆盖两次 micro-step、梯度常驻后的 forward、以及至少一次实际 ARC 压缩 step。找到最长安全 seq 后，用同一 seq 验证 dense，并串行运行 CM019a dense 与 CM019b ARC 正式 3000-step 训练。
 - Probe 结果：无需缩短 seq。ARC 在 seq 1024 的 20-step debug probe 中实际启用压缩并通过，峰值显存 14406 MiB；dense 相同 seq/device batch/两次梯度累积 probe 通过，峰值 8760 MiB。controller 选择 seq 1024，并于 21:53 启动 CM019a（W&B `b7g8rfy6`）；CM019b 将在 CM019a 成功完成后自动接续。
 - 用户将每个正式 run 的墙钟上限调整为 8 小时。原 CM019a 无时限 attempt 在 step 12 主动停止，相关文件完整移至 `attempt1-unbounded-interrupted/`。新 controller 使用 GNU `timeout` 为 dense 和 ARC 分别设置 8h 上限；dense 即使因达到时间上限退出也会继续启动 ARC，ARC 同样最多运行 8h。
+
+## 2026-09-06：CM020 corrected `no_sync` wall-clock 归因
+
+- 两 rank Gloo characterization 直接证明共享训练循环的历史写法无效：forward 在 context 外、仅 backward 位于 `DDP.no_sync()` 时，两个 micro-batch 各触发一次 reducer，共 2 次；正确 dense accumulation 只在最后一步触发 1 次；optimizer-side ARC 的全部 micro-batch 正确包裹后触发 0 次，并保留 rank-local 累积梯度。
+- 已修复 `train.py`，由同一个 micro-step helper 将 forward、next-batch/FSDP pre-backward 配置和 backward 放进同一 DDP context。修复同时改变 dense accumulation 和 optimizer-side ARC 的实际同步语义，因此 CM019 历史结果不与修复后结果混用。
+- 预登记 CM020a/b：GPT-350M、4 GPU、BF16、seq 1024、global batch 1024、device batch 1、gradient accumulation 256、compile，串行运行 dense Muon 与 optimizer-side ARC Muon；两侧各训练 15 步，使用训练入口 step 10 后的 5 个 step 形成短窗口 `step_avg`。ARC 固定 ratio 0.2、projection rank 4、eta 0.1、compression start 0。
+- 本次不传 `--time_optimizer`，避免额外 `cuda.synchronize()` 改变主 wall-clock critical path；validation 仅在最终 step 运行且不计入 training timer。每个 cell 最长一小时，GPU busy、CPU correctness gate、数据缺失、非零退出或缺少最终 timing 均 fail closed。
+- CM020 只有每 cell 一次短跑，没有重复样本、CV 或 profiler，定位为高信息增益 attribution probe，不能登记为稳定性能结论。若结果表明修复双重同步后 optimizer-side ARC 仍不能改善 step wall-clock，再进入 DDP bucket-hook 实施和三方 profiler 对照。
