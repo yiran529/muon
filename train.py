@@ -9,6 +9,7 @@ import torch.distributed.checkpoint as dcp
 import wandb
 import yaml
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
@@ -86,6 +87,53 @@ MASTER_PROCESS = True
 def print0(*args):
     if MASTER_PROCESS:
         print(*args)
+
+
+def ddp_gradient_sync_context(
+    model,
+    *,
+    micro_step: int,
+    grad_accum_steps: int,
+    optimizer_owns_gradient_sync: bool,
+):
+    """Select the DDP context for one complete forward/backward micro-step."""
+
+    if not 1 <= micro_step <= grad_accum_steps:
+        raise ValueError(
+            f"micro_step must be in [1, {grad_accum_steps}], got {micro_step}"
+        )
+    disable_sync = micro_step < grad_accum_steps or optimizer_owns_gradient_sync
+    if isinstance(model, DDP) and disable_sync:
+        return model.no_sync()
+    return nullcontext()
+
+
+def forward_backward_micro_step(
+    model,
+    x,
+    y,
+    *,
+    autocast_ctx,
+    micro_step: int,
+    grad_accum_steps: int,
+    optimizer_owns_gradient_sync: bool,
+    before_backward=None,
+):
+    """Run one accumulated micro-step with forward and backward under one DDP context."""
+
+    with ddp_gradient_sync_context(
+        model,
+        micro_step=micro_step,
+        grad_accum_steps=grad_accum_steps,
+        optimizer_owns_gradient_sync=optimizer_owns_gradient_sync,
+    ):
+        with autocast_ctx:
+            loss = model(x, y)
+        train_loss = loss.detach()
+        loss = loss / grad_accum_steps
+        callback_result = before_backward() if before_backward is not None else None
+        loss.backward()
+    return train_loss, callback_result
 
 
 def parse_cli_args(configure_parser=None):
@@ -1021,18 +1069,8 @@ def main(
             torch.cuda.synchronize()
             t_fwd_bwd = time.perf_counter()
         for i in range(1, grad_accum_steps + 1):
-            with autocast_ctx:
-                loss = model(x, y)
-            train_loss = loss.detach()  # for logging
-            loss = loss / grad_accum_steps
-            x, y = train_loader.next_batch()
-
-            # Turn off DDP grad sync if replicate_mesh_grad_sync is True
-            ddp_no_sync = i < grad_accum_steps or hp.replicate_mesh_grad_sync
-            if isinstance(model, DDP) and ddp_no_sync:
-                with model.no_sync():
-                    loss.backward()
-            else:
+            def prepare_backward():
+                next_batch = train_loader.next_batch()
                 if isinstance(model, FSDPModule):
                     # Gradient accumulation for DP on top of FSDP
                     model.set_is_last_backward(i == grad_accum_steps)
@@ -1044,7 +1082,18 @@ def main(
                     else:
                         # FSDP always synchronizes sharded gradients via reduce-scatter
                         model.set_requires_gradient_sync(True)
-                loss.backward()
+                return next_batch
+
+            train_loss, (x, y) = forward_backward_micro_step(
+                model,
+                x,
+                y,
+                autocast_ctx=autocast_ctx,
+                micro_step=i,
+                grad_accum_steps=grad_accum_steps,
+                optimizer_owns_gradient_sync=hp.replicate_mesh_grad_sync,
+                before_backward=prepare_backward,
+            )
 
         if cli_args.time_optimizer:
             torch.cuda.synchronize()

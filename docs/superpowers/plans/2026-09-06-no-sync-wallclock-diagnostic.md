@@ -122,7 +122,7 @@ git commit -m "test: characterize DDP no_sync placement"
 
 **Interfaces:**
 - Produces: `ddp_gradient_sync_context(model, *, micro_step: int, grad_accum_steps: int, optimizer_owns_gradient_sync: bool) -> ContextManager`
-- Produces: `forward_backward_micro_step(model, x, y, *, autocast_ctx, micro_step: int, grad_accum_steps: int, optimizer_owns_gradient_sync: bool, before_backward: Optional[Callable[[], None]] = None) -> Tensor`
+- Produces: `forward_backward_micro_step(model, x, y, *, autocast_ctx, micro_step: int, grad_accum_steps: int, optimizer_owns_gradient_sync: bool, before_backward: Optional[Callable[[], Any]] = None) -> tuple[Tensor, Any]`
 - `micro_step` is one-based and must satisfy `1 <= micro_step <= grad_accum_steps`.
 - `optimizer_owns_gradient_sync=True` corresponds to current `replicate_mesh_grad_sync=True` and disables reducer synchronization for every micro-batch.
 
@@ -203,13 +203,12 @@ def forward_backward_micro_step(
             loss = model(x, y)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
-        if before_backward is not None:
-            before_backward()
+        callback_result = before_backward() if before_backward is not None else None
         loss.backward()
-    return train_loss
+    return train_loss, callback_result
 ```
 
-The optional callback preserves the current FSDP setters immediately before backward without duplicating the DDP context logic.
+The optional callback preserves both the current next-batch fetch and the FSDP setters immediately before backward without duplicating the DDP context logic or changing data-loading overlap.
 
 - [ ] **Step 5: Route the shared training loop through the function**
 
@@ -217,7 +216,8 @@ Replace the backward-only branch with this structure while retaining the existin
 
 ```python
 for i in range(1, grad_accum_steps + 1):
-    def configure_fsdp_backward():
+    def prepare_backward():
+        next_batch = train_loader.next_batch()
         if isinstance(model, FSDPModule):
             model.set_is_last_backward(i == grad_accum_steps)
             if cli_args.fast_fsdp:
@@ -225,8 +225,9 @@ for i in range(1, grad_accum_steps + 1):
                 model.set_requires_gradient_sync(i == grad_accum_steps)
             else:
                 model.set_requires_gradient_sync(True)
+        return next_batch
 
-    train_loss = forward_backward_micro_step(
+    train_loss, (x, y) = forward_backward_micro_step(
         model,
         x,
         y,
@@ -234,9 +235,8 @@ for i in range(1, grad_accum_steps + 1):
         micro_step=i,
         grad_accum_steps=grad_accum_steps,
         optimizer_owns_gradient_sync=hp.replicate_mesh_grad_sync,
-        before_backward=configure_fsdp_backward,
+        before_backward=prepare_backward,
     )
-    x, y = train_loader.next_batch()
 ```
 
 - [ ] **Step 6: Run focused and existing ARC tests**
