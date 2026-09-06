@@ -8,9 +8,11 @@ status_log="$controller_dir/status.log"
 python_bin="$repo_dir/.venv/bin/python"
 torchrun_bin="$repo_dir/.venv/bin/torchrun"
 data_dir="$repo_dir/data/fineweb10B"
-gpu_list="2,3,4,5"
+gpu_list=""
 world_size=4
 run_limit=1h
+idle_memory_limit_mib=1024
+gpu_poll_seconds="${GPU_POLL_SECONDS:-60}"
 
 dense_id="CM020a-muon-dense-gpt350m-corrected-nosync"
 arc_id="CM020b-m001-arc-muon-gpt350m-corrected-nosync"
@@ -24,7 +26,8 @@ print_plan() {
         '    "CM020a-muon-dense-gpt350m-corrected-nosync",' \
         '    "CM020b-m001-arc-muon-gpt350m-corrected-nosync"' \
         '  ],' \
-        '  "cuda_visible_devices": "2,3,4,5",' \
+        '  "cuda_visible_devices": "dynamic",' \
+        '  "gpu_selection": {"scope": "all_visible", "count": 4, "max_memory_used_mib_exclusive": 1024, "poll_seconds": 60},' \
         '  "model": {"dim": 1024, "layers": 20, "heads": 16},' \
         '  "sequence_length": 1024,' \
         '  "batch_size": 1024,' \
@@ -37,12 +40,35 @@ print_plan() {
         '}'
 }
 
+select_idle_gpus() {
+    local rows="$1" selected selected_count
+    selected="$(
+        awk -F',' -v limit="$idle_memory_limit_mib" '
+            {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+                if ($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $2 + 0 < limit) {
+                    print $1 + 0
+                }
+            }
+        ' <<< "$rows" | sort -n | head -n "$world_size" | paste -sd, -
+    )"
+    selected_count="$(tr ',' '\n' <<< "$selected" | awk 'NF {n++} END {print n+0}')"
+    [[ "$selected_count" == "$world_size" ]] || return 78
+    printf '%s\n' "$selected"
+}
+
 if [[ "${1:-}" == "--print-plan" ]]; then
     print_plan
     exit 0
 fi
+if [[ "${1:-}" == "--select-gpus-from-stdin" ]]; then
+    rows="$(command cat)"
+    select_idle_gpus "$rows" || exit 78
+    exit 0
+fi
 if [[ $# -ne 0 ]]; then
-    printf 'usage: %s [--print-plan]\n' "$0" >&2
+    printf 'usage: %s [--print-plan|--select-gpus-from-stdin]\n' "$0" >&2
     exit 64
 fi
 
@@ -78,18 +104,42 @@ preflight_static() {
     [[ -x "$torchrun_bin" ]] || { log "BLOCKED missing torchrun: $torchrun_bin"; return 1; }
 }
 
-preflight_gpus() {
-    local rows count bad
+wait_for_gpus() {
+    local rows selected
+    while true; do
+        rows="$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null)" || {
+            log "BLOCKED nvidia-smi unavailable"
+            return 1
+        }
+        if selected="$(select_idle_gpus "$rows")"; then
+            gpu_list="$selected"
+            log "GPU SET SELECTED cuda_visible_devices=$gpu_list"
+            return 0
+        fi
+        log "WAITING fewer than $world_size GPUs use <$idle_memory_limit_mib MiB"
+        sleep "$gpu_poll_seconds"
+    done
+}
+
+preflight_selected_gpus() {
+    local rows gpu used
     rows="$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null)" || {
         log "BLOCKED nvidia-smi unavailable"
         return 1
     }
-    count="$(awk -F', ' '$1 >= 2 && $1 <= 5 {n++} END {print n+0}' <<< "$rows")"
-    bad="$(awk -F', ' '$1 >= 2 && $1 <= 5 && $2 >= 1024 {n++} END {print n+0}' <<< "$rows")"
-    [[ "$count" == 4 && "$bad" == 0 ]] || {
-        log "BLOCKED GPU 2-5 unavailable or using >=1024 MiB"
-        return 1
-    }
+    while IFS= read -r gpu; do
+        used="$(awk -F',' -v wanted="$gpu" '
+            {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+                if ($1 == wanted) print $2
+            }
+        ' <<< "$rows")"
+        if [[ -z "$used" || "$used" -ge "$idle_memory_limit_mib" ]]; then
+            log "BLOCKED selected GPU $gpu unavailable or using >=$idle_memory_limit_mib MiB"
+            return 1
+        fi
+    done < <(tr ',' '\n' <<< "$gpu_list")
 }
 
 run_cell() {
@@ -149,8 +199,8 @@ run_cell() {
 log "BEGIN corrected no_sync GPT-350M serial diagnostic"
 run_cpu_gate || { log "BLOCKED CPU gate failed"; exit 78; }
 preflight_static || exit 78
-preflight_gpus || exit 78
+wait_for_gpus || exit 78
 run_cell dense || exit "$?"
-preflight_gpus || exit 78
+preflight_selected_gpus || exit 78
 run_cell arc || exit "$?"
 log "COMPLETE corrected no_sync GPT-350M serial diagnostic"

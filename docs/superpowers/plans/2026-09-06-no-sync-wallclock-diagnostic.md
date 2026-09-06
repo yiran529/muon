@@ -19,9 +19,9 @@
 - This plan does not implement the DDP ARC bucket hook.
 - The GPU comparison is exploratory attribution evidence, not a formal performance claim: one serial run per cell and five timed optimizer steps are insufficient for a stable mean/CV.
 - Do not mix historical CM019 results with corrected CM020 results.
-- GPU cells use the same four GPUs, run serially, use normal NCCL, compile enabled, BF16, GPT-350M, sequence length 1024, device batch 1, global batch 1024, and seed 42.
+- GPU cells dynamically select the lowest-numbered four idle GPUs from all visible devices, keep that same set for both cells, run serially, use normal NCCL, compile enabled, BF16, GPT-350M, sequence length 1024, device batch 1, global batch 1024, and seed 42.
 - ARC uses ratio 0.2, projection rank 4, eta 0.1, and compression start 0 so all timed steps are compressed.
-- The launcher must refuse to start GPU work when any selected GPU has at least 1024 MiB allocated, the dataset is missing, or the code/test gate fails.
+- The launcher must wait when fewer than four GPUs have less than 1024 MiB allocated. After selecting four GPUs, it must refuse to continue if any selected GPU reaches at least 1024 MiB before the ARC cell; missing data or a failed code/test gate also remains fail-closed.
 - Primary wall-clock timing must not use `--time_optimizer`, because its explicit CUDA synchronizations perturb the measured critical path.
 
 ---
@@ -285,7 +285,13 @@ assert plan["cells"] == [
     "CM020a-muon-dense-gpt350m-corrected-nosync",
     "CM020b-m001-arc-muon-gpt350m-corrected-nosync",
 ]
-assert plan["cuda_visible_devices"] == "2,3,4,5"
+assert plan["cuda_visible_devices"] == "dynamic"
+assert plan["gpu_selection"] == {
+    "scope": "all_visible",
+    "count": 4,
+    "max_memory_used_mib_exclusive": 1024,
+    "poll_seconds": 60,
+}
 assert plan["model"] == {"dim": 1024, "layers": 20, "heads": 16}
 assert plan["sequence_length"] == 1024
 assert plan["batch_size"] == 1024
@@ -345,21 +351,21 @@ focused pytest gate
 CPU no_sync diagnostic and JSON gate
 dataset directory check
 GNU timeout check
-GPU 2-5 memory check (<1024 MiB each)
+wait for any four visible GPUs with memory usage <1024 MiB, then lock that set
 ```
 
 Cell execution must remain serial:
 
 ```bash
 run_cell dense || exit "$?"
-preflight_gpus || exit 78
+preflight_selected_gpus || exit 78
 run_cell arc || exit "$?"
 ```
 
 Run each cell with normal NCCL and no W&B:
 
 ```bash
-CUDA_VISIBLE_DEVICES=2,3,4,5 "$TORCHRUN" --standalone --nproc_per_node=4 \
+CUDA_VISIBLE_DEVICES="$GPU_LIST" "$TORCHRUN" --standalone --nproc_per_node=4 \
   "$ENTRY" --config "$CONFIG" --data_dir "$DATA_DIR" --no_wandb
 ```
 

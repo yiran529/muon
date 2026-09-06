@@ -28,7 +28,13 @@ def test_launcher_print_plan_is_serial_matched_and_unperturbed():
         "CM020a-muon-dense-gpt350m-corrected-nosync",
         "CM020b-m001-arc-muon-gpt350m-corrected-nosync",
     ]
-    assert plan["cuda_visible_devices"] == "2,3,4,5"
+    assert plan["cuda_visible_devices"] == "dynamic"
+    assert plan["gpu_selection"] == {
+        "scope": "all_visible",
+        "count": 4,
+        "max_memory_used_mib_exclusive": 1024,
+        "poll_seconds": 60,
+    }
     assert plan["model"] == {"dim": 1024, "layers": 20, "heads": 16}
     assert plan["sequence_length"] == 1024
     assert plan["batch_size"] == 1024
@@ -71,3 +77,30 @@ def test_launcher_configs_match_the_printed_plan():
     assert arc["arc_projection_rank"] == 4
     assert arc["arc_eta"] == 0.1
     assert arc["arc_start_compress_step"] == 0
+
+
+def test_launcher_selects_the_lowest_four_idle_gpu_indices():
+    completed = subprocess.run(
+        ["bash", str(LAUNCHER), "--select-gpus-from-stdin"],
+        cwd=REPO_ROOT,
+        input="7, 0\n0, 3\n3, 1024\n2, 100\n4, 1023\n1, 2048\n5, 1024\n6, 1817\n",
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout == "0,2,4,7\n"
+
+
+def test_launcher_rejects_fewer_than_four_idle_gpus():
+    completed = subprocess.run(
+        ["bash", str(LAUNCHER), "--select-gpus-from-stdin"],
+        cwd=REPO_ROOT,
+        input="0, 0\n1, 100\n2, 1023\n3, 1024\n",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 78
+    assert completed.stdout == ""
