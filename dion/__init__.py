@@ -5,6 +5,7 @@ from .dion_reference import Dion as DionReference
 from .muon import Muon
 from .muon_arctopk import ArcTopKMuon
 from .adamw_arctopk import ArcTopKAdamW
+from .arc_topk_ddp_hook import ArcTopKDDPParameterSpec, ArcTopKDDPState
 from .muon_reference import Muon as MuonReference
 from .dion2 import Dion2
 from .normuon import NorMuon
