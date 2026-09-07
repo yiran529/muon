@@ -1,6 +1,6 @@
 # ARC-TopK + Muon DDP Bucket Hook 设计
 
-状态：二次独立评审通过，可进入 implementation plan
+状态：2026-09-07 独立审查后修订，可按配套 implementation plan 实施
 
 日期：2026-09-06
 
@@ -10,6 +10,8 @@
 
 - 2026-09-06 首次独立架构审阅后，补充训练循环现状核验、EF21M full-support 语义、跨 bucket 全局 collective 顺序、rank-local DCP schema 和首版 unused-parameter 支持边界。
 - 2026-09-06 二次独立架构审阅后，补充 dense accumulation 基线、compiled 正式入口、有限精度、Future 生命周期和 checkpoint snapshot 约束；审阅结论为无新增架构阻断。
+- 2026-09-07 已修复并验证 shared training loop 的 `no_sync()` 放置；结合 CM023b profiler，将逐任务 seed broadcast/`.item()` 识别为可独立消除的同步开销。本次路线先提供兼容的本地确定性 seed，再直接实现完整 DDP bucket hook；明确不实施 selective-dense 中间 hook，也不采用 per-parameter autograd hook。
+- 2026-09-07 Astra 独立审查指出 bucket tail 不隐含本 bucket 梯度的 CUDA stream 可见性、optimizer fingerprint 必须包含真实 task layout。设计据此增加 bucket-ready event/CUDA-aware Future、分路线 fingerprint、fresh DCP load schema 和真实 GPU kernel overlap 验收；结论为修订后可实施。
 
 ## 1. 背景与问题
 
@@ -29,15 +31,9 @@ optimizer.step()
 
 ARC-TopK 即使降低了通信字节或单个同步操作的时延，也只能在 backward 完成后开始，无法与较早层的反向计算重叠。这是“optimizer-side 同步失去 DDP overlap”的准确含义。
 
-但是，当前正式训练循环在 `train.py` 中先执行 forward，随后才用 `no_sync()` 包住 backward。PyTorch DDP 要求 forward 也处于该 context，否则梯度仍会同步。因此，设计实施前必须先用两 rank hook 计数和 profiler 核实当前正式训练是否实际执行了：
+shared training loop 的 backward-only `no_sync()` 问题已经修复并由真实两 rank hook-count 测试验证。当前正式语义是：dense DDP 仅在最后一个 accumulation micro-batch 触发 reducer；optimizer-side ARC 的所有 micro-batch 均禁用 reducer，由 optimizer 独占梯度同步。历史 CM019 与 corrected CM020+ 结果必须继续分开记录。
 
-```text
-backward 中的 dense DDP all-reduce
-                 ＋
-optimizer.step() 中的 ARC-TopK 同步
-```
-
-若核实为双重同步，则当前长训练中的 ARC 输入已经不是预期的 rank-local 累积梯度，且其 wall-clock 不能用于评价纯 optimizer-side ARC。该错误也影响普通 dense DDP 的 gradient accumulation：前 N-1 个 micro-batch 原本应禁止同步，却可能仍触发 reducer。专用 benchmark 的 `sync_context` 已经把 forward/backward 一起放入 `no_sync()`，所以 benchmark 结果与正式训练入口不能在修复前直接类比。修复后的 dense 与 optimizer-side ARC 必须分别重建基线；既有实验需标记其具体入口和同步行为。
+CM022/CM023b profiler 已进一步确认：optimizer-side ARC 的压缩局部窗口确实比 dense 梯度通信短，但它位于约 8 秒 optimizer step 的尾部，无法与 backward 重叠；在三卡 CM023b 中，所观测局部窗口约缩短 26 ms，而逐任务 seed broadcast/等待约占 8 ms。seed 路径不是全部问题，但它是无需改变 ARC 数学语义即可消除的设备同步点。
 
 目标路线是把“数据并行梯度同步”迁移到 DDP communication hook。某个 DDP bucket 就绪后，ARC-TopK 可以立即开始处理该 bucket；与此同时，autograd 可以继续计算更早层的梯度。
 
@@ -72,6 +68,8 @@ backward: bucket 0 ready ── ARC sync bucket 0 ───────┐
 - 不保证压缩率小于 1 时，DDP-hook 模式与旧 optimizer-side 模式逐 bit 相同；两者的投影分组和随机数消费顺序不同。
 - 不在本改造中重新设计 DDP reducer、跨节点拓扑或通信后端。
 - 不删除现有 shape/dtype megabatch 路线。
+- 不实施只把 dense fallback 搬进 DDP hook 的 selective-dense 中间阶段。
+- 不注册 per-parameter autograd hook；完整路线只使用 DDP bucket communication hook。
 
 ## 4. 方案比较
 
@@ -100,8 +98,8 @@ train_arctopk.py
   ├─ 构造 ARC 配置与参数组
   └─ 创建 ArcTopKMuon
            │
-train.py   │  预期所有 micro-batch 的 forward/backward 使用 DDP.no_sync()
-           │  当前实现仅包 backward，必须先核实并修复
+train.py   │  optimizer-side ARC 的所有 micro-batch 均将
+           │  forward/backward 一起放入 DDP.no_sync()
   └────────┘
            ▼
 dion/muon_arctopk.py
@@ -191,9 +189,9 @@ micro N-1   normal DDP forward + backward ────┘
                        └─ bucket ready 后调用 ARC hook
 ```
 
-只有最后一个 micro-batch 触发 reducer。hook 看到的是该 optimizer step 的累积梯度，而不是只看到最后一个 micro-batch 的梯度。这一行为必须由真实两 rank hook 计数与数值测试确认；不能沿用当前仅包 backward 的 context 写法。
+只有最后一个 micro-batch 触发 reducer。hook 看到的是该 optimizer step 的累积梯度，而不是只看到最后一个 micro-batch 的梯度。这一行为已由 corrected shared-loop 的真实两 rank测试覆盖；hook 集成测试仍须再次确认调用次数和累积梯度数值。
 
-旧 `optimizer` 模式则让所有 micro-batch 的 forward/backward 都处于 `no_sync()`，确保 ARC 收到真正的 rank-local 累积梯度。修复该行为会改变当前正式训练入口的实际语义，因此修复前后的结果必须分开记录。
+旧 `optimizer` 模式让所有 micro-batch 的 forward/backward 都处于 `no_sync()`，确保 ARC 收到真正的 rank-local 累积梯度。该 corrected 行为是兼容基线；修复前后的结果继续分开记录。
 
 ### 7.2 Bucket 分类与重建
 
@@ -271,6 +269,8 @@ bucket 2 ready
 
 所有 rank 必须具有相同的 **全局 collective 发射序列**，而不仅是各 bucket 内局部顺序相同。callback 中的分支只能依赖各 rank 一致的元数据或 collective 结果，不能依赖 rank-local 的数值条件决定是否发起通信。
 
+由于后一 bucket 的 prepare 可能被前一 bucket 的 tail 延迟到 DDP hook callback stream 上，tail 只提供 bucket 间次序，不自动提供“后一 bucket 梯度已在 backward stream 写完”的可见性。hook 入口必须立即记录 bucket-ready CUDA event；延迟 prepare 的执行 stream 同时等待 previous tail 和本 bucket event。DDP-facing completion Future 与内部 destination Future 必须带 bucket device，最终 scatter 所在 stream 负责完成 Future。这里使用 stream event/Future 依赖，禁止 host synchronize。
+
 `Work.get_future()` 的值可能是 tensor list，而 DDP hook 最终要求单个 `Future[Tensor]`。`Future.then()` 的 callback 返回另一个 Future 时不会自动 flatten。实现必须使用显式的 CUDA-aware bridge/completion Future 或等价状态机，把内部 collective Future 的成功和异常传递到最终 Future；最终 completion 必须覆盖 scatter 所在 CUDA stream 的工作。state 初始化为 completed tail；每个 backward/step 都要定义 tail 的开始、完成和清理时点，任一 bucket 异常必须使后续 bucket 和 DDP 返回 Future 一致失败。
 
 bucket views、projection、delta、local selected、averaged selected 和 packing buffers 必须由 bucket context 强引用到最终 Future 完成。`local_selected` 与参与 all-reduce 的 `averaged_selected` 必须分离，避免原地 collective 污染 `g_local` 所需的 rank-local delta。
@@ -295,9 +295,16 @@ bucket views、projection、delta、local selected、averaged selected 和 packi
 
 训练循环在一个 optimizer step 的 backward 开始前，显式调用类似 `arc_state.begin_step(step)` 的接口。hook 调用时捕获该 step 的局部值；step 不按 bucket 自增，避免异步 callback 观察到下一步编号。
 
-每个参数的投影 seed 由 `base_seed`、optimizer step 和稳定参数序号确定，各 rank 本地得到相同值，不额外广播 seed。bucket 重排不改变某个参数的 seed。
+增加显式 `arc_seed_mode`：
 
-取消逐任务 seed broadcast 的前提是：hook 注册时对 process group 的有序 rank membership、base seed、ARC 配置、稳定参数名/序号、shape/dtype、角色和 optimizer parameter coverage 生成 canonical fingerprint，并在所有 rank 上做一致性校验；不能使用各进程不同的 process-group 对象身份。恢复 checkpoint 时再次校验。不一致立即报错，不能继续训练。
+- `broadcast`：兼容现有 optimizer-side 行为，由 group source 决定 seed，允许各 rank 配置的 `base_seed` 不同；作为底层 API/optimizer 构造器默认值，避免静默改变历史调用语义。
+- `local_deterministic`：不构造 device seed tensor，不执行 seed broadcast，也不调用 `.item()`。每个同步任务的投影 seed 仅由固定整数混合函数、`base_seed`、optimizer step 和稳定任务身份确定，各 rank 本地计算相同值。
+
+专用训练入口的 `arc_seed_mode` 默认值为 unset，由 `arc_sync_mode` 派生：optimizer 模式选择 `broadcast`，hook 模式选择 `local_deterministic`。显式 `ddp_hook + broadcast` 在启动时拒绝。
+
+hook 模式的稳定任务身份是稳定参数名/序号；optimizer-side shape/dtype megabatch 模式使用构造期冻结的稳定 batch/task 序号。optimizer fingerprint 必须包含真实执行顺序中的 optimizer group、task、ordered members、shape/dtype 和每组 ARC 配置；只有模型参数表一致并不充分。hook fingerprint 则描述稳定参数角色表，两种 fingerprint 不要求相等。不得使用 Python `hash()`、全局 RNG 状态、rank、临时 bucket index 或 callback 到达顺序。bucket rebuild 不改变某个参数的 seed。两条路线在 `ratio < 1` 时可能因投影分组不同而不消费同一随机序列，因此不要求逐 bit 相同。
+
+使用 `local_deterministic` 的前提是：初始化时对 process group 的有序 rank membership、base seed、ARC 配置、稳定参数/任务表、shape/dtype、角色和 optimizer parameter coverage 生成 canonical fingerprint，并在所有 rank 上做一次一致性校验；不能使用各进程不同的 process-group 对象身份。恢复 checkpoint 时再次校验。不一致立即报错，不能继续训练。该一次性校验不位于训练 step 的关键路径。
 
 这保证 hook 模式自身可重复，但不承诺与旧 shape-batched 路线在 `ratio < 1` 时使用完全相同的随机投影。
 
@@ -325,7 +332,7 @@ checkpoint
 
 当前 `CheckpointManager` 使用 DCP 默认 planner；若每个 rank 以相同 metadata key 提供普通 tensor，replicated-tensor 去重会丢失 rank-local 差异。因此 rank-local tensor 必须使用 rank namespace，或采用明确的 rank-sharded 表示，不能只把同名字典附加到公共 state dict。
 
-checkpoint snapshot 只能在本 optimizer step 的所有 hook Future 和 Muon 通信完成后生成，不能复制仍被 callback 更新的状态。保存时每个 rank 提供自己的 namespace；加载时按 global rank 和稳定参数名匹配，并校验 schema version、DP world size、rank mapping、配置 fingerprint、shape/dtype/角色。首版不支持改变 DP world size 后精确续训。缺失、重复或不兼容状态默认报错；只有显式选择“重新初始化压缩器状态”时才允许丢弃。
+checkpoint snapshot 只能在本 optimizer step 的所有 hook Future、Muon 通信和 optimizer commit 完成后生成，不能复制仍被 callback 更新的状态。保存时每个 rank 提供自己的 namespace；fresh load 必须先从稳定参数表预分配完整目的 tensor schema，再由 DCP 加载，不能指望 DCP 从空字典自动创建 rank-local tensor。加载时按 global rank 和稳定参数名匹配，并用 checkpoint metadata 对当前 runtime 的 schema version、DP world size、rank mapping、配置 fingerprint、seed scheme、shape/dtype/角色做外部校验。首版不支持改变 DP world size 后精确续训，也不支持只重置 compressor 而保留 Muon optimizer 状态；缺失、重复或不兼容状态统一报错。
 
 ## 10. 配置与兼容性
 
@@ -346,8 +353,9 @@ arc_sync_mode: ddp_hook   # 新路线
 - 要求 `find_unused_parameters=False`，首版不支持动态 unused parameters。
 - hook process group 必须与 Muon distributed process group 相同，每个 optimizer 参数必须恰有一个同步角色。
 - 单 rank 训练可以省略 collective，但仍执行完整 EF21M 状态更新。
+- 要求 `arc_seed_mode=local_deterministic`；不在 hook 中重新引入逐参数 seed broadcast。
 
-选择 `optimizer` 时，所有 micro-batch 的 forward/backward 都必须处于 `no_sync()`。这会修复当前正式训练入口仅包 backward 的问题；修复后的行为才作为兼容基线。除非新路线改变 ARC/EF21M 数学语义，否则仍归入 M001，作为新的同步调度实现，不创建新方法编号。
+选择 `optimizer` 时，所有 micro-batch 的 forward/backward 都必须处于 `no_sync()`；当前 corrected shared loop 已满足这一语义。`arc_seed_mode` 可选 `broadcast` 或 `local_deterministic`。除非新路线改变 ARC/EF21M 数学语义，否则仍归入 M001，作为新的同步调度实现，不创建新方法编号。
 
 ## 11. 正确性不变量
 
@@ -382,7 +390,8 @@ arc_sync_mode: ddp_hook   # 新路线
 
 优先用 Gloo CPU 测试控制流和数值正确性：
 
-- 首先对当前正式训练写法注册计数 hook，证明仅包 backward 时仍发生 DDP 同步；再验证修正后的 optimizer/hook 两种 context 策略。
+- 保留历史 backward-only 诊断作为回归特征；验证当前 dense/optimizer/hook 三种 context 策略分别只产生预期 hook 次数。
+- 对 `broadcast` 与 `local_deterministic` 做多步两 rank对照；验证相同配置同轨迹、fingerprint 不一致一致失败，并确认 local 模式没有 `arc/seed` collective 或 `.item()` 路径。
 - `eta=1, ratio=1` 对照标准 DDP all-reduce；一般 `eta` 对照多步 EF21M oracle。
 - `ratio<1` 不仅验证 rank 一致，还逐项验证 `h_local/g_local/g_global` 和最终参数的 oracle。
 - 两个以上 bucket，人为引入不同 rank 的 prepare/callback 延迟，验证全局 collective 标签、shape、顺序和完成 Future。
@@ -406,21 +415,21 @@ arc_sync_mode: ddp_hook   # 新路线
 - 通信字节、bucket 数、bucket size、gradient accumulation 和压缩率。
 - eager 与正式 `model.compile()` 入口的 bucket-ready 时序、hook trace 和 wall-clock；不能从 eager 骨架直接外推 compiled 路径。
 
-三方对照中的 dense DDP 和 optimizer-side ARC 都必须使用修复后的 accumulation context；历史入口行为和修复后行为分开报告。正式训练还需记录 hook 调用次数和实际 collective signature，排除 dense DDP 与 ARC 双重同步。
+三方对照中的 dense DDP 和 optimizer-side ARC 都必须使用修复后的 accumulation context；两个 ARC 模式统一使用 `local_deterministic`，避免把 seed broadcast 差异误归因于 overlap。历史入口行为和修复后行为分开报告。正式训练还需记录 hook 调用次数和实际 collective signature，排除 dense DDP 与 ARC 双重同步。
 
-只有 profiler 显示 ARC collective 位于 backward 区间并与后续反向计算重叠，才能声称恢复了 DDP overlap。只有端到端 wall-clock 改善，才能声称该路线带来训练加速。专门 benchmark 的单步改善不能自动外推到长训练；数据加载、验证、checkpoint、日志、不同 gradient accumulation/bucket layout 和系统抖动都需分别核对。
+只有 profiler 显示 ARC 通信 GPU kernel 与其后的真实 backward compute GPU kernel 存在时间区间交集，才能声称恢复了 DDP overlap；仅位于 host backward range 内不够，因为 backward 返回前本来就会等待 hook Future。只有端到端 wall-clock 改善，才能声称该路线带来训练加速。专门 benchmark 的单步改善不能自动外推到长训练；数据加载、验证、checkpoint、日志、不同 gradient accumulation/bucket layout 和系统抖动都需分别核对。
 
 ## 13. 分阶段交付
 
-1. 为当前 `no_sync()` 写两 rank 回归测试，修复 shared training loop，并分别重新建立 dense DDP 与 optimizer-side ARC 基线。
-2. 用 dummy payload 实现全局 tail Future、多 bucket、多 collective 的最小骨架；先验证 Gloo/NCCL 顺序、异常传播和 CUDA completion。
-3. 抽离可复用的 ARC 本地数学原语，以多步 EF21M oracle 保持旧语义。
+1. 在保留 `broadcast` 默认兼容行为的前提下实现 `local_deterministic` seed、一次性 fingerprint 校验和多步分布式回归；先独立确认 seed collective 与 `.item()` 从关键路径消失。
+2. 抽离可复用的 ARC 本地数学原语，以多步 EF21M oracle 保持旧 optimizer-side 语义。
+3. 用 dummy payload 实现全局 tail Future、多 bucket、多 collective 的最小骨架；先验证 Gloo/NCCL 顺序、异常传播和 CUDA completion。
 4. 实现 hook state、静态参数角色/fingerprint 和 fail-fast unused 支持边界。
 5. 实现首步、warmup/full-support 和 mixed dense bucket hook。
-6. 实现稀疏 ARC sketch/values 链，完成两 rank 数值测试并增加 NCCL 压力测试。
+6. 直接实现完整稀疏 ARC sketch/values 链，完成两 rank 数值测试并增加 NCCL 压力测试；不交付 selective-dense 中间 hook。
 7. 将 rank-local compressor state 接入真实 DCP checkpoint 并验证恢复轨迹。
-8. 接入 `train_arctopk.py` 配置，普通 Muon 与修复后的旧 `ArcTopKMuon` 双路线共存。
-9. 运行 profiler 和 GPT 350M 对照实验；按研究规范记录 M001 worklog 和正式 CM 实验。
+8. 接入 `train_arctopk.py` 配置，使普通 Muon hook 路线与 corrected `ArcTopKMuon` 对照路线共存。
+9. 运行 dense DDP、optimizer-side ARC-local-seed、DDP-hook ARC-local-seed 三方 profiler 和 GPT 350M 对照实验；按研究规范记录 M001 worklog 和正式 CM 实验。
 
 每个阶段都应可独立回归。阻塞 prototype 只作为短期数学/测试参考，不保留为第二套生产实现；异步骨架验证通过后，生产入口只保留 Future 路线。
 
@@ -447,7 +456,7 @@ arc_sync_mode: ddp_hook   # 新路线
 - `eta=1, ratio=1` 与标准 DDP 在规定容差内一致；一般 eta 的 full-support 与多步 EF21M oracle 一致。
 - accumulation、mixed bucket、rank-local DCP round-trip、bucket rebuild 和跨 rank 延迟有自动化覆盖。
 - profiler 与 hook count 证明 dense accumulation 的前 N-1 个 micro-batch 不通信，并证明 optimizer-side ARC 基线没有 dense DDP 双重同步。
-- profiler 证明 ARC 同步在 backward 的 bucket-ready 时刻启动，并至少与一部分后续反向计算重叠。
+- profiler 证明 ARC 同步在 bucket-ready 后启动，并与一部分后续真实 backward GPU compute kernel 重叠；hook 自身 prepare/TopK/finalize kernel 不计作 backward compute。
 - eager 和正式 compiled 入口分别通过同步时序验收；性能结论以实际部署配置为准。
 - 旧 optimizer-side 模式仍可运行，且配置不会造成双重同步。
 - GPT 350M 正式实验完整记录环境、吞吐、step time、通信量和 timeline；不预设新路线一定改善 wall clock。
