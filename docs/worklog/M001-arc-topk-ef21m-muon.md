@@ -646,6 +646,14 @@ CM023b 的 `12.49%` 只针对约 0.2 秒的最后 micro-step + optimizer 尾部�
 
 当前证据支持更具体的判断：optimizer-side ARC 确实减少了 dense DDP 梯度通信的 exposed 尾部，但收益只覆盖完整 step 的很小一部分，并被 ARC optimizer 内新增的状态处理和串行多阶段工作显著抵消。DDP bucket-hook 的潜在价值是把压缩通信重新移入 backward、争取与反向计算重叠；不过在实现前应先用四卡相同 workload 复测一次局部 trace，确认三卡观察能复现，再把 hook 与当前 optimizer-side ARC 做三方对照。
 
+## 2026-09-08：完整 sparse ARC DDP bucket hook
+
+按方案 Task 7，bucket hook 的压缩步已实现固定异步链：可选 packed dense all-reduce、packed ARC sketch all-reduce、Top-K 与 rank-local values gather、packed selected-values all-reduce，最后逐稳定参数名更新 `h_local/g_local/g_global` 并重建 bucket gradient。每个参数的 projection seed 只由 base seed、optimizer step 和 stable parameter ID 在本地派生；关键路径没有 seed collective、`Work.wait`、`torch.cuda.synchronize`、Tensor `.item()` 或 host polling。
+
+Future 链统一在每设备专用 execution stream 上延续，并显式桥接最终 Tensor Future，避免 nested Future 和 callback stream 可见性不明。`BucketContext` 强引用 projection、packing buffer、support 和中间结果直至最终 Future 完成。NCCL 压测覆盖真实 DDP bucket rebuild、小 bucket、多次迭代、rank-dependent callback delay、allocator churn 和非默认 consumer stream。调试中发现一次间歇性 `.grad` 差异来自测试在新 consumer stream 上读取前遗漏 stream dependency；补上 consumer 对 backward current stream 的等待后，完整 NCCL 文件稳定通过。
+
+Task 7 回归结果：CPU/Gloo hook、Future、state 共 `23 passed`；两张空闲 GPU 上 NCCL stress 共 `2 passed`。两 rank 三步 oracle 同时核对 ARC 三类 tracker、support、bucket gradient、普通 Muon 更新和精确 collective signature；没有运行正式 wall-clock 实验，因此本阶段只主张正确性与异步生命周期覆盖。
+
 ## 2026-09-07：本地确定性 seed 与稳定 optimizer task ID
 
 按 ARC DDP bucket-hook 设计的 Task 1，optimizer-side ARC 已删除逐任务 device seed tensor、broadcast、等待和 `.item()`，改为纯整数公式 `base_seed + step * 1_000_003 + stable_task_id` 后按 `2**64` 规范化。本地 seed 不读取或修改全局 RNG；逻辑通信统计保留 `arc_seed_bytes` schema 字段，但其运行值固定为 0，benchmark collective signature 不再包含 `arc_seed`。

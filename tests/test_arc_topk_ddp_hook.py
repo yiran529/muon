@@ -1,5 +1,7 @@
 """Single-rank reconstruction tests for the ARC DDP communication hook."""
 
+import math
+
 import pytest
 import torch
 
@@ -9,6 +11,7 @@ from dion.arc_topk_ddp_hook import (
     arc_topk_ddp_hook,
 )
 from dion.arc_topk_sync import ArcTopKSyncConfig
+from dion.arc_topk import derive_arc_seed
 
 
 class FakeGradBucket:
@@ -32,7 +35,7 @@ class FakeGradBucket:
         return self._buffer
 
 
-def _state(parameters_and_roles, *, ratio=0.5):
+def _state(parameters_and_roles, *, ratio=0.5, start_compress_step=2):
     parameters = [item[0] for item in parameters_and_roles]
     return ArcTopKDDPState(
         process_group=None,
@@ -47,7 +50,7 @@ def _state(parameters_and_roles, *, ratio=0.5):
             projection_rank=2,
             eta=0.25,
             seed=17,
-            start_compress_step=2,
+            start_compress_step=start_compress_step,
         ),
     )
 
@@ -100,3 +103,78 @@ def test_full_support_preserves_each_realistic_bucket_dtype(dtype):
 
     assert result.dtype == dtype
     torch.testing.assert_close(result.view_as(parameter), gradient)
+
+
+def _manual_sparse_step(gradient, h_local, g_local, *, step, stable_id):
+    h_local = gradient if step == 1 else h_local.lerp(gradient, 0.25)
+    if step == 1:
+        return h_local, h_local, torch.arange(gradient.shape[0])
+    delta = h_local - g_local
+    generator = torch.Generator().manual_seed(
+        derive_arc_seed(base_seed=17, step=step, stable_task_id=stable_id)
+    )
+    projection = torch.randn(1, gradient.shape[1], 2, generator=generator)
+    sketch = torch.bmm(delta.unsqueeze(0), projection).squeeze(0) / math.sqrt(2.0)
+    k = math.ceil(0.5 * gradient.shape[0])
+    support = sketch.square().sum(-1).topk(k, sorted=True).indices
+    compressed = torch.zeros_like(delta)
+    compressed[support] = delta[support]
+    return h_local, g_local + compressed, support
+
+
+def test_sparse_hook_preserves_per_parameter_state_across_mixed_shape_bucket_steps():
+    first = torch.nn.Parameter(torch.zeros(3, 2))
+    dense = torch.nn.Parameter(torch.zeros(2))
+    second = torch.nn.Parameter(torch.zeros(2, 3))
+    state = _state(
+        [
+            (first, "first", "arc_matrix"),
+            (dense, "dense", "dense_aux"),
+            (second, "second", "arc_matrix"),
+        ],
+        start_compress_step=0,
+    )
+    expected = {
+        first: (torch.zeros_like(first), torch.zeros_like(first)),
+        second: (torch.zeros_like(second), torch.zeros_like(second)),
+    }
+
+    for step in range(1, 4):
+        gradients = [
+            torch.arange(6.0).view_as(first) + step,
+            torch.tensor([10.0 + step, 20.0 + step]),
+            torch.arange(6.0).view_as(second) + 2 * step,
+        ]
+        bucket = FakeGradBucket([first, dense, second], gradients)
+        state.begin_step()
+        result = arc_topk_ddp_hook(state, bucket).wait()
+        state.finish_step()
+
+        for parameter, gradient, stable_id in (
+            (first, gradients[0], 0),
+            (second, gradients[2], 2),
+        ):
+            h_local, g_local = expected[parameter]
+            h_local, g_local, support = _manual_sparse_step(
+                gradient,
+                h_local,
+                g_local,
+                step=step,
+                stable_id=stable_id,
+            )
+            expected[parameter] = (h_local, g_local)
+            parameter_state = state.parameter_state(parameter)
+            torch.testing.assert_close(parameter_state.h_local, h_local)
+            torch.testing.assert_close(parameter_state.g_local, g_local)
+            torch.testing.assert_close(parameter_state.g_global, g_local)
+            torch.testing.assert_close(parameter_state.last_support, support)
+            offset = 0 if parameter is first else first.numel() + dense.numel()
+            torch.testing.assert_close(
+                result[offset : offset + parameter.numel()].view_as(parameter),
+                g_local,
+            )
+        torch.testing.assert_close(
+            result[first.numel() : first.numel() + dense.numel()],
+            gradients[1],
+        )
+        state.commit_step()
