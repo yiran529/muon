@@ -1,6 +1,6 @@
 """Asynchronous DDP bucket communication state for ARC-TopK/EF21M."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Literal, Optional, Sequence
 import threading
 
@@ -11,6 +11,8 @@ from torch.distributed import ProcessGroup
 from torch.nn import Parameter
 
 from .arc_topk_sync import ArcTopKSyncConfig
+from .arc_topk import finalize_arc_full_support_, prepare_arc_batch
+from .collective_observer import observe_collective
 
 
 ARC_COMPRESSOR_SCHEMA_VERSION = 1
@@ -45,6 +47,7 @@ class BucketContext:
     bucket_ready_event: Optional[torch.cuda.Event]
     previous_tail: torch.futures.Future
     completion_future: torch.futures.Future
+    retained: list[Any] = field(default_factory=list)
 
 
 def _future_devices(device: torch.device) -> list[torch.device]:
@@ -363,3 +366,88 @@ def enqueue_bucket_chain(
 
     context.previous_tail.add_done_callback(after_previous)
     return destination
+
+
+def _future_tensor(value: Any) -> Tensor:
+    return value[0] if isinstance(value, (tuple, list)) else value
+
+
+def _launch_full_support_bucket(
+    state: ArcTopKDDPState,
+    context: BucketContext,
+) -> torch.futures.Future:
+    prepared_views = []
+    for gradient, parameter_state in zip(
+        context.gradients,
+        context.parameter_states,
+    ):
+        if parameter_state is None:
+            continue
+        prepared = prepare_arc_batch(
+            gradient.unsqueeze(0),
+            parameter_state.h_local.unsqueeze(0),
+            parameter_state.g_local.unsqueeze(0),
+            parameter_state.g_global.unsqueeze(0),
+            config=state.config,
+            step=context.step,
+            projection_batch=None,
+        )
+        gradient.copy_(parameter_state.h_local)
+        prepared_views.append((prepared, gradient))
+    context.retained.extend(prepared_views)
+
+    if state.process_group is not None and state.world_size > 1:
+        observe_collective("arc_hook/dense", "all_reduce", context.buffer)
+        source = dist.all_reduce(
+            context.buffer,
+            op=dist.ReduceOp.SUM,
+            group=state.process_group,
+            async_op=True,
+        ).get_future()
+    else:
+        source = torch.futures.Future(
+            devices=_future_devices(context.buffer.device)
+        )
+        source.set_result(context.buffer)
+
+    finalized = torch.futures.Future(
+        devices=_future_devices(context.buffer.device)
+    )
+
+    def finalize(value: Any) -> Tensor:
+        buffer = _future_tensor(value)
+        if state.world_size > 1:
+            buffer.div_(state.world_size)
+        for prepared, averaged_gradient in prepared_views:
+            finalize_arc_full_support_(
+                prepared,
+                averaged_gradient.unsqueeze(0),
+            )
+        return context.buffer
+
+    bridge_future(source, finalized, finalize)
+    return finalized
+
+
+def arc_topk_ddp_hook(
+    state: ArcTopKDDPState,
+    bucket: dist.GradBucket,
+) -> torch.futures.Future[Tensor]:
+    """Synchronize one DDP bucket through the globally sequenced ARC chain."""
+
+    context = state.note_bucket(bucket)
+    is_sparse_step = (
+        context.step > state.config.start_compress_step
+        and context.step != 1
+        and state.config.ratio < 1.0
+    )
+    if is_sparse_step:
+        def unsupported(_context: BucketContext) -> torch.futures.Future:
+            raise NotImplementedError("sparse ARC DDP hook is not implemented")
+
+        return enqueue_bucket_chain(state, context, unsupported)
+    return enqueue_bucket_chain(
+        state,
+        context,
+        lambda current: _launch_full_support_bucket(state, current),
+    )
