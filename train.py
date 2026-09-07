@@ -31,6 +31,10 @@ from dion import Dion2
 from dion import NorMuon
 from dion import NorDion2
 from dion.opt_utils import lm_head_lr_scale
+from benchmark.compressed_muon.training_profiler import (
+    make_training_profile_capture,
+    profiled_optimizer_step,
+)
 
 
 @dataclass
@@ -118,6 +122,7 @@ def forward_backward_micro_step(
     grad_accum_steps: int,
     optimizer_owns_gradient_sync: bool,
     before_backward=None,
+    profile_ranges: bool = False,
 ):
     """Run one accumulated micro-step with forward and backward under one DDP context."""
 
@@ -127,12 +132,24 @@ def forward_backward_micro_step(
         grad_accum_steps=grad_accum_steps,
         optimizer_owns_gradient_sync=optimizer_owns_gradient_sync,
     ):
-        with autocast_ctx:
-            loss = model(x, y)
+        forward_range = (
+            torch.profiler.record_function("train/final_forward")
+            if profile_ranges
+            else nullcontext()
+        )
+        with forward_range:
+            with autocast_ctx:
+                loss = model(x, y)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         callback_result = before_backward() if before_backward is not None else None
-        loss.backward()
+        backward_range = (
+            torch.profiler.record_function("train/final_backward")
+            if profile_ranges
+            else nullcontext()
+        )
+        with backward_range:
+            loss.backward()
     return train_loss, callback_result
 
 
@@ -193,6 +210,24 @@ def parse_cli_args(configure_parser=None):
         "--time_optimizer", action="store_true",
         help="Time fwd/bwd and optimizer step separately (adds cuda.synchronize between them)",
     )
+    parser.add_argument(
+        "--profile-output-dir",
+        type=str,
+        default=None,
+        help="Write one targeted Chrome trace per rank to this directory",
+    )
+    parser.add_argument(
+        "--profile-step",
+        type=int,
+        default=None,
+        help="Profile the final accumulation micro-step and optimizer at this step",
+    )
+    parser.add_argument(
+        "--training-seed",
+        type=int,
+        default=None,
+        help="Seed model initialization for reproducible comparison runs",
+    )
 
     # ---------- model ----------
     parser.add_argument("--model_dim", type=int, default=None)
@@ -208,6 +243,7 @@ def parse_cli_args(configure_parser=None):
     )
     parser.add_argument("--device_batch_size", type=int, default=None)
     parser.add_argument("--sequence_length", type=int, default=None)
+    parser.add_argument("--val_tokens", type=int, default=None)
     parser.add_argument("--warmup_ratio", type=float, default=None)
     parser.add_argument("--warmdown_ratio", type=float, default=None)
 
@@ -754,6 +790,10 @@ def main(
     hp = hyperparameters_factory()
     hp = override_args_from_cli(hp, cli_args)
 
+    if cli_args.training_seed is not None:
+        torch.manual_seed(cli_args.training_seed)
+        torch.cuda.manual_seed_all(cli_args.training_seed)
+
     if hp.checkpoint_freq > 0:
         if not hp.checkpoint_dir:
             raise ValueError("Must specify --checkpoint_dir to save checkpoints")
@@ -800,6 +840,11 @@ def main(
     assert hp.batch_size % sequences_in_global_batch == 0, "Invalid batch_size"
     grad_accum_steps = hp.batch_size // sequences_in_global_batch
     assert grad_accum_steps >= 1, "Invalid grad_accum_steps"
+    profile_capture = make_training_profile_capture(
+        output_dir=cli_args.profile_output_dir,
+        profile_step=cli_args.profile_step,
+        num_iterations=hp.num_iterations,
+    )
 
     print0(f"Global batch size: {hp.batch_size} sequences")
     print0(f"Per-device batch size: {hp.device_batch_size} sequences")
@@ -1069,6 +1114,9 @@ def main(
             torch.cuda.synchronize()
             t_fwd_bwd = time.perf_counter()
         for i in range(1, grad_accum_steps + 1):
+            profile_capture.maybe_start(
+                step=step, micro_step=i, grad_accum_steps=grad_accum_steps
+            )
             def prepare_backward():
                 next_batch = train_loader.next_batch()
                 if isinstance(model, FSDPModule):
@@ -1084,16 +1132,18 @@ def main(
                         model.set_requires_gradient_sync(True)
                 return next_batch
 
-            train_loss, (x, y) = forward_backward_micro_step(
-                model,
-                x,
-                y,
-                autocast_ctx=autocast_ctx,
-                micro_step=i,
-                grad_accum_steps=grad_accum_steps,
-                optimizer_owns_gradient_sync=hp.replicate_mesh_grad_sync,
-                before_backward=prepare_backward,
-            )
+            with profile_capture.range("train/final_microstep"):
+                train_loss, (x, y) = forward_backward_micro_step(
+                    model,
+                    x,
+                    y,
+                    autocast_ctx=autocast_ctx,
+                    micro_step=i,
+                    grad_accum_steps=grad_accum_steps,
+                    optimizer_owns_gradient_sync=hp.replicate_mesh_grad_sync,
+                    before_backward=prepare_backward,
+                    profile_ranges=profile_capture.active,
+                )
 
         if cli_args.time_optimizer:
             torch.cuda.synchronize()
@@ -1101,10 +1151,11 @@ def main(
             t_opt = time.perf_counter()
 
         # Gradient norm + optimizer step
-        grad_norm = torch.nn.utils.get_total_norm(
-            [p.grad for p in model.parameters() if p.grad is not None]
-        )
-        optimizer.step()
+        with profile_capture.range("train/gradient_norm"):
+            grad_norm = torch.nn.utils.get_total_norm(
+                [p.grad for p in model.parameters() if p.grad is not None]
+            )
+        profiled_optimizer_step(optimizer, profile_capture)
         lr_scheduler.step()
         model.zero_grad(set_to_none=True)
 

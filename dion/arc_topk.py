@@ -150,12 +150,13 @@ def arc_topk_ef21m_async(
     if len(shape) != 2 or any(t.shape != shape for t in gradients):
         raise ValueError("ARC-TopK shape groups require same-shaped 2D gradients")
 
-    gradient_batch = torch.stack(
-        [g.to(dtype=trackers[i].dtype) for i, g in enumerate(gradients)]
-    )
-    tracker_batch = torch.stack(trackers)
-    local_estimate_batch = torch.stack(local_estimates)
-    global_estimate_batch = torch.stack(global_estimates)
+    with record_function("arc/state_stack"):
+        gradient_batch = torch.stack(
+            [g.to(dtype=trackers[i].dtype) for i, g in enumerate(gradients)]
+        )
+        tracker_batch = torch.stack(trackers)
+        local_estimate_batch = torch.stack(local_estimates)
+        global_estimate_batch = torch.stack(global_estimates)
 
     with record_function("arc/ef21m"):
         if step == 1:
@@ -177,7 +178,8 @@ def arc_topk_ef21m_async(
                     async_op=True,
                 )
             yield
-            work.wait()
+            with record_function("arc/dense_uncompressed_wait"):
+                work.wait()
             global_estimate_batch.div_(world_size)
 
         torch._foreach_copy_(trackers, list(tracker_batch.unbind(0)))
@@ -205,7 +207,8 @@ def arc_topk_ef21m_async(
                 async_op=True,
             )
         yield
-        work.wait()
+        with record_function("arc/seed_wait"):
+            work.wait()
     synchronized_seed = int(seed_tensor.item())
 
     delta_batch = tracker_batch - local_estimate_batch
@@ -219,7 +222,8 @@ def arc_topk_ef21m_async(
             device=gradient_batch.device,
             dtype=gradient_batch.dtype,
         )
-    global_sketch = arc_topk_local_sketch(delta_batch, projection)
+    with record_function("arc/sketch_compute"):
+        global_sketch = arc_topk_local_sketch(delta_batch, projection)
     if process_group is not None and world_size > 1:
         observe_collective("arc/sketch", "all_reduce", global_sketch)
         with record_function("arc/sketch"):
@@ -230,13 +234,14 @@ def arc_topk_ef21m_async(
                 async_op=True,
             )
         yield
-        work.wait()
+        with record_function("arc/sketch_wait"):
+            work.wait()
         global_sketch.div_(world_size)
 
     k = math.ceil(ratio * rows)
     with record_function("arc/topk"):
         indices = arc_topk_support(global_sketch, k)
-    with record_function("arc/selected_values"):
+    with record_function("arc/gather"):
         local_selected = gather_rows(delta_batch, indices)
     averaged_selected = local_selected.clone()
     if process_group is not None and world_size > 1:
@@ -249,11 +254,13 @@ def arc_topk_ef21m_async(
                 async_op=True,
             )
         yield
-        work.wait()
+        with record_function("arc/selected_values_wait"):
+            work.wait()
         averaged_selected.div_(world_size)
 
-    local_compressed = scatter_rows(local_selected, indices, rows)
-    averaged_compressed = scatter_rows(averaged_selected, indices, rows)
+    with record_function("arc/scatter"):
+        local_compressed = scatter_rows(local_selected, indices, rows)
+        averaged_compressed = scatter_rows(averaged_selected, indices, rows)
     with record_function("arc/ef21m"):
         ef21m_apply_delta_(
             local_estimate_batch,
@@ -262,7 +269,8 @@ def arc_topk_ef21m_async(
             averaged_compressed,
         )
 
-    torch._foreach_copy_(trackers, list(tracker_batch.unbind(0)))
-    torch._foreach_copy_(local_estimates, list(local_estimate_batch.unbind(0)))
-    torch._foreach_copy_(global_estimates, list(global_estimate_batch.unbind(0)))
+    with record_function("arc/state_copy"):
+        torch._foreach_copy_(trackers, list(tracker_batch.unbind(0)))
+        torch._foreach_copy_(local_estimates, list(local_estimate_batch.unbind(0)))
+        torch._foreach_copy_(global_estimates, list(global_estimate_batch.unbind(0)))
     return global_estimates

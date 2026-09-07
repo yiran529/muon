@@ -22,6 +22,20 @@ _CATEGORY_NAMES = {
     "arc/ef21m": "arc_ef21m",
     "muon/newton_schulz": "muon_newton_schulz",
     "muon/result_collective": "muon_result",
+    "train/profile_window": "profile_window",
+    "train/final_microstep": "final_microstep",
+    "train/final_forward": "final_forward",
+    "train/final_backward": "final_backward",
+    "train/gradient_norm": "gradient_norm",
+    "train/optimizer": "optimizer",
+    "arc/state_stack": "arc_state_stack",
+    "arc/sketch_compute": "arc_sketch_compute",
+    "arc/sketch_wait": "arc_sketch_wait",
+    "arc/gather": "arc_gather",
+    "arc/selected_values_wait": "arc_selected_values_wait",
+    "arc/scatter": "arc_scatter",
+    "arc/state_copy": "arc_state_copy",
+    "muon/result_collective_wait": "muon_result_wait",
 }
 
 _COLLECTIVE_CATEGORIES = {
@@ -120,6 +134,11 @@ def _is_nccl(event: dict[str, Any]) -> bool:
     return category in {"kernel", "cuda_kernel", "gpu"} or "ncclkernel" in name or "nccldevkernel" in name
 
 
+def _is_cpu_annotation(event: dict[str, Any]) -> bool:
+    """Exclude Kineto's GPU mirror of a record_function annotation."""
+    return str(event.get("cat", "")).lower() != "gpu_user_annotation"
+
+
 def attribute_trace(trace: Any) -> dict[str, Any]:
     """Attribute NCCL kernels to the nearest named launch range.
 
@@ -166,6 +185,18 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
             if nested:
                 correlation_categories[str(corr)] = min(nested, key=lambda r: r[2] - r[1])[0]
                 correlation_ranges[str(corr)] = min(nested, key=lambda r: r[2] - r[1])[4]
+            elif "record_param_comms" in name and str(_args(event).get("Collective name", "")).lower() in {"allreduce", "all_reduce"}:
+                backward = [
+                    r for r in ranges
+                    if r[0] == "final_backward"
+                    and r[4].get("pid") == event.get("pid")
+                    and r[1] <= start and end <= r[2]
+                ]
+                if backward:
+                    correlation_categories[str(corr)] = "ddp_gradient"
+                    correlation_ranges[str(corr)] = min(
+                        backward, key=lambda r: r[2] - r[1]
+                    )[4]
     groups: dict[str, dict[str, Any]] = defaultdict(lambda: {"kernel_count": 0, "duration_us": 0.0, "message_bytes": 0})
     nccl_intervals = []; compute_intervals = []; counted_payloads = set()
     for event in events:
@@ -178,7 +209,13 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
             if not candidates:
                 candidates = [r for r in ranges if r[0] in _COLLECTIVE_CATEGORIES
                               and r[1] <= start and end <= r[2]]
-            category = (correlation_categories.get(str(corr)) if corr is not None else None) or (candidates[-1][0] if candidates else "unattributed")
+            category = (correlation_categories.get(str(corr)) if corr is not None else None) or (candidates[-1][0] if candidates else None)
+            if category is None:
+                backward_ranges = [
+                    r for r in ranges
+                    if r[0] == "final_backward" and r[1] <= start and end <= r[2]
+                ]
+                category = "ddp_gradient" if backward_ranges else "unattributed"
             item = groups[category]
             item["kernel_count"] += 1; item["duration_us"] += _duration(event)
             nccl_intervals.append((start, end))
@@ -220,6 +257,49 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
         "exposed_is_trace_estimate": True,
         "collectives": collectives,
     }
+
+
+def summarize_training_trace(trace: Any) -> dict[str, Any]:
+    """Add named CPU-range accounting to the existing NCCL attribution."""
+    events = _events(trace)
+    windows = [
+        event for event in events
+        if event.get("ph") == "X"
+        and event.get("name") == "train/profile_window"
+        and _is_cpu_annotation(event)
+    ]
+    if windows:
+        window_start = min(float(event.get("ts", 0.0)) for event in windows)
+        window_end = max(
+            float(event.get("ts", 0.0)) + _duration(event) for event in windows
+        )
+        events = [
+            event for event in events
+            if float(event.get("ts", 0.0)) >= window_start
+            and float(event.get("ts", 0.0)) + _duration(event) <= window_end
+        ]
+    result = attribute_trace(events)
+    cpu_ranges: dict[str, float] = defaultdict(float)
+    for event in events:
+        if event.get("ph") != "X":
+            continue
+        if not _is_cpu_annotation(event):
+            continue
+        category = _range_category(str(event.get("name", "")))
+        if category is not None:
+            cpu_ranges[category] += _duration(event) / 1000.0
+    total_nccl = sum(item["duration_ms"] for item in result["collectives"])
+    unattributed = sum(
+        item["duration_ms"]
+        for item in result["collectives"]
+        if item["category"] == "unattributed"
+    )
+    result["cpu_ranges_ms"] = dict(sorted(cpu_ranges.items()))
+    result["profile_window_ms"] = cpu_ranges.get("profile_window", 0.0)
+    result["unattributed_nccl_fraction"] = (
+        unattributed / total_nccl if total_nccl else 0.0
+    )
+    return result
 
 
 def parse_trace(path: str | Path) -> dict[str, Any]:

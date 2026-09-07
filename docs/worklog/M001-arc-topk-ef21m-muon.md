@@ -573,3 +573,75 @@ allocator 配置可以消除最早的初始化 OOM，但当前 24GB 卡仍不足
 - 预登记 CM020a/b：GPT-350M、4 GPU、BF16、seq 1024、global batch 1024、device batch 1、gradient accumulation 256、compile，串行运行 dense Muon 与 optimizer-side ARC Muon；两侧各训练 15 步，使用训练入口 step 10 后的 5 个 step 形成短窗口 `step_avg`。ARC 固定 ratio 0.2、projection rank 4、eta 0.1、compression start 0。
 - 本次不传 `--time_optimizer`，避免额外 `cuda.synchronize()` 改变主 wall-clock critical path；validation 仅在最终 step 运行且不计入 training timer。每个 cell 最长一小时，GPU busy、CPU correctness gate、数据缺失、非零退出或缺少最终 timing 均 fail closed。
 - CM020 只有每 cell 一次短跑，没有重复样本、CV 或 profiler，定位为高信息增益 attribution probe，不能登记为稳定性能结论。若结果表明修复双重同步后 optimizer-side ARC 仍不能改善 step wall-clock，再进入 DDP bucket-hook 实施和三方 profiler 对照。
+
+## 2026-09-07：CM021/CM022 ARC 正确性、质量与 GPT-350M wall-clock 复测
+
+### CM021 等价性 gate 与小模型消融
+
+CM021 首先用 2-rank NCCL、8 个 optimizer steps 检查 `ratio=1.0`、`eta=1.0`、identity orthogonalizer 的 ARC 路径是否退化为 dense 同步。Gate 通过：每一步 matrix parameter 的 dense/ARC `max_abs` 差为 0，ARC 跨 rank parameter 差为 0；第 8 步 matrix momentum 最大差为 `8.34465e-7`，重建 global gradient 最大差不超过 `1.19209e-7`。这支持当前 optimizer-side ARC 的同步、缩放和累积路径没有明显的平均倍数或漏同步错误，但不证明有损压缩配置与 dense 等价。
+
+随后使用 GPT 小模型（dim 256、4 layers、4 heads）、2 GPU、BF16、seq 128、global batch 64、device batch 4、100 steps、seed 42、两侧均使用 Polar Express，串行执行 dense 和四个 ARC 消融 cell。所有 cell 均 exit 0：
+
+| cell | ratio | eta | final validation loss | step average |
+|---|---:|---:|---:|---:|
+| dense | — | — | 7.1172 | 97.79 ms |
+| ARC | 1.0 | 1.0 | 7.1169 | 100.75 ms |
+| ARC | 1.0 | 0.1 | 7.4607 | 110.10 ms |
+| ARC | 0.2 | 1.0 | 7.2051 | 105.33 ms |
+| ARC | 0.2 | 0.1 | 7.6052 | 104.91 ms |
+
+`ratio=1.0, eta=1.0` 的 loss 与 dense 基本一致，进一步支持实现主路径正确。在这次短训练中，单独把 `eta` 降到 0.1 的质量损失大于单独启用 `ratio=0.2` 的 Top-K；两者组合的最终 loss 最高。因此，当前早期 loss 差距更像有损算法配置的优化效应，尤其与 `eta=0.1` 有关，而不是 `no_sync` 修复后仍存在明显的同步倍数错误。该判断只覆盖一个 seed 和 100-step 小模型，不能替代长训练收敛实验。原始结果位于 `artifacts/compressed_muon/CM021-temporary-arc-ablation/`。
+
+### CM022 GPT-350M 三组交错配对复测
+
+为修正 CM020 只有单次、5 个 timed steps 且两侧 orthogonalizer 不一致的对照缺陷，CM022 使用 GPT-350M、4 GPU DDP、BF16、seq 1024、global batch 1024、device batch 1、gradient accumulation 256、compile、seed 42，并将 dense/ARC 两侧统一为 Polar Express。ARC 保持 `ratio=0.2`、projection rank 4、`eta=0.1`、compression start 0。每个进程训练 30 steps，训练入口重置 timer 后累计 20 个 timed updates；不传 `--time_optimizer`。固定 GPU 2–5，按 `dense→ARC`、`ARC→dense`、`dense→ARC` 顺序完成三组交错配对。六个 cell 均 exit 0，未发现 OOM、timeout、traceback 或 NaN。
+
+| repeat | order | dense step average | ARC step average | ARC time reduction | dense / ARC final validation loss |
+|---:|---|---:|---:|---:|---:|
+| 1 | dense → ARC | 7990.00 ms | 7991.28 ms | -0.0160% | 7.6725 / 10.3858 |
+| 2 | ARC → dense | 7983.19 ms | 7985.86 ms | -0.0334% | 7.5565 / 10.6963 |
+| 3 | dense → ARC | 8073.62 ms | 7866.40 ms | +2.5666% | 7.7017 / 10.7896 |
+
+Dense 的三次均值为 `8015.60 ms`、样本标准差 `50.36 ms`、CV `0.628%`；ARC 为 `7947.85 ms`、样本标准差 `70.59 ms`、CV `0.888%`。平均 paired time reduction 为 `0.839%`，对应平均 paired throughput gain `0.862%`，但前两组实际上持平，均值主要由第三组贡献；paired reduction 中位数为 `-0.016%`，样本标准差为 `1.496` 个百分点。基于仅 3 对样本的事后 t 区间约为 `[-2.88%, +4.56%]`，只能作为波动范围提示，不能作为精确统计推断。
+
+因此，CM022 不支持“当前 optimizer-side ARC 已稳定降低 GPT-350M wall-clock”的结论；更保守的判断是两者在该配置下基本持平，小幅潜在收益被运行波动覆盖。它也说明 CM020 观察到的约 8.1% 单次差值不能全部归因于 ARC 本身。
+
+最终 validation loss 的三次均值为 dense `7.6436`、ARC `10.6239`，ARC 平均高 `2.9803`，且三组方向一致。CM022 已训练 30 steps，所以该差距不能简单解释为“只训练/计时 5 步”；不过 30 steps 仍处于极早期，且每次最终验证只有 4096 tokens，不能外推完整训练的最终收敛或 time-to-quality。CM021 的消融证据使 `eta=0.1` 与 Top-K 有损压缩成为当前更强的早期质量差距解释。
+
+CM022 的机械汇总位于 `artifacts/compressed_muon/CM022-temporary-gpt350m-paired/summary.json`，逐 cell 命令、配置、日志与退出码位于同一目录。CM021/CM022 都是临时 exploratory experiments，不纳入正式 `RESULTS.md` 的稳定性能主表。
+
+### 下一步判断
+
+下一优先级是对相同 GPT-350M 对照做 timeline profiler，分别量化 dense DDP reducer 通信，以及 optimizer-side ARC 的 projection、Top-K、selected-values collective、EF21M、Muon orthogonalization/result collective 和 exposed NCCL 时间。目标是判断通信量下降是否被压缩计算、collective 启动、optimizer-side 串行化或 overlap 丢失抵消；在获得该证据前，不直接把 DDP bucket hook 作为已证明有效的 wall-clock 修复。
+
+## 2026-09-07：CM023b GPT-350M 三卡关键路径 profiler
+
+### 配置与执行边界
+
+使用参数化 launcher 在启动时空闲的 GPU 5、6、7 上串行运行 dense Muon 和 optimizer-side ARC Muon；明确排除 GPU 0、1，GPU 2、3、4 因已有占用未使用。两侧均为 GPT-350M、BF16、seq 1024、device batch 1、gradient accumulation 256、seed 42 和 Polar Express。为保持每卡工作量与 CM022 一致，三卡 global batch 改为 768。每个进程训练 13 steps，只采集 step 12 的最后一个 micro-step和随后 `optimizer.step()`；所有 rank 均采集 Kineto trace，不启用 shape、stack、memory 或 `--time_optimizer`。
+
+两组均 exit 0，各生成 3 份 rank trace；未发现 OOM、timeout、traceback 或 NaN，所有 NCCL kernel 均完成分类，最大 unattributed fraction 为 0。原始 trace、命令和日志的压缩归档及机械 summary 位于 `artifacts/compressed_muon/CM023b-gpt350m-critical-path-profiler-ws3-preserved/`。由于单次运行且 profiler 会扰动时序，本结果只用于热点归因，不替代 CM022 的无 profiler wall-clock 数据。
+
+CM023 首次 capture 暴露出两项 profiler 实现问题：CPU range 汇总重复计入 Kineto 的 `gpu_user_annotation` 镜像，且采集窗口在 `optimizer.step()` 后还包含 scheduler 和 `zero_grad`。对应回归测试与修复完成后才重跑 CM023b；首次 capture 只保留作审计，不用于以下数值或结论。
+
+### 关键路径观察
+
+| 指标（跨 rank 最大值） | dense | ARC |
+|---|---:|---:|
+| profile window | 208.618 ms | 182.561 ms |
+| NCCL interval union | 165.740 ms | 115.824 ms |
+| trace-estimated exposed NCCL | 125.858 ms | 63.836 ms |
+| final micro-step CPU range | 60.786 ms | 52.743 ms |
+| gradient norm CPU range | 2.036 ms | 2.171 ms |
+| optimizer CPU range | 10.413 ms | 32.280 ms |
+| Muon Newton–Schulz CPU range | 3.409 ms | 4.097 ms |
+
+ARC 的目标窗口比 dense 短 `26.056 ms`，即该局部窗口内约 `12.49%`。其 exposed NCCL 估计减少约 `62.02 ms`，optimizer CPU range 增加约 `21.87 ms`；这些量仍不能简单相减，因为 NCCL 异步 kernel、CPU ranges 和计算重叠区间彼此嵌套，profile window 才是本次局部关键路径的最终口径。
+
+Dense 跨 rank 最大的 DDP gradient NCCL 为 `136.28 ms`，Muon result collective 为 `29.46 ms`。ARC 跨 rank 最大的主要 NCCL 为：未压缩梯度 `39.12 ms`、selected values `26.49 ms`、Muon result `37.38 ms`、seed `8.13 ms`、sketch `4.96 ms`。ARC 本地 CPU range 的跨 rank 最大值包括 state copy `1.64 ms`、state stack `0.81 ms`、scatter `0.68 ms`、Top-K `0.67 ms`、EF21M `0.33 ms`、sketch compute `0.31 ms` 和 projection `0.25 ms`。这些 CPU 数字是 host annotation，不等于相应 CUDA kernel 总成本；实际主要额外关键路径表现为 optimizer 内串行的多阶段本地工作与 collective，而不是单独的 projection。
+
+### 对 CM022 wall-clock 的解释
+
+CM023b 的 `12.49%` 只针对约 0.2 秒的最后 micro-step + optimizer 尾部，不是完整训练 step。完整 step 还包含此前 255 个未采集的梯度累积 micro-steps，CM022 的无 profiler step 约为 8 秒。局部净节省 `26.06 ms` 若直接摊到 8 秒，只相当于约 `0.33%`，与 CM022 观察到的整体基本持平并不矛盾，也不足以证明稳定 wall-clock 加速。
+
+当前证据支持更具体的判断：optimizer-side ARC 确实减少了 dense DDP 梯度通信的 exposed 尾部，但收益只覆盖完整 step 的很小一部分，并被 ARC optimizer 内新增的状态处理和串行多阶段工作显著抵消。DDP bucket-hook 的潜在价值是把压缩通信重新移入 backward、争取与反向计算重叠；不过在实现前应先用四卡相同 workload 复测一次局部 trace，确认三卡观察能复现，再把 hook 与当前 optimizer-side ARC 做三方对照。

@@ -802,7 +802,8 @@ def megabatch_orthogonalize_async(
                 output_chunks, input_chunks, group=process_group, async_op=True
             )
         yield
-        work.wait()
+        with record_function("muon/result_collective_wait"):
+            work.wait()
 
         # comm_dim is negative, so it correctly indexes the stacked tensor
         full_matrices = torch.cat(output_chunks, dim=comm_dim)
@@ -831,7 +832,8 @@ def megabatch_orthogonalize_async(
                 recv_chunks, split_chunks, group=process_group, async_op=True
             )
         yield
-        work.wait()
+        with record_function("muon/result_collective_wait"):
+            work.wait()
 
         # Narrow each per-rank result back to the rank's original local size and
         # flatten the (rank, per_rank) axes in one shot, instead of a
@@ -867,7 +869,8 @@ def megabatch_orthogonalize_async(
                 all_chunks, my_matrices.contiguous(), group=process_group, async_op=True
             )
         yield
-        work.wait()
+        with record_function("muon/result_collective_wait"):
+            work.wait()
 
         # Flatten (rank, per_rank) in one op instead of a nested select loop.
         return _finalize(torch.stack(all_chunks).flatten(0, 1))
