@@ -40,7 +40,7 @@ def test_arctopk_hyperparameter_defaults_select_ddp_arc_topk():
     hp = module.ArcTopKHyperparameters()
 
     assert hp.optimizer == "arc_topk_muon"
-    assert hp.replicate_mesh_grad_sync is True
+    assert hp.arc_sync_mode == "optimizer"
     assert hp.arc_topk_ratio == 0.2
     assert hp.arc_projection_rank == 4
     assert hp.arc_eta == 0.1
@@ -107,7 +107,7 @@ def test_arctopk_optimizer_builds_matrix_and_scalar_groups():
     ddp_model = argparse.Namespace(process_group=None)
 
     model = _StubModel()
-    opt = module.init_arc_topk_optimizer(
+    opt, runtime = module.init_arc_topk_optimizer(
         model=model,
         device_mesh=None,
         ddp_model=ddp_model,
@@ -116,6 +116,8 @@ def test_arctopk_optimizer_builds_matrix_and_scalar_groups():
     )
 
     assert type(opt) is ArcTopKMuon
+    assert runtime.optimizer_owns_gradient_sync is True
+    assert runtime.checkpoint_state is None
     assert [group["algorithm"] for group in opt.param_groups] == [
         "muon",
         "adamw",
@@ -146,6 +148,7 @@ def test_m001_yaml_loads_through_shared_parser():
     assert raw_config["fs_size"] is None
     assert raw_config["tp_size"] is None
     assert raw_config["checkpoint_freq"] == 0
+    assert "replicate_mesh_grad_sync" not in raw_config
 
     with patch.object(sys, "argv", ["train_arctopk.py", "--config", str(CONFIG_PATH)]):
         args = train.parse_cli_args(
@@ -160,7 +163,7 @@ def test_m001_yaml_loads_through_shared_parser():
         }
     )
     assert hp.optimizer == "arc_topk_muon"
-    assert hp.replicate_mesh_grad_sync is True
+    assert hp.arc_sync_mode == "optimizer"
     assert hp.arc_topk_ratio == 0.2
     assert hp.arc_projection_rank == 4
     assert hp.arc_eta == 0.1

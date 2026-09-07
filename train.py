@@ -1,6 +1,7 @@
 import argparse
 import os
 import shutil
+import sys
 import time
 import tempfile
 import torch
@@ -18,7 +19,7 @@ from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DeviceMesh
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from models.gpt_model import GPT, GPTConfig, parallelize_gpt_model
 from models.gpt_utils import DistributedDataLoader
@@ -82,6 +83,35 @@ class Hyperparameters:
 
     # For printing out selection choice in Dion2
     verbose: bool = True
+
+
+@dataclass
+class GradientSyncRuntime:
+    """Optimizer-independent ownership and lifecycle for gradient synchronization."""
+
+    optimizer_owns_gradient_sync: bool
+    begin_step: Optional[Callable[[], Any]] = None
+    finish_step: Optional[Callable[[], Any]] = None
+    commit_step: Optional[Callable[[], Any]] = None
+    checkpoint_state: Any = None
+
+
+def normalize_gradient_sync_runtime(
+    factory_result,
+    *,
+    optimizer_owns_gradient_sync: bool,
+):
+    """Normalize legacy optimizer-only factories to the runtime contract."""
+
+    if (
+        isinstance(factory_result, tuple)
+        and len(factory_result) == 2
+        and isinstance(factory_result[1], GradientSyncRuntime)
+    ):
+        return factory_result
+    return factory_result, GradientSyncRuntime(
+        optimizer_owns_gradient_sync=optimizer_owns_gradient_sync
+    )
 
 
 # Helper function to only print on global rank 0
@@ -298,6 +328,7 @@ def parse_cli_args(configure_parser=None):
     if configure_parser is not None:
         configure_parser(parser)
 
+    explicitly_requested_replicate_sync = "--replicate_mesh_grad_sync" in sys.argv[1:]
     cli_args = parser.parse_args()
     if cli_args.config:
         # Read YAML → dict
@@ -324,6 +355,13 @@ def parse_cli_args(configure_parser=None):
         ):
             if yaml_cfg.get(flag, False):
                 setattr(cli_args, flag, True)
+
+        explicitly_requested_replicate_sync = (
+            explicitly_requested_replicate_sync
+            or "replicate_mesh_grad_sync" in yaml_cfg
+        )
+
+    cli_args._explicit_replicate_mesh_grad_sync = explicitly_requested_replicate_sync
 
     return cli_args
 
@@ -941,12 +979,16 @@ def main(
     print0(f"Scalar optimizer: {hp.scalar_opt}")
     print0(f"Base learning rate: {hp.lr}")
 
-    optimizer = optimizer_factory(
+    factory_result = optimizer_factory(
         model=raw_model,
         device_mesh=device_mesh,
         ddp_model=model if isinstance(model, DDP) else None,
         hp=hp,
         cli_args=cli_args,
+    )
+    optimizer, gradient_sync_runtime = normalize_gradient_sync_runtime(
+        factory_result,
+        optimizer_owns_gradient_sync=hp.replicate_mesh_grad_sync,
     )
 
     # Learning rate scheduler
@@ -1110,6 +1152,8 @@ def main(
             break
 
         model.train()
+        if gradient_sync_runtime.begin_step is not None:
+            gradient_sync_runtime.begin_step()
         if cli_args.time_optimizer:
             torch.cuda.synchronize()
             t_fwd_bwd = time.perf_counter()
@@ -1140,7 +1184,9 @@ def main(
                     autocast_ctx=autocast_ctx,
                     micro_step=i,
                     grad_accum_steps=grad_accum_steps,
-                    optimizer_owns_gradient_sync=hp.replicate_mesh_grad_sync,
+                    optimizer_owns_gradient_sync=(
+                        gradient_sync_runtime.optimizer_owns_gradient_sync
+                    ),
                     before_backward=prepare_backward,
                     profile_ranges=profile_capture.active,
                 )
@@ -1150,12 +1196,17 @@ def main(
             fwd_bwd_ms = 1000 * (time.perf_counter() - t_fwd_bwd)
             t_opt = time.perf_counter()
 
+        if gradient_sync_runtime.finish_step is not None:
+            gradient_sync_runtime.finish_step()
+
         # Gradient norm + optimizer step
         with profile_capture.range("train/gradient_norm"):
             grad_norm = torch.nn.utils.get_total_norm(
                 [p.grad for p in model.parameters() if p.grad is not None]
             )
         profiled_optimizer_step(optimizer, profile_capture)
+        if gradient_sync_runtime.commit_step is not None:
+            gradient_sync_runtime.commit_step()
         lr_scheduler.step()
         model.zero_grad(set_to_none=True)
 

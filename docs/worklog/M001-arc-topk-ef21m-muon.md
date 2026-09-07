@@ -654,6 +654,14 @@ Future 链统一在每设备专用 execution stream 上延续，并显式桥接�
 
 Task 7 回归结果：CPU/Gloo hook、Future、state 共 `23 passed`；两张空闲 GPU 上 NCCL stress 共 `2 passed`。两 rank 三步 oracle 同时核对 ARC 三类 tracker、support、bucket gradient、普通 Muon 更新和精确 collective signature；没有运行正式 wall-clock 实验，因此本阶段只主张正确性与异步生命周期覆盖。
 
+## 2026-09-08：正式训练入口接入 ARC DDP hook
+
+按方案 Task 8，专用入口新增唯一 ownership 选择 `arc_sync_mode=optimizer|ddp_hook`。optimizer 模式继续构造 `ArcTopKMuon` 并对所有 accumulation micro-batch 使用 `no_sync()`；hook 模式构造普通 `Muon`，冻结 named-parameter stable ID/角色与 canonical fingerprint，并只注册一次 `arc_topk_ddp_hook`。旧 `replicate_mesh_grad_sync` 已从 ARC 配置删除，若通过命令行或 YAML 显式传入会给出迁移错误；普通训练入口的旧 optimizer-only factory 仍由 runtime adapter 保持兼容。
+
+共享训练循环现在在首个 micro-batch 前调用 compressor `begin_step`，只由 runtime policy 决定 DDP context，在全部 backward 后、gradient norm 前调用 `finish_step`，并仅在普通 Muon `optimizer.step()` 成功后调用 `commit_step`。validation 不进入该 lifecycle。真实两 rank Gloo 测试覆盖两次梯度累积：optimizer 模式 reducer hook 调用为零并保留 rank-local accumulated gradient；hook 模式只在最终 micro-batch 触发 bucket hook，输出为完整 accumulated gradient 的跨 rank 平均。另用单 rank GA=256 验证 tracker 和 compressor step 每个 optimizer step 只推进一次。
+
+Task 8 规定的 formal-entry suite 使用 `python -m pytest` 执行（本环境直接调用 pytest console script 未将仓库根目录放入 `sys.path`）：`20 passed`；补充 factory/GA 回归为 `15 passed`。本阶段 runtime 已暴露 `checkpoint_state`，但尚未接入 DCP；这是 Task 9 的边界。
+
 ## 2026-09-07：本地确定性 seed 与稳定 optimizer task ID
 
 按 ARC DDP bucket-hook 设计的 Task 1，optimizer-side ARC 已删除逐任务 device seed tensor、broadcast、等待和 `.item()`，改为纯整数公式 `base_seed + step * 1_000_003 + stable_task_id` 后按 `2**64` 规范化。本地 seed 不读取或修改全局 RNG；逻辑通信统计保留 `arc_seed_bytes` schema 字段，但其运行值固定为 0，benchmark collective signature 不再包含 `arc_seed`。

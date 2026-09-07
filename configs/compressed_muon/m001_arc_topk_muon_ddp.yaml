@@ -25,7 +25,6 @@ no_wandb: false
 dp_size: null
 fs_size: null
 tp_size: null
-replicate_mesh_grad_sync: true
 
 # Runtime
 debug: false
@@ -35,6 +34,7 @@ use_polar_express: true
 
 # Optimizer
 optimizer: arc_topk_muon
+arc_sync_mode: optimizer
 scalar_opt: adamw
 adjust_lr: spectral_norm
 mu: 0.95
