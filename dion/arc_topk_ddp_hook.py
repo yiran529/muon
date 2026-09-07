@@ -10,6 +10,7 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.nn import Parameter
+from torch.optim import Optimizer
 
 from .arc_topk_sync import ArcTopKSyncConfig
 from .arc_topk import (
@@ -82,6 +83,7 @@ class ArcTopKDDPState:
         optimizer_parameters: Sequence[Parameter],
         config: ArcTopKSyncConfig,
         find_unused_parameters: bool = False,
+        optimizer: Optional[Optimizer] = None,
     ) -> None:
         if find_unused_parameters:
             raise ValueError("ARC DDP hook requires find_unused_parameters=False")
@@ -125,6 +127,7 @@ class ArcTopKDDPState:
         self.process_group = process_group
         self.fingerprint = fingerprint
         self.config = config
+        self.optimizer = optimizer
         self.parameter_specs = tuple(parameter_specs)
         self.world_size = (
             dist.get_world_size(process_group) if process_group is not None else 1
@@ -160,6 +163,102 @@ class ArcTopKDDPState:
         self._next_context_id = 0
         self._context_lock = threading.Lock()
         self._execution_streams: dict[torch.device, torch.cuda.Stream] = {}
+
+    def _ordered_parameter_table(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "stable_name": spec.stable_name,
+                "stable_id": spec.stable_id,
+                "shape": list(spec.parameter.shape),
+                "dtype": str(spec.parameter.dtype).removeprefix("torch."),
+                "role": spec.role,
+            }
+            for spec in self.parameter_specs
+        ]
+
+    def _optimizer_step(self) -> Optional[int]:
+        if self.optimizer is None:
+            return None
+        steps = {int(group["step"]) for group in self.optimizer.param_groups}
+        if len(steps) != 1:
+            raise RuntimeError("Muon parameter groups disagree on their committed step")
+        return steps.pop()
+
+    def _require_committed_boundary(
+        self,
+        operation: str,
+        *,
+        require_optimizer_match: bool = True,
+    ) -> None:
+        if self._active_step is not None or not self.tail_future.done():
+            raise RuntimeError(
+                f"ARC compressor {operation} requires a committed step boundary"
+            )
+        optimizer_step = self._optimizer_step()
+        if (
+            require_optimizer_match
+            and optimizer_step is not None
+            and optimizer_step != self.committed_step
+        ):
+            raise RuntimeError(
+                "Muon and ARC compressor committed steps disagree: "
+                f"Muon={optimizer_step}, compressor={self.committed_step}"
+            )
+
+    def checkpoint_metadata(self) -> dict[str, Any]:
+        """Return value-only metadata suitable for validation before DCP load."""
+
+        self._require_committed_boundary("checkpoint")
+        return {
+            "schema_version": ARC_COMPRESSOR_SCHEMA_VERSION,
+            "dp_world_size": self.world_size,
+            "group_ranks": list(self.group_ranks),
+            "config_fingerprint": self.fingerprint,
+            "config": asdict(self.config),
+            "seed_scheme_version": self.config.seed_scheme_version,
+            "committed_step": self.committed_step,
+            "ordered_parameter_table": self._ordered_parameter_table(),
+        }
+
+    def validate_checkpoint_metadata(self, metadata: dict[str, Any]) -> None:
+        """Fail closed before tensor payloads are loaded into this runtime."""
+
+        if metadata.get("schema_version") != ARC_COMPRESSOR_SCHEMA_VERSION:
+            raise ValueError("ARC compressor checkpoint schema version mismatch")
+        if metadata.get("dp_world_size") != self.world_size:
+            raise ValueError("ARC compressor checkpoint world size mismatch")
+        if metadata.get("group_ranks") != list(self.group_ranks):
+            raise ValueError("ARC compressor checkpoint rank membership mismatch")
+        if metadata.get("config_fingerprint") != self.fingerprint:
+            raise ValueError("ARC compressor checkpoint fingerprint mismatch")
+        if metadata.get("seed_scheme_version") != self.config.seed_scheme_version:
+            raise ValueError("ARC compressor checkpoint seed scheme mismatch")
+        if metadata.get("config") != asdict(self.config):
+            raise ValueError("ARC compressor checkpoint config mismatch")
+        if metadata.get("ordered_parameter_table") != self._ordered_parameter_table():
+            raise ValueError("ARC compressor checkpoint parameter table mismatch")
+        committed_step = metadata.get("committed_step")
+        if not isinstance(committed_step, int) or committed_step < 0:
+            raise ValueError("ARC compressor checkpoint committed step is invalid")
+
+    def _validate_replicated_global_state(self) -> None:
+        if self.process_group is None or self.world_size <= 1:
+            return
+        for parameter_state in self._parameter_states.values():
+            gathered = [
+                torch.empty_like(parameter_state.g_global)
+                for _ in range(self.world_size)
+            ]
+            dist.all_gather(
+                gathered,
+                parameter_state.g_global,
+                group=self.process_group,
+            )
+            if any(not torch.equal(gathered[0], tensor) for tensor in gathered[1:]):
+                raise RuntimeError(
+                    "ARC replicated global state differs across ranks for "
+                    f"{parameter_state.spec.stable_name!r}"
+                )
 
     def execution_stream(self, device: torch.device) -> torch.cuda.Stream:
         if device.type != "cuda":
@@ -274,18 +373,8 @@ class ArcTopKDDPState:
         self._finished_step = False
 
     def state_dict(self) -> dict:
-        if self._active_step is not None or not self.tail_future.done():
-            raise RuntimeError("ARC compressor checkpoint requires a committed step boundary")
-        parameter_table = [
-            {
-                "stable_name": spec.stable_name,
-                "stable_id": spec.stable_id,
-                "shape": list(spec.parameter.shape),
-                "dtype": str(spec.parameter.dtype).removeprefix("torch."),
-                "role": spec.role,
-            }
-            for spec in self.parameter_specs
-        ]
+        self._require_committed_boundary("checkpoint")
+        self._validate_replicated_global_state()
         arc_states = [
             state
             for spec in self.parameter_specs
@@ -293,14 +382,7 @@ class ArcTopKDDPState:
         ]
         return {
             "shared": {
-                "schema_version": ARC_COMPRESSOR_SCHEMA_VERSION,
-                "dp_world_size": self.world_size,
-                "group_ranks": list(self.group_ranks),
-                "config_fingerprint": self.fingerprint,
-                "config": asdict(self.config),
-                "seed_scheme_version": self.config.seed_scheme_version,
-                "committed_step": self.committed_step,
-                "ordered_parameter_table": parameter_table,
+                **self.checkpoint_metadata(),
                 "g_global": {
                     state.spec.stable_name: state.g_global for state in arc_states
                 },
@@ -315,20 +397,67 @@ class ArcTopKDDPState:
         }
 
     def load_state_dict(self, state_dict: dict) -> None:
-        if self._active_step is not None or not self.tail_future.done():
-            raise RuntimeError("ARC compressor load requires a committed step boundary")
-        shared = state_dict["shared"]
-        if shared["schema_version"] != ARC_COMPRESSOR_SCHEMA_VERSION:
-            raise ValueError("ARC compressor checkpoint schema version mismatch")
-        if shared["config_fingerprint"] != self.fingerprint:
-            raise ValueError("ARC compressor checkpoint fingerprint mismatch")
-        rank_state = state_dict[f"rank_{self.global_rank}"]
+        self._require_committed_boundary("load", require_optimizer_match=False)
+        try:
+            shared = state_dict["shared"]
+        except KeyError as exc:
+            raise ValueError("ARC compressor checkpoint is missing shared metadata") from exc
+        self.validate_checkpoint_metadata(shared)
+        rank_key = f"rank_{self.global_rank}"
+        try:
+            rank_state = state_dict[rank_key]
+            global_state = shared["g_global"]
+        except KeyError as exc:
+            raise ValueError(
+                f"ARC compressor checkpoint is missing state for {rank_key}"
+            ) from exc
+        expected_names = {
+            parameter_state.spec.stable_name
+            for parameter_state in self._parameter_states.values()
+        }
+        if set(rank_state) != expected_names:
+            missing = sorted(expected_names - set(rank_state))
+            extra = sorted(set(rank_state) - expected_names)
+            raise ValueError(
+                "ARC compressor rank-local state mismatch; "
+                f"missing={missing}, extra={extra}"
+            )
+        if set(global_state) != expected_names:
+            missing = sorted(expected_names - set(global_state))
+            extra = sorted(set(global_state) - expected_names)
+            raise ValueError(
+                "ARC compressor global state mismatch; "
+                f"missing={missing}, extra={extra}"
+            )
         for parameter_state in self._parameter_states.values():
             name = parameter_state.spec.stable_name
-            parameter_state.h_local.copy_(rank_state[name]["h_local"])
-            parameter_state.g_local.copy_(rank_state[name]["g_local"])
-            parameter_state.g_global.copy_(shared["g_global"][name])
-        self.committed_step = int(shared["committed_step"])
+            local_entry = rank_state[name]
+            if set(local_entry) != {"h_local", "g_local"}:
+                raise ValueError(
+                    f"ARC compressor state fields mismatch for parameter {name!r}"
+                )
+            tensors = {
+                "h_local": local_entry["h_local"],
+                "g_local": local_entry["g_local"],
+                "g_global": global_state[name],
+            }
+            for field_name, source in tensors.items():
+                destination = getattr(parameter_state, field_name)
+                if source.shape != destination.shape or source.dtype != destination.dtype:
+                    raise ValueError(
+                        f"ARC compressor tensor schema mismatch for {name!r}/{field_name}"
+                    )
+            parameter_state.h_local.copy_(tensors["h_local"])
+            parameter_state.g_local.copy_(tensors["g_local"])
+            parameter_state.g_global.copy_(tensors["g_global"])
+        checkpoint_step = int(shared["committed_step"])
+        optimizer_step = self._optimizer_step()
+        if optimizer_step is not None and optimizer_step != checkpoint_step:
+            raise ValueError(
+                "Muon and ARC compressor committed steps disagree: "
+                f"Muon={optimizer_step}, compressor={checkpoint_step}"
+            )
+        self.committed_step = checkpoint_step
 
 
 def bridge_future(
@@ -553,8 +682,39 @@ def _launch_sparse_bucket(
         prepared_entries.append((prepared, gradient, parameter_state, rows, columns))
         sketch_parts.append(prepared.local_sketch_batch.reshape(-1))
 
-    sketch_buffer = torch.cat(sketch_parts)
     final = context.completion_future
+    if not prepared_entries:
+        context.retained.append(dense_buffer)
+
+        def finish_dense_only(completed: torch.futures.Future) -> Tensor:
+            averaged_dense = _future_tensor(completed.value())
+            if state.world_size > 1:
+                averaged_dense.div_(state.world_size)
+            offset = 0
+            for gradient in dense_views:
+                gradient.copy_(
+                    averaged_dense[offset : offset + gradient.numel()].view_as(
+                        gradient
+                    )
+                )
+                offset += gradient.numel()
+            return context.buffer
+
+        dense_completion = _all_reduce_future(
+            state,
+            dense_buffer,
+            "arc_hook/dense",
+        ).then(
+            _on_bucket_execution_stream_result(
+                state,
+                context,
+                finish_dense_only,
+            )
+        )
+        bridge_future(dense_completion, final, lambda value: value)
+        return final
+
+    sketch_buffer = torch.cat(sketch_parts)
     context.retained.extend(
         [dense_buffer, sketch_buffer, prepared_entries, sketch_parts]
     )

@@ -200,6 +200,7 @@ def init_arc_topk_optimizer(
             for parameter in group["params"]
         ],
         config=config,
+        optimizer=optimizer,
         find_unused_parameters=getattr(
             ddp_model,
             "find_unused_parameters",

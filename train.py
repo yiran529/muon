@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -14,12 +15,13 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DeviceMesh
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from models.gpt_model import GPT, GPTConfig, parallelize_gpt_model
 from models.gpt_utils import DistributedDataLoader
@@ -720,6 +722,7 @@ class CheckpointManager:
         train_loader: DistributedDataLoader,
         val_loader: DistributedDataLoader,
         wandb_id: Optional[str] = None,
+        extra_stateful: Optional[Mapping[str, Stateful]] = None,
     ):
         self.checkpoint_dir = checkpoint_dir
         self.model = model
@@ -727,8 +730,53 @@ class CheckpointManager:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.wandb_id = wandb_id
+        self.extra_stateful = dict(extra_stateful or {})
+        reserved_names = {
+            "model",
+            "optimizer",
+            "train_loader",
+            "val_loader",
+            "step",
+            "wandb_id",
+        }
+        collisions = reserved_names.intersection(self.extra_stateful)
+        if collisions:
+            raise ValueError(
+                "extra checkpoint state uses reserved names: "
+                + ", ".join(sorted(collisions))
+            )
         self.step = None
         self.DEFAULT_NAME = "checkpoint"
+        self.EXTRA_METADATA_NAME = ".extra_stateful_metadata.json"
+
+    def _extra_metadata(self) -> dict[str, Any]:
+        return {
+            name: (
+                stateful.checkpoint_metadata()
+                if hasattr(stateful, "checkpoint_metadata")
+                else None
+            )
+            for name, stateful in self.extra_stateful.items()
+        }
+
+    def _validate_extra_metadata(self, checkpoint_path: str) -> None:
+        if not self.extra_stateful:
+            return
+        metadata_path = os.path.join(checkpoint_path, self.EXTRA_METADATA_NAME)
+        if not os.path.isfile(metadata_path):
+            raise ValueError("checkpoint is missing extra stateful metadata")
+        with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+            checkpoint_metadata = json.load(metadata_file)
+        expected_names = set(self._extra_metadata())
+        if set(checkpoint_metadata) != expected_names:
+            raise ValueError(
+                "checkpoint extra stateful metadata names mismatch: "
+                f"checkpoint={sorted(checkpoint_metadata)}, runtime={sorted(expected_names)}"
+            )
+        for name, metadata in checkpoint_metadata.items():
+            stateful = self.extra_stateful[name]
+            if hasattr(stateful, "validate_checkpoint_metadata"):
+                stateful.validate_checkpoint_metadata(metadata)
 
     def _get_state_dict(self) -> dict:
         # Use get_state_dict() instead of directly calling model.state_dict() etc.
@@ -742,6 +790,12 @@ class CheckpointManager:
             "step": self.step,
             "wandb_id": self.wandb_id,
         }
+        state_dict.update(
+            {
+                name: stateful.state_dict()
+                for name, stateful in self.extra_stateful.items()
+            }
+        )
         return state_dict
 
     def save(self, name: Optional[str] = None, step: Optional[int] = None):
@@ -769,6 +823,14 @@ class CheckpointManager:
 
         # Save the checkpoint
         state_dict = self._get_state_dict()
+        extra_metadata = self._extra_metadata()
+        if dist.get_rank() == 0 and extra_metadata:
+            with open(
+                os.path.join(tmpdir, self.EXTRA_METADATA_NAME),
+                "w",
+                encoding="utf-8",
+            ) as metadata_file:
+                json.dump(extra_metadata, metadata_file, sort_keys=True)
         dcp.save(state_dict, checkpoint_id=tmpdir)
         dist.barrier()
 
@@ -797,6 +859,7 @@ class CheckpointManager:
             raise FileNotFoundError(f"Checkpoint {checkpoint_path} does not exist")
 
         print0(f"Loading checkpoint from {checkpoint_path}")
+        self._validate_extra_metadata(checkpoint_path)
         state_dict = self._get_state_dict()
         dcp.load(state_dict, checkpoint_id=checkpoint_path)
 
@@ -807,6 +870,8 @@ class CheckpointManager:
             model_state_dict=state_dict["model"],
             optim_state_dict=state_dict["optimizer"],
         )
+        for name, stateful in self.extra_stateful.items():
+            stateful.load_state_dict(state_dict[name])
 
         # Load train and validation dataloader states
         self.train_loader.load_state_dict(state_dict["train_loader"])
@@ -1029,6 +1094,11 @@ def main(
         train_loader=train_loader,
         val_loader=val_loader,
         wandb_id=None,
+        extra_stateful=(
+            {"arc_compressor": gradient_sync_runtime.checkpoint_state}
+            if gradient_sync_runtime.checkpoint_state is not None
+            else None
+        ),
     )
 
     print0(f"Run name: {run_name}")

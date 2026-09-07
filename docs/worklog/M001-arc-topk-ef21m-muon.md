@@ -662,6 +662,14 @@ Task 7 回归结果：CPU/Gloo hook、Future、state 共 `23 passed`；两张空
 
 Task 8 规定的 formal-entry suite 使用 `python -m pytest` 执行（本环境直接调用 pytest console script 未将仓库根目录放入 `sys.path`）：`20 passed`；补充 factory/GA 回归为 `15 passed`。本阶段 runtime 已暴露 `checkpoint_state`，但尚未接入 DCP；这是 Task 9 的边界。
 
+## 2026-09-08：rank-local hook compressor DCP checkpoint
+
+按方案 Task 9，`CheckpointManager` 新增可选的通用 `extra_stateful` 映射，hook runtime 以 `arc_compressor` 接入；非 ARC checkpoint 的既有 key 与流程不变。ARC metadata 另存为 checkpoint 内的 JSON sidecar，使 schema/world size/rank membership/fingerprint/config/seed scheme/ordered parameter table 能在 DCP 写入目的 tensor 前验证；DCP payload 仍使用真实 default planner。每个 rank 预分配并加载自己的 `rank_<global_rank>/<stable_name>/h_local|g_local`，`g_global` 使用 shared key，保存前对 process group 做逐 tensor exact equality 校验。
+
+加载与保存均要求 compressor 位于 committed boundary，并校验普通 Muon 所有 param-group step 与 compressor committed step 一致。缺失或额外 stable name、字段、tensor shape/dtype、metadata schema/config/layout，以及改变 DP world size/rank membership 都 fail closed，不提供部分 reset。真实两 rank Gloo round-trip 在三步后保存，销毁旧对象并以不同 DDP bucket cap 重建 fresh model/Muon/hook，恢复所有稳定参数名状态，再继续两个固定 LR 压缩步；恢复轨迹与不中断 oracle 一致，同时两个 rank 的 local tracker 保持有意构造的差异。
+
+改变 bucket layout 的续训最初暴露出 sparse step 遇到纯 dense bucket 时对空 sketch 列表 `torch.cat` 的遗漏；新增纯 dense 异步 all-reduce 分支后 round-trip 转绿。Task 9 checkpoint/formal-entry suite 为 `29 passed`，Task 7 CPU/Gloo 回归 `23 passed`，NCCL stress `2 passed`。checkpoint 保存前的 replicated-state `all_gather` 是明确位于 step boundary 的校验，不在 backward/hook 关键路径；hook 内仍无 `Work.wait`、CUDA synchronize、Tensor `.item()`、host polling 或 seed collective。
+
 ## 2026-09-07：本地确定性 seed 与稳定 optimizer task ID
 
 按 ARC DDP bucket-hook 设计的 Task 1，optimizer-side ARC 已删除逐任务 device seed tensor、broadcast、等待和 `.item()`，改为纯整数公式 `base_seed + step * 1_000_003 + stable_task_id` 后按 `2**64` 规范化。本地 seed 不读取或修改全局 RNG；逻辑通信统计保留 `arc_seed_bytes` schema 字段，但其运行值固定为 0，benchmark collective signature 不再包含 `arc_seed`。
