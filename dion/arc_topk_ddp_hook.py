@@ -1,7 +1,7 @@
 """Asynchronous DDP bucket communication state for ARC-TopK/EF21M."""
 
 from dataclasses import asdict, dataclass
-from typing import Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Optional, Sequence
 import threading
 
 import torch
@@ -146,6 +146,16 @@ class ArcTopKDDPState:
         self._active_contexts: dict[int, BucketContext] = {}
         self._next_context_id = 0
         self._context_lock = threading.Lock()
+        self._execution_streams: dict[torch.device, torch.cuda.Stream] = {}
+
+    def execution_stream(self, device: torch.device) -> torch.cuda.Stream:
+        if device.type != "cuda":
+            raise ValueError("ARC execution streams are only defined for CUDA devices")
+        stream = self._execution_streams.get(device)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._execution_streams[device] = stream
+        return stream
 
     def begin_step(self) -> int:
         if self._active_step is not None:
@@ -306,3 +316,50 @@ class ArcTopKDDPState:
             parameter_state.g_local.copy_(rank_state[name]["g_local"])
             parameter_state.g_global.copy_(shared["g_global"][name])
         self.committed_step = int(shared["committed_step"])
+
+
+def bridge_future(
+    source: torch.futures.Future,
+    destination: torch.futures.Future,
+    transform: Callable[[Any], Tensor],
+) -> None:
+    """Complete ``destination`` with one transformed value or source exception."""
+
+    def complete(completed: torch.futures.Future) -> None:
+        try:
+            destination.set_result(transform(completed.value()))
+        except BaseException as exc:
+            destination.set_exception(exc)
+
+    source.add_done_callback(complete)
+
+
+def enqueue_bucket_chain(
+    state: ArcTopKDDPState,
+    context: BucketContext,
+    launch: Callable[[BucketContext], torch.futures.Future],
+) -> torch.futures.Future:
+    """Launch one bucket after the prior complete bucket chain without nesting."""
+
+    destination = context.completion_future
+
+    def after_previous(previous: torch.futures.Future) -> None:
+        try:
+            previous.value()
+            if context.buffer.device.type == "cuda":
+                device = context.buffer.device
+                callback_stream = torch.cuda.current_stream(device)
+                execution_stream = state.execution_stream(device)
+                execution_stream.wait_stream(callback_stream)
+                assert context.bucket_ready_event is not None
+                execution_stream.wait_event(context.bucket_ready_event)
+                with torch.cuda.stream(execution_stream):
+                    launched = launch(context)
+            else:
+                launched = launch(context)
+            bridge_future(launched, destination, lambda value: value)
+        except BaseException as exc:
+            destination.set_exception(exc)
+
+    context.previous_tail.add_done_callback(after_previous)
+    return destination

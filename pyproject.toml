@@ -37,6 +37,11 @@ gns = [
 [tool.setuptools.packages.find]
 include = ["dion", "dion.*"]
 
+[tool.pytest.ini_options]
+markers = [
+  "multi_gpu: requires at least two exclusive CUDA devices",
+]
+
 # The machine exposes NVIDIA RTX 4090 GPUs and an R580 driver module.
 # Pin torch to the CUDA 12.8 wheel index; the Python environment does not
 # require a system-wide CUDA toolkit for the prebuilt PyTorch runtime.
