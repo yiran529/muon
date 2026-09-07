@@ -10,6 +10,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from dion import ArcTopKMuon
+from dion.arc_topk_layout import ArcTopKLayoutMismatch
+from dion.collective_observer import CollectiveObserver, set_active_observer
 
 
 def _identity_orthogonalizer(x, epsilon=None):
@@ -166,6 +168,119 @@ def test_distributed_arc_topk_muon_requires_stable_parameter_names():
     mp.spawn(
         _missing_parameter_names_worker,
         args=(2, _free_port()),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _layout_validation_count_worker(
+    rank: int,
+    world_size: int,
+    port: int,
+) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    observer = CollectiveObserver()
+    set_active_observer(observer)
+    try:
+        parameter = torch.nn.Parameter(torch.zeros(4, 3))
+        optimizer = ArcTopKMuon(
+            [parameter],
+            distributed_mesh=dist.group.WORLD,
+            arc_parameter_names={parameter: "matrix"},
+            lr=0.125,
+            mu=0.0,
+            weight_decay=0.0,
+            nesterov=False,
+            adjust_lr=None,
+            newton_schulz_func=_identity_orthogonalizer,
+            arc_topk_ratio=0.5,
+            arc_projection_rank=2,
+            arc_eta=1.0,
+            arc_seed=23,
+            arc_start_compress_step=0,
+        )
+        for step in range(3):
+            parameter.grad = _matrix_gradient(rank) + step
+            optimizer.step()
+
+        categories = [event.category for event in observer.events]
+        assert categories.count("arc/layout_validation") == 1
+        assert "arc/seed" not in categories
+    finally:
+        set_active_observer(None)
+        dist.destroy_process_group()
+
+
+def test_layout_validation_runs_once_across_three_optimizer_steps():
+    mp.spawn(
+        _layout_validation_count_worker,
+        args=(2, _free_port()),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _optimizer_layout_mismatch_worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    mismatch: str,
+) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    observer = CollectiveObserver()
+    set_active_observer(observer)
+    try:
+        first = torch.nn.Parameter(torch.zeros(4, 3))
+        second = torch.nn.Parameter(torch.ones(4, 3))
+        groups = (
+            [{"params": [first, second]}]
+            if rank == 0 or mismatch == "seed"
+            else [{"params": [first]}, {"params": [second]}]
+        )
+        seed = 24 if mismatch == "seed" and rank == 1 else 23
+        message = None
+        try:
+            ArcTopKMuon(
+                groups,
+                distributed_mesh=dist.group.WORLD,
+                arc_parameter_names={first: "first", second: "second"},
+                newton_schulz_func=_identity_orthogonalizer,
+                arc_seed=seed,
+            )
+        except ArcTopKLayoutMismatch as exc:
+            message = str(exc)
+        assert message is not None
+        messages = [None] * world_size
+        dist.all_gather_object(messages, message)
+        assert messages == [messages[0]] * world_size
+        categories = [event.category for event in observer.events]
+        assert categories == ["arc/layout_validation"]
+    finally:
+        set_active_observer(None)
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("mismatch", ["seed", "group_boundary"])
+def test_optimizer_seed_and_real_task_layout_mismatch_fail_before_training(
+    mismatch,
+):
+    mp.spawn(
+        _optimizer_layout_mismatch_worker,
+        args=(2, _free_port(), mismatch),
         nprocs=2,
         join=True,
     )

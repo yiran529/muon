@@ -1,6 +1,9 @@
 """DDP-only Muon with complete ARC-TopK and EF21M gradient synchronization."""
 
+from dataclasses import asdict
+
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh
@@ -9,6 +12,13 @@ from torch.nn import Parameter
 from typing import Callable, Generator, List, Mapping, Optional, Union
 
 from .arc_topk import validate_arc_topk_config
+from .arc_topk_layout import (
+    ArcOptimizerTaskDescriptor,
+    ArcParameterDescriptor,
+    ArcTopKLayoutMismatch,
+    canonical_arc_fingerprint,
+    validate_arc_fingerprint_across_ranks,
+)
 from .arc_topk_sync import (
     ArcTopKSyncConfig,
     average_gradients_async,
@@ -30,6 +40,45 @@ from .opt_utils import AsyncTask, as_scalar_tensor, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
 
+def _dtype_name(tensor: Tensor) -> str:
+    return str(tensor.dtype).removeprefix("torch.")
+
+
+def _serialize_optimizer_tasks(
+    tasks: tuple[ArcOptimizerTaskDescriptor, ...],
+) -> list[dict]:
+    return [asdict(task) for task in tasks]
+
+
+def _checkpoint_groups_match_tasks(
+    saved_groups: list[dict],
+    current_groups: list[dict],
+    tasks: tuple[ArcOptimizerTaskDescriptor, ...],
+) -> bool:
+    if len(saved_groups) != len(current_groups):
+        return False
+    for saved_group, current_group in zip(saved_groups, current_groups):
+        if saved_group.get("algorithm") != current_group.get("algorithm"):
+            return False
+        if len(saved_group.get("params", ())) != len(current_group["params"]):
+            return False
+    for task in tasks:
+        if task.group_id >= len(saved_groups):
+            return False
+        group = saved_groups[task.group_id]
+        saved_config = ArcTopKSyncConfig(
+            ratio=group["arc_topk_ratio"],
+            projection_rank=group["arc_projection_rank"],
+            eta=group["arc_eta"],
+            seed=group["arc_seed"],
+            start_compress_step=group["arc_start_compress_step"],
+            seed_scheme_version=group.get("arc_seed_scheme_version", 1),
+        )
+        if saved_config != task.config:
+            return False
+    return True
+
+
 class ArcTopKMuon(Muon):
     """Muon whose DDP matrix gradients are synchronized with ARC-TopK + EF21M."""
 
@@ -46,6 +95,7 @@ class ArcTopKMuon(Muon):
         arc_parameter_names: Mapping[Parameter, str] | None = None,
         **kwargs,
     ):
+        self._arc_layout_frozen = False
         validate_arc_topk_config(
             arc_topk_ratio,
             arc_projection_rank,
@@ -66,8 +116,6 @@ class ArcTopKMuon(Muon):
                 "distributed ArcTopKMuon requires arc_parameter_names from "
                 "model.named_parameters()"
             )
-        self._arc_parameter_names = dict(arc_parameter_names or {})
-
         for group in self.param_groups:
             if group["algorithm"] != "muon":
                 continue
@@ -82,15 +130,115 @@ class ArcTopKMuon(Muon):
             group["arc_eta"] = arc_eta
             group["arc_seed"] = arc_seed
             group["arc_start_compress_step"] = arc_start_compress_step
+            group["arc_seed_scheme_version"] = 1
+
+        optimizer_parameters = [
+            parameter
+            for group in self.param_groups
+            for parameter in group["params"]
+        ]
+        if arc_parameter_names is None:
+            self._arc_parameter_names = {
+                parameter: f"parameter_{stable_id}"
+                for stable_id, parameter in enumerate(optimizer_parameters)
+            }
+            named_parameters = list(self._arc_parameter_names.items())
+        else:
+            self._arc_parameter_names = dict(arc_parameter_names)
+            missing_positions = [
+                position
+                for position, parameter in enumerate(optimizer_parameters, start=1)
+                if parameter not in self._arc_parameter_names
+            ]
+            if missing_positions:
+                raise ValueError(
+                    "arc_parameter_names is missing stable names for "
+                    f"optimizer parameter at position {missing_positions[0]}"
+                )
+            optimizer_parameter_ids = {id(parameter) for parameter in optimizer_parameters}
+            named_parameters = [
+                (parameter, name)
+                for parameter, name in self._arc_parameter_names.items()
+                if id(parameter) in optimizer_parameter_ids
+            ]
+
+        roles = {
+            id(parameter): (
+                "arc_matrix" if group["algorithm"] == "muon" else "dense_aux"
+            )
+            for group in self.param_groups
+            for parameter in group["params"]
+        }
+        self._arc_parameters = tuple(
+            ArcParameterDescriptor(
+                stable_name=name,
+                stable_id=stable_id,
+                shape=tuple(parameter.shape),
+                dtype=_dtype_name(parameter),
+                role=roles[id(parameter)],
+            )
+            for stable_id, (parameter, name) in enumerate(named_parameters)
+        )
 
         self._arc_task_ids = {}
+        optimizer_tasks = []
         next_task_id = 0
-        for group in self.param_groups:
+        for group_id, group in enumerate(self.param_groups):
             if group["algorithm"] != "muon":
                 continue
             for task_params in group_parameters_by_shape_dtype(group["params"]):
                 self._arc_task_ids[tuple(map(id, task_params))] = next_task_id
+                optimizer_tasks.append(
+                    ArcOptimizerTaskDescriptor(
+                        group_id=group_id,
+                        task_id=next_task_id,
+                        ordered_parameter_names=tuple(
+                            self._arc_parameter_names[parameter]
+                            for parameter in task_params
+                        ),
+                        shape=tuple(task_params[0].shape),
+                        dtype=_dtype_name(task_params[0]),
+                        config=ArcTopKSyncConfig(
+                            ratio=group["arc_topk_ratio"],
+                            projection_rank=group["arc_projection_rank"],
+                            eta=group["arc_eta"],
+                            seed=group["arc_seed"],
+                            start_compress_step=group["arc_start_compress_step"],
+                        ),
+                    )
+                )
                 next_task_id += 1
+        self._arc_optimizer_tasks = tuple(optimizer_tasks)
+        group_ranks = (
+            tuple(dist.get_process_group_ranks(self._process_group))
+            if self._process_group is not None
+            else (0,)
+        )
+        default_config = ArcTopKSyncConfig(
+            ratio=arc_topk_ratio,
+            projection_rank=arc_projection_rank,
+            eta=arc_eta,
+            seed=arc_seed,
+            start_compress_step=arc_start_compress_step,
+        )
+        self._arc_layout_fingerprint = canonical_arc_fingerprint(
+            base_seed=arc_seed,
+            config=default_config,
+            group_ranks=group_ranks,
+            parameters=self._arc_parameters,
+            optimizer_tasks=self._arc_optimizer_tasks,
+        )
+        if self._process_group is not None:
+            validate_arc_fingerprint_across_ranks(
+                self._arc_layout_fingerprint,
+                self._process_group,
+            )
+        self._arc_layout_frozen = True
+
+    def add_param_group(self, param_group: dict) -> None:
+        if getattr(self, "_arc_layout_frozen", False):
+            raise RuntimeError("cannot add a parameter group to a frozen ARC layout")
+        super().add_param_group(param_group)
 
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
         state = super()._get_or_initialize_state(param, algo)
@@ -104,7 +252,31 @@ class ArcTopKMuon(Muon):
         for group in migrated["param_groups"]:
             if group.get("algorithm") == "muon":
                 group.setdefault("arc_start_compress_step", 0)
+                group.setdefault("arc_seed_scheme_version", 1)
+
+        saved_fingerprint = migrated.get("arc_layout_fingerprint")
+        saved_tasks = migrated.get("arc_optimizer_tasks")
+        if (
+            saved_fingerprint != self._arc_layout_fingerprint
+            or saved_tasks != _serialize_optimizer_tasks(self._arc_optimizer_tasks)
+            or not _checkpoint_groups_match_tasks(
+                migrated["param_groups"],
+                self.param_groups,
+                self._arc_optimizer_tasks,
+            )
+        ):
+            raise ArcTopKLayoutMismatch(
+                "checkpoint ARC layout does not match the frozen optimizer layout"
+            )
         super().load_state_dict(migrated)
+
+    def state_dict(self):
+        result = super().state_dict()
+        result["arc_layout_fingerprint"] = self._arc_layout_fingerprint
+        result["arc_optimizer_tasks"] = _serialize_optimizer_tasks(
+            self._arc_optimizer_tasks
+        )
+        return result
 
     def _create_ortho_tasks(
         self, param_groups: List[dict]

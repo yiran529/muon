@@ -653,3 +653,11 @@ CM023b 的 `12.49%` 只针对约 0.2 秒的最后 micro-step + optimizer 尾部�
 `ArcTopKMuon` 在构造期冻结按 optimizer group 遍历、shape/dtype 首次出现顺序生成的 task ID。分布式构造现在要求调用方提供来自 `model.named_parameters()` 的稳定参数名映射；正式训练入口和现有 benchmark 已接入。canonical optimizer fingerprint、跨 rank layout/seed 校验和 checkpoint mismatch 处理仍按计划留在 Task 2，本阶段不提前实现。
 
 红—绿回归先冻结了两个同形矩阵、三步有损 EF21M 的 projection、support、三类 tracker、Muon momentum 和参数字面量轨迹；删除 seed collective 后轨迹保持不变。Task 1 完整 CPU/Gloo 集合结果为 `105 passed, 0 failed, 0 skipped`。沙箱内因禁止 loopback socket 无法执行 Gloo，随后在授权环境中用相同命令完成两 rank 回归；本阶段未运行 GPU 或性能实验，因此不作 wall-clock 改善判断。
+
+## 2026-09-07：一次性 canonical ARC layout 校验
+
+按 DDP bucket-hook 方案的 Task 2，新增带显式 schema version 的 sorted-JSON/SHA-256 canonical fingerprint。optimizer-side fingerprint 冻结稳定参数名/ID/shape/dtype/角色，以及真实 param-group 遍历和 first-seen shape/dtype batching 产生的 `(group_id, task_id, ordered members, shape, dtype, per-group ARC config)`；hook 的参数布局使用独立 payload 类型，不与 optimizer digest 比较。
+
+分布式 `ArcTopKMuon` 构造期仅执行一次 `all_gather_object`，一致性失败时所有 rank 获得包含完整 rank/digest 表的同一 `ArcTopKLayoutMismatch`。三步 observer 回归确认 layout collective 计数为 1、`arc/seed` 为 0。冻结后拒绝 `add_param_group`；state dict 保存 fingerprint 和 task table，加载前同时校验冻结布局及恢复 param-group 配置，避免 compressor step 被不兼容布局接受。正式训练入口在 Task 1 已传入 `raw_model.named_parameters()` 的稳定映射，因此本 Task 无需再次改动入口。
+
+红—绿过程先观察到 canonical 模块缺失、optimizer 缓存/冻结/恢复检查缺失，以及篡改 checkpoint ARC 配置未被拒绝，再分别实现并转绿。Task 1+2 完整 CPU/Gloo 回归结果为 `129 passed, 0 failed, 0 skipped`；另有 14 条既有 PyTorch JIT 弃用警告。未运行 GPU 或性能实验；完整异步 DDP bucket hook、GPU stream/Future 生命周期和 hook compressor checkpoint 仍属于后续 Task。

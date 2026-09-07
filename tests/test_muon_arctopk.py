@@ -8,6 +8,7 @@ import torch
 
 from dion import ArcTopKMuon
 import dion.arc_topk as arc_topk_module
+from dion.arc_topk_layout import ArcTopKLayoutMismatch
 import dion.muon_arctopk as muon_arctopk_module
 from dion.arc_topk_sync import ArcTopKSyncConfig
 
@@ -97,6 +98,101 @@ def test_arc_topk_muon_routes_sync_through_shared_adapter():
     )
     torch.testing.assert_close(optimizer.state[first]["momentum"], first_sentinel)
     torch.testing.assert_close(optimizer.state[second]["momentum"], second_sentinel)
+
+
+def test_optimizer_freezes_real_group_task_layout_and_parameter_roles():
+    first = torch.nn.Parameter(torch.zeros(4, 3))
+    second = torch.nn.Parameter(torch.zeros(2, 3))
+    scalar = torch.nn.Parameter(torch.zeros(3))
+    names = {first: "first", second: "second", scalar: "scalar"}
+
+    optimizer = ArcTopKMuon(
+        [
+            {"params": [first, second]},
+            {"params": [scalar], "algorithm": "adamw"},
+        ],
+        arc_parameter_names=names,
+        newton_schulz_func=_identity_orthogonalizer,
+    )
+
+    assert [descriptor.stable_name for descriptor in optimizer._arc_parameters] == [
+        "first",
+        "second",
+        "scalar",
+    ]
+    assert [descriptor.role for descriptor in optimizer._arc_parameters] == [
+        "arc_matrix",
+        "arc_matrix",
+        "dense_aux",
+    ]
+    assert [task.group_id for task in optimizer._arc_optimizer_tasks] == [0, 0]
+    assert [task.task_id for task in optimizer._arc_optimizer_tasks] == [0, 1]
+    assert [
+        task.ordered_parameter_names for task in optimizer._arc_optimizer_tasks
+    ] == [("first",), ("second",)]
+    assert len(optimizer._arc_layout_fingerprint) == 64
+
+
+def test_explicit_stable_name_mapping_must_cover_every_optimizer_parameter():
+    first = torch.nn.Parameter(torch.zeros(4, 3))
+    second = torch.nn.Parameter(torch.zeros(4, 3))
+
+    with pytest.raises(ValueError, match="missing stable names"):
+        ArcTopKMuon(
+            [first, second],
+            arc_parameter_names={first: "first"},
+            newton_schulz_func=_identity_orthogonalizer,
+        )
+
+
+def test_add_param_group_is_rejected_after_arc_layout_is_frozen():
+    first = torch.nn.Parameter(torch.zeros(4, 3))
+    optimizer = _make_optimizer(first)
+
+    with pytest.raises(RuntimeError, match="frozen ARC layout"):
+        optimizer.add_param_group({"params": [torch.nn.Parameter(torch.zeros(2, 3))]})
+
+
+def test_load_rejects_a_different_frozen_optimizer_task_layout():
+    source_parameters = [
+        torch.nn.Parameter(torch.zeros(4, 3)),
+        torch.nn.Parameter(torch.ones(4, 3)),
+    ]
+    source = ArcTopKMuon(
+        source_parameters,
+        arc_parameter_names={
+            source_parameters[0]: "first",
+            source_parameters[1]: "second",
+        },
+        newton_schulz_func=_identity_orthogonalizer,
+    )
+    saved = copy.deepcopy(source.state_dict())
+
+    target_parameters = [
+        torch.nn.Parameter(torch.zeros(4, 3)),
+        torch.nn.Parameter(torch.ones(4, 3)),
+    ]
+    target = ArcTopKMuon(
+        list(reversed(target_parameters)),
+        arc_parameter_names={
+            target_parameters[0]: "first",
+            target_parameters[1]: "second",
+        },
+        newton_schulz_func=_identity_orthogonalizer,
+    )
+
+    with pytest.raises(ArcTopKLayoutMismatch, match="checkpoint ARC layout"):
+        target.load_state_dict(saved)
+
+
+def test_load_rejects_param_group_config_that_disagrees_with_frozen_task_table():
+    parameter = torch.nn.Parameter(torch.zeros(4, 3))
+    optimizer = _make_optimizer(parameter)
+    saved = copy.deepcopy(optimizer.state_dict())
+    saved["param_groups"][0]["arc_seed"] += 1
+
+    with pytest.raises(ArcTopKLayoutMismatch, match="checkpoint ARC layout"):
+        optimizer.load_state_dict(saved)
 
 
 @pytest.mark.parametrize(
@@ -334,7 +430,7 @@ def test_legacy_state_dict_resumes_with_immediate_compression():
         restored_parameter,
         arc_topk_ratio=0.5,
         arc_eta=0.25,
-        arc_start_compress_step=1000,
+        arc_start_compress_step=0,
     )
     restored.load_state_dict(legacy)
     restored_parameter.grad = torch.full((4, 3), 3.0)
