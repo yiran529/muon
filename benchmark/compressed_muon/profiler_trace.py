@@ -36,11 +36,33 @@ _CATEGORY_NAMES = {
     "arc/scatter": "arc_scatter",
     "arc/state_copy": "arc_state_copy",
     "muon/result_collective_wait": "muon_result_wait",
+    "arc_hook/local_prepare": "arc_hook_local_prepare",
+    "arc_hook/dense": "arc_hook_dense",
+    "arc_hook/sketch": "arc_hook_sketch",
+    "arc_hook/topk": "arc_hook_topk",
+    "arc_hook/selected_values": "arc_hook_selected_values",
+    "arc_hook/finalize": "arc_hook_finalize",
+    "arc_hook/bucket_ready": "arc_hook_bucket_ready",
+    "arc_hook/future_complete": "arc_hook_future_complete",
 }
 
 _COLLECTIVE_CATEGORIES = {
     "ddp_gradient", "arc_seed", "arc_sketch", "arc_selected_values",
-    "arc_dense_uncompressed", "muon_result",
+    "arc_dense_uncompressed", "muon_result", "arc_hook_dense",
+    "arc_hook_sketch", "arc_hook_selected_values",
+}
+
+_ARC_HOOK_COLLECTIVES = {
+    "arc_hook_dense", "arc_hook_sketch", "arc_hook_selected_values",
+}
+
+_GRADIENT_COLLECTIVES = {
+    "ddp_gradient", "arc_sketch", "arc_selected_values",
+    "arc_dense_uncompressed", *_ARC_HOOK_COLLECTIVES,
+}
+
+_HOOK_LOCAL_CATEGORIES = {
+    "arc_hook_local_prepare", "arc_hook_topk", "arc_hook_finalize",
 }
 
 
@@ -117,12 +139,38 @@ def _merge_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[flo
 
 def _range_category(name: str) -> str | None:
     if name in _CATEGORY_NAMES: return _CATEGORY_NAMES[name]
+    for range_name, category in _CATEGORY_NAMES.items():
+        if range_name.startswith("arc_hook/") and name.startswith(range_name + " "):
+            return category
+        if range_name.startswith("arc_hook/") and name.startswith(range_name + "/"):
+            return category
     lower = name.lower().replace("-", "_")
     if "ddp" in lower and ("reduce" in lower or "bucket" in lower): return "ddp_gradient"
     if "arc" in lower and "sketch" in lower: return "arc_sketch"
     if "selected" in lower and ("value" in lower or "arc" in lower): return "arc_selected_values"
     if "result" in lower and "collective" in lower: return "muon_result"
     return None
+
+
+def _numeric_arg(event: dict[str, Any], key: str) -> int:
+    args = _args(event)
+    if key in args:
+        return int(args[key])
+    for value in args.values():
+        candidates = value if isinstance(value, list) else [value]
+        for candidate in candidates:
+            if not isinstance(candidate, str) or not candidate.startswith("{"):
+                continue
+            try:
+                decoded = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if key in decoded:
+                return int(decoded[key])
+    match = re.search(rf"(?:^|[ /]){re.escape(key)}=(\d+)(?:$| )", str(event.get("name", "")))
+    if match:
+        return int(match.group(1))
+    return 0
 
 
 def _is_nccl(event: dict[str, Any]) -> bool:
@@ -199,6 +247,17 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
                     )[4]
     groups: dict[str, dict[str, Any]] = defaultdict(lambda: {"kernel_count": 0, "duration_us": 0.0, "message_bytes": 0})
     nccl_intervals = []; compute_intervals = []; counted_payloads = set()
+    category_intervals: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    backward_ranges = [r for r in ranges if r[0] == "final_backward"]
+    hook_local_ranges = [r for r in ranges if r[0] in _HOOK_LOCAL_CATEGORIES]
+    cpu_events_by_correlation: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for cpu_event in events:
+        cpu_correlation = _correlation(cpu_event)
+        if cpu_correlation is None or _is_nccl(cpu_event):
+            continue
+        if "kernel" in str(cpu_event.get("cat", "")).lower():
+            continue
+        cpu_events_by_correlation[str(cpu_correlation)].append(cpu_event)
     for event in events:
         if event.get("ph") not in {"X", "B"}: continue
         start = float(event.get("ts", 0)); end = start + _duration(event)
@@ -219,6 +278,7 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
             item = groups[category]
             item["kernel_count"] += 1; item["duration_us"] += _duration(event)
             nccl_intervals.append((start, end))
+            category_intervals[category].append((start, end))
             mapped_range = correlation_ranges.get(str(corr)) if corr is not None else None
             metadata_ranges = candidates or ([next((r for r in ranges if r[4] is mapped_range), None)] if mapped_range is not None else [])
             metadata_ranges = [r for r in metadata_ranges if r is not None]
@@ -230,14 +290,46 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
             counted_payloads.add(payload_key)
             if metadata_ranges:
                 metadata = _args(metadata_ranges[-1][4])
-                item["message_bytes"] += int(next((metadata.get(k) for k in ("bytes", "message_bytes", "size_bytes", "collective_bytes") if metadata.get(k) is not None), 0) or 0)
+                item["message_bytes"] += _numeric_arg(metadata_ranges[-1][4], "bytes") or int(next((metadata.get(k) for k in ("bytes", "message_bytes", "size_bytes", "collective_bytes") if metadata.get(k) is not None), 0) or 0)
             else:
                 metadata = _args(event)
                 item["message_bytes"] += int(next((metadata.get(k) for k in ("bytes", "message_bytes", "size_bytes", "collective_bytes") if metadata.get(k) is not None), 0) or 0)
         elif ("kernel" in str(event.get("cat", "")).lower()
               or str(event.get("cat", "")).lower() in {"gpu", "cuda_kernel"}
               or ("stream" in event and "compute" in str(event.get("name", "")).lower())):
-            compute_intervals.append((start, end))
+            corr = _correlation(event)
+            correlated_cpu_events = (
+                cpu_events_by_correlation.get(str(corr), [])
+                if corr is not None
+                else []
+            )
+            is_hook_local = any(
+                local[1] <= start and end <= local[2]
+                or (corr is not None and local[3] is not None and str(corr) == str(local[3]))
+                for local in hook_local_ranges
+            )
+            is_hook_local = is_hook_local or any(
+                any(
+                    local[1] <= float(cpu_event.get("ts", 0.0))
+                    and float(cpu_event.get("ts", 0.0)) + _duration(cpu_event) <= local[2]
+                    for local in hook_local_ranges
+                )
+                for cpu_event in correlated_cpu_events
+            )
+            is_backward_compute = any(
+                backward[1] <= start and end <= backward[2]
+                for backward in backward_ranges
+            )
+            is_backward_compute = is_backward_compute or any(
+                any(
+                    backward[1] <= float(cpu_event.get("ts", 0.0))
+                    and float(cpu_event.get("ts", 0.0)) + _duration(cpu_event) <= backward[2]
+                    for backward in backward_ranges
+                )
+                for cpu_event in correlated_cpu_events
+            )
+            if is_backward_compute and not is_hook_local:
+                compute_intervals.append((start, end))
     collectives = []
     for category in sorted(groups):
         item = groups[category]
@@ -246,6 +338,30 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
                             "message_bytes": item["message_bytes"]})
     union_us = _interval_union(nccl_intervals)
     overlap_us = _overlap(nccl_intervals, compute_intervals)
+    arc_intervals = [
+        interval
+        for category in _ARC_HOOK_COLLECTIVES
+        for interval in category_intervals.get(category, [])
+    ]
+    gradient_intervals = [
+        interval
+        for category in _GRADIENT_COLLECTIVES
+        for interval in category_intervals.get(category, [])
+    ]
+    last_compute_end = max((end for _start, end in compute_intervals), default=None)
+    exposed_gradient_tail_us = (
+        _interval_union(
+            (max(start, last_compute_end), end)
+            for start, end in gradient_intervals
+            if end > last_compute_end
+        )
+        if last_compute_end is not None
+        else _interval_union(gradient_intervals)
+    )
+    backward_start = min((item[1] for item in backward_ranges), default=None)
+    backward_end = max((item[2] for item in backward_ranges), default=None)
+    first_arc_start = min((start for start, _end in arc_intervals), default=None)
+    last_arc_end = max((end for _start, end in arc_intervals), default=None)
     return {
         "nccl_kernel_time_ms": sum(item["duration_ms"] for item in collectives),
         "raw_nccl_total_ms": sum(item["duration_ms"] for item in collectives),
@@ -255,6 +371,20 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
         "exposed_nccl_time_ms": max(0.0, union_us - overlap_us) / 1000.0,
         "exposed_time_ms": max(0.0, union_us - overlap_us) / 1000.0,
         "exposed_is_trace_estimate": True,
+        "arc_collective_backward_compute_overlap_ms": (
+            _overlap(arc_intervals, compute_intervals) / 1000.0
+        ),
+        "exposed_gradient_sync_tail_ms": exposed_gradient_tail_us / 1000.0,
+        "first_arc_collective_from_backward_start_ms": (
+            (first_arc_start - backward_start) / 1000.0
+            if first_arc_start is not None and backward_start is not None
+            else None
+        ),
+        "last_arc_completion_from_backward_end_ms": (
+            (last_arc_end - backward_end) / 1000.0
+            if last_arc_end is not None and backward_end is not None
+            else None
+        ),
         "collectives": collectives,
     }
 
@@ -285,6 +415,8 @@ def summarize_training_trace(trace: Any) -> dict[str, Any]:
             continue
         if not _is_cpu_annotation(event):
             continue
+        if "/payload " in str(event.get("name", "")):
+            continue
         category = _range_category(str(event.get("name", "")))
         if category is not None:
             cpu_ranges[category] += _duration(event) / 1000.0
@@ -298,6 +430,47 @@ def summarize_training_trace(trace: Any) -> dict[str, Any]:
     result["profile_window_ms"] = cpu_ranges.get("profile_window", 0.0)
     result["unattributed_nccl_fraction"] = (
         unattributed / total_nccl if total_nccl else 0.0
+    )
+    bucket_events = [
+        event for event in events
+        if event.get("ph") == "X"
+        and str(event.get("name", "")).startswith("arc_hook/bucket_ready")
+        and _is_cpu_annotation(event)
+    ]
+    result["bucket_count"] = len(bucket_events)
+    for key in ("bucket_bytes", "arc_bytes", "dense_bytes"):
+        result[key] = sum(_numeric_arg(event, key) for event in bucket_events)
+    backward_ranges = [
+        event for event in events
+        if event.get("ph") == "X"
+        and event.get("name") == "train/final_backward"
+        and _is_cpu_annotation(event)
+    ]
+    bucket_ready_starts = [float(event.get("ts", 0.0)) for event in bucket_events]
+    future_completion_ends = [
+        float(event.get("ts", 0.0)) + _duration(event)
+        for event in events
+        if event.get("ph") == "X"
+        and event.get("name") == "arc_hook/future_complete"
+        and _is_cpu_annotation(event)
+    ]
+    backward_start = min(
+        (float(event.get("ts", 0.0)) for event in backward_ranges),
+        default=None,
+    )
+    backward_end = max(
+        (float(event.get("ts", 0.0)) + _duration(event) for event in backward_ranges),
+        default=None,
+    )
+    result["first_bucket_ready_from_backward_start_ms"] = (
+        (min(bucket_ready_starts) - backward_start) / 1000.0
+        if bucket_ready_starts and backward_start is not None
+        else None
+    )
+    result["last_hook_future_completion_from_backward_end_ms"] = (
+        (max(future_completion_ends) - backward_end) / 1000.0
+        if future_completion_ends and backward_end is not None
+        else None
     )
     return result
 

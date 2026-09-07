@@ -6,7 +6,7 @@ python_bin="$repo_dir/.venv/bin/python"
 torchrun_bin="$repo_dir/.venv/bin/torchrun"
 data_dir="$repo_dir/data/fineweb10B"
 dense_config="$repo_dir/configs/compressed_muon/cm020a_dense_muon_gpt350m.yaml"
-arc_config="$repo_dir/configs/compressed_muon/cm020b_arc_muon_gpt350m.yaml"
+arc_config="$repo_dir/configs/compressed_muon/m001_arc_topk_muon_ddp.yaml"
 world_size=3
 global_batch_size=768
 device_batch_size=1
@@ -14,8 +14,10 @@ model_dim=1024
 layers=20
 heads=16
 sequence_length=1024
-profile_step=12
-num_iterations=13
+timing_warmup_steps=12
+measured_steps=1
+requested_num_iterations=""
+bucket_cap_mb=25
 repeats=1
 training_seed=42
 gpu_list=""
@@ -34,8 +36,11 @@ while (($#)); do
         --layers) layers="$2"; shift 2 ;;
         --heads) heads="$2"; shift 2 ;;
         --sequence-length) sequence_length="$2"; shift 2 ;;
-        --profile-step) profile_step="$2"; shift 2 ;;
-        --num-iterations) num_iterations="$2"; shift 2 ;;
+        --profile-step) timing_warmup_steps="$2"; shift 2 ;;
+        --num-iterations) requested_num_iterations="$2"; shift 2 ;;
+        --timing-warmup-steps) timing_warmup_steps="$2"; shift 2 ;;
+        --measured-steps) measured_steps="$2"; shift 2 ;;
+        --bucket-cap-mb) bucket_cap_mb="$2"; shift 2 ;;
         --repeats) repeats="$2"; shift 2 ;;
         --training-seed) training_seed="$2"; shift 2 ;;
         --gpu-list) gpu_list="$2"; shift 2 ;;
@@ -53,13 +58,18 @@ if ((world_size < 1 || device_batch_size < 1 || global_batch_size % denominator 
     printf 'global batch must be divisible by world_size * device_batch_size\n' >&2
     exit 64
 fi
-if ((profile_step < 1 || profile_step >= num_iterations)); then
-    printf 'profile_step must be positive and before num_iterations\n' >&2
+if [[ -n "$requested_num_iterations" ]]; then
+    measured_steps=$((requested_num_iterations - timing_warmup_steps))
+fi
+num_iterations=$((timing_warmup_steps + measured_steps))
+profile_step="$timing_warmup_steps"
+if ((timing_warmup_steps < 1 || measured_steps < 1)); then
+    printf 'timing warmup and measured steps must both be positive\n' >&2
     exit 64
 fi
 grad_accum_steps=$((global_batch_size / denominator))
 val_tokens=$((world_size * device_batch_size * sequence_length))
-artifact_root="${artifact_root:-$repo_dir/artifacts/compressed_muon/CM023-gpt350m-critical-path-profiler-ws${world_size}}"
+artifact_root="${artifact_root:-$repo_dir/artifacts/compressed_muon/CM024-gpt350m-three-mode-profiler-ws${world_size}}"
 
 select_gpus() {
     awk -F, -v limit="$memory_limit_mib" -v excluded="$exclude_gpus" '
@@ -79,21 +89,26 @@ fi
 print_plan() {
     WS="$world_size" GBS="$global_batch_size" DBS="$device_batch_size" GA="$grad_accum_steps" \
     MD="$model_dim" NL="$layers" NH="$heads" SEQ="$sequence_length" PS="$profile_step" \
-    NI="$num_iterations" REPS="$repeats" GPU_LIST_VALUE="${gpu_list:-dynamic}" EXCLUDED="$exclude_gpus" ROOT="$artifact_root" \
+    NI="$num_iterations" WARMUP="$timing_warmup_steps" MEASURED="$measured_steps" BUCKET="$bucket_cap_mb" \
+    REPS="$repeats" GPU_LIST_VALUE="${gpu_list:-dynamic}" EXCLUDED="$exclude_gpus" ROOT="$artifact_root" \
     "$python_bin" - <<'PY'
 import json, os
+import itertools
 repeats=int(os.environ["REPS"])
 cells=[]
+orders=list(itertools.permutations(("dense", "arc_optimizer", "arc_ddp_hook")))
 for repeat in range(1, repeats+1):
-    cells.extend(([f"dense-r{repeat}", f"arc-r{repeat}"] if repeat % 2 else [f"arc-r{repeat}", f"dense-r{repeat}"]))
+    cells.extend(f"{mode}-r{repeat}" for mode in orders[(repeat-1) % len(orders)])
 print(json.dumps({
   "world_size": int(os.environ["WS"]), "global_batch_size": int(os.environ["GBS"]),
   "device_batch_size": int(os.environ["DBS"]), "gradient_accumulation_steps": int(os.environ["GA"]),
   "model": {"dim": int(os.environ["MD"]), "layers": int(os.environ["NL"]), "heads": int(os.environ["NH"])},
   "sequence_length": int(os.environ["SEQ"]), "profile_step": int(os.environ["PS"]),
-  "num_iterations": int(os.environ["NI"]), "cells": cells,
+  "num_iterations": int(os.environ["NI"]), "timing_warmup_steps": int(os.environ["WARMUP"]),
+  "measured_steps": int(os.environ["MEASURED"]), "bucket_cap_mb": float(os.environ["BUCKET"]), "cells": cells,
   "gpu_list": os.environ["GPU_LIST_VALUE"], "exclude_gpus": os.environ["EXCLUDED"], "artifact_root": os.environ["ROOT"],
   "profile_scope": "final_microstep_and_optimizer", "uses_time_optimizer": False,
+  "require_final_timing": True,
 }, indent=2))
 PY
 }
@@ -160,7 +175,7 @@ run_cell() {
     local cell="$1" mode_name="$2" entry config cell_dir rc
     cell_dir="$artifact_root/$cell"
     entry="$repo_dir/train.py"; config="$dense_config"
-    [[ "$mode_name" == "arc" ]] && { entry="$repo_dir/train_arctopk.py"; config="$arc_config"; }
+    [[ "$mode_name" != "dense" ]] && { entry="$repo_dir/train_arctopk.py"; config="$arc_config"; }
     while ! selected_idle; do log "GPU_WAIT_SELECTED list=$gpu_list"; sleep "$poll_seconds"; done
     mkdir -p "$cell_dir/profiler"
     local -a command=(env -u NCCL_DEBUG -u NCCL_P2P_DISABLE -u NCCL_SHM_DISABLE
@@ -171,7 +186,13 @@ run_cell() {
         --sequence_length "$sequence_length" --batch_size "$global_batch_size"
         --device_batch_size "$device_batch_size" --val_tokens "$val_tokens"
         --num_iterations "$num_iterations" --training-seed "$training_seed"
+        --timing-warmup-steps "$timing_warmup_steps" --bucket-cap-mb "$bucket_cap_mb"
         --profile-output-dir "$cell_dir/profiler" --profile-step "$profile_step")
+    if [[ "$mode_name" == "arc_optimizer" ]]; then
+        command+=(--arc_sync_mode optimizer --arc_start_compress_step 0)
+    elif [[ "$mode_name" == "arc_ddp_hook" ]]; then
+        command+=(--arc_sync_mode ddp_hook --arc_start_compress_step 0)
+    fi
     printf '%q ' "${command[@]}" > "$cell_dir/command.txt"; printf '\n' >> "$cell_dir/command.txt"
     timestamp > "$cell_dir/started_at.txt"; log "CELL_START cell=$cell mode=$mode_name"
     timeout --signal=TERM --kill-after=60 3600 "${command[@]}" > "$cell_dir/stdout.log" 2> "$cell_dir/stderr.log"
@@ -183,7 +204,14 @@ run_cell() {
 }
 
 for ((repeat=1; repeat<=repeats; repeat++)); do
-    if ((repeat % 2)); then order=(dense arc); else order=(arc dense); fi
+    case $(((repeat - 1) % 6)) in
+        0) order=(dense arc_optimizer arc_ddp_hook) ;;
+        1) order=(dense arc_ddp_hook arc_optimizer) ;;
+        2) order=(arc_optimizer dense arc_ddp_hook) ;;
+        3) order=(arc_optimizer arc_ddp_hook dense) ;;
+        4) order=(arc_ddp_hook dense arc_optimizer) ;;
+        5) order=(arc_ddp_hook arc_optimizer dense) ;;
+    esac
     for mode_name in "${order[@]}"; do run_cell "${mode_name}-r${repeat}" "$mode_name" || exit $?; done
 done
 

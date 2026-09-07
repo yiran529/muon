@@ -685,3 +685,11 @@ Task 8 规定的 formal-entry suite 使用 `python -m pytest` 执行（本环境
 分布式 `ArcTopKMuon` 构造期仅执行一次 `all_gather_object`，一致性失败时所有 rank 获得包含完整 rank/digest 表的同一 `ArcTopKLayoutMismatch`。三步 observer 回归确认 layout collective 计数为 1、`arc/seed` 为 0。冻结后拒绝 `add_param_group`；state dict 保存 fingerprint 和 task table，加载前同时校验冻结布局及恢复 param-group 配置，避免 compressor step 被不兼容布局接受。正式训练入口在 Task 1 已传入 `raw_model.named_parameters()` 的稳定映射，因此本 Task 无需再次改动入口。
 
 红—绿过程先观察到 canonical 模块缺失、optimizer 缓存/冻结/恢复检查缺失，以及篡改 checkpoint ARC 配置未被拒绝，再分别实现并转绿。Task 1+2 完整 CPU/Gloo 回归结果为 `129 passed, 0 failed, 0 skipped`；另有 14 条既有 PyTorch JIT 弃用警告。未运行 GPU 或性能实验；完整异步 DDP bucket hook、GPU stream/Future 生命周期和 hook compressor checkpoint 仍属于后续 Task。
+
+## 2026-09-08：三模式 profiler 与 fail-closed launcher
+
+按方案 Task 10，hook 新增 `arc_hook/local_prepare|dense|sketch|topk|selected_values|finalize` profiler ranges，以及每 bucket ready/final Future completion 标记。bucket 标记编码总 bytes、ARC bytes 和 dense bytes；collective payload range 编码实际 message bytes。离线解析器显式区分 hook dense/sketch/selected-values，不再将 callback-thread NCCL 误归为默认 DDP gradient。
+
+Overlap 口径改为 GPU interval：用 Kineto external ID 将 GPU compute kernel 关联到 `final_backward` 内发射的 CPU op，排除 NCCL 和 hook prepare/Top-K/finalize 的本地 kernel，再计算 ARC collective 与 genuine backward compute 的时间交集及最后 compute kernel 之后的 exposed gradient-sync tail。合成反例覆盖“ARC NCCL 完全位于 host backward range、但开始于最后 backward compute 之后”，其 overlap 必须为 0。摘要同时输出首个 bucket/ARC collective 相对 backward start、最后 ARC kernel/Future 相对 backward end、bucket count/bytes，并拒绝 rank-divergent hook signature、任何 ARC seed collective、缺 rank/cell、非零 exit、OOM/timeout/traceback 和缺少最终 timing。
+
+launcher 现包含 dense、optimizer-side ARC 和 DDP-hook ARC 三个 cell，按六种排列轮换 paired block；支持 world/global batch、GPU include/exclude、bucket cap、timing warmup、measured steps 和 artifact root，`num_iterations=warmup+measured`，无 hard-coded GPU 或 seed mode。共享训练入口将原 hard-coded 10-step timing reset 参数化，默认仍为 10，并将 DDP bucket cap 显式传给构造器。Task 10 CPU contracts 为 `23 passed`；与 hook/训练回归合并为 `39 passed`，shell syntax 和 `--print-plan` JSON 均通过。真实 trace 是否满足 positive overlap acceptance 仍需 Task 11 GPU scan 验证。

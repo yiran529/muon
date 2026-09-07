@@ -49,6 +49,10 @@ def test_shared_training_cli_accepts_targeted_profiler_arguments(monkeypatch, tm
             "42",
             "--val_tokens",
             "3072",
+            "--timing-warmup-steps",
+            "7",
+            "--bucket-cap-mb",
+            "5",
         ],
     )
 
@@ -58,6 +62,14 @@ def test_shared_training_cli_accepts_targeted_profiler_arguments(monkeypatch, tm
     assert args.profile_step == 12
     assert args.training_seed == 42
     assert args.val_tokens == 3072
+    assert args.timing_warmup_steps == 7
+    assert args.bucket_cap_mb == 5
+
+
+def test_nondefault_timing_warmup_excludes_exactly_completed_warmup_steps():
+    assert train.completed_timed_steps(step=7, timing_warmup_steps=7) == 0
+    assert train.completed_timed_steps(step=8, timing_warmup_steps=7) == 1
+    assert train.completed_timed_steps(step=107, timing_warmup_steps=7) == 100
 
 
 def test_profile_capture_finishes_immediately_after_real_optimizer_step():

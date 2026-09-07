@@ -1,6 +1,8 @@
 import pytest
+import json
 
 from benchmark.compressed_muon.profiler_trace import summarize_training_trace
+from benchmark.compressed_muon.summarize_training_profiles import summarize_profile_root
 
 
 def test_training_trace_attributes_default_ddp_nccl_inside_backward():
@@ -88,3 +90,104 @@ def test_training_summary_counts_only_cpu_user_annotations_as_cpu_ranges():
 
     assert result["profile_window_ms"] == pytest.approx(1.0)
     assert result["cpu_ranges_ms"]["optimizer"] == pytest.approx(0.2)
+
+
+def test_hook_collectives_are_classified_explicitly_and_report_bucket_metrics():
+    trace = {"traceEvents": [
+        {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 2000},
+        {"ph": "X", "name": "train/final_backward", "cat": "cpu_op", "ts": 100, "dur": 1000},
+        {"ph": "X", "name": "arc_hook/bucket_ready", "cat": "cpu_op", "ts": 200, "dur": 1,
+         "args": {"bucket_bytes": 100, "arc_bytes": 80, "dense_bytes": 20}},
+        {"ph": "X", "name": "arc_hook/dense", "cat": "cpu_op", "ts": 250, "dur": 10,
+         "args": {"External id": 1, "bytes": 20}},
+        {"ph": "X", "name": "arc_hook/sketch", "cat": "cpu_op", "ts": 300, "dur": 10,
+         "args": {"External id": 2, "bytes": 32}},
+        {"ph": "X", "name": "arc_hook/selected_values", "cat": "cpu_op", "ts": 500, "dur": 10,
+         "args": {"External id": 3, "bytes": 24}},
+        {"ph": "X", "name": "backward_gemm", "cat": "kernel", "ts": 150, "dur": 500},
+        {"ph": "X", "name": "ncclDevKernel_AllReduce", "cat": "kernel", "ts": 270, "dur": 100,
+         "args": {"External id": 1}},
+        {"ph": "X", "name": "ncclDevKernel_AllReduce", "cat": "kernel", "ts": 380, "dur": 100,
+         "args": {"External id": 2}},
+        {"ph": "X", "name": "ncclDevKernel_AllReduce", "cat": "kernel", "ts": 550, "dur": 200,
+         "args": {"External id": 3}},
+        {"ph": "X", "name": "arc_hook/future_complete", "cat": "cpu_op", "ts": 760, "dur": 1},
+    ]}
+
+    result = summarize_training_trace(trace)
+
+    assert [item["category"] for item in result["collectives"]] == [
+        "arc_hook_dense", "arc_hook_selected_values", "arc_hook_sketch"
+    ]
+    assert result["bucket_count"] == 1
+    assert result["bucket_bytes"] == 100
+    assert result["arc_bytes"] == 80
+    assert result["dense_bytes"] == 20
+    assert result["first_bucket_ready_from_backward_start_ms"] == pytest.approx(0.1)
+    assert result["last_hook_future_completion_from_backward_end_ms"] == pytest.approx(-0.339)
+    assert result["first_arc_collective_from_backward_start_ms"] == pytest.approx(0.17)
+    assert result["last_arc_completion_from_backward_end_ms"] == pytest.approx(-0.35)
+    assert result["arc_collective_backward_compute_overlap_ms"] == pytest.approx(0.30)
+    assert result["exposed_gradient_sync_tail_ms"] == pytest.approx(0.10)
+
+
+def test_host_backward_containment_does_not_fake_gpu_compute_overlap():
+    trace = {"traceEvents": [
+        {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 2000},
+        {"ph": "X", "name": "train/final_backward", "cat": "cpu_op", "ts": 100, "dur": 1200},
+        {"ph": "X", "name": "backward_gemm", "cat": "kernel", "ts": 150, "dur": 200},
+        {"ph": "X", "name": "arc_hook/sketch", "cat": "cpu_op", "ts": 500, "dur": 10,
+         "args": {"External id": 4}},
+        {"ph": "X", "name": "ncclDevKernel_AllReduce", "cat": "kernel", "ts": 600, "dur": 300,
+         "args": {"External id": 4}},
+    ]}
+
+    result = summarize_training_trace(trace)
+
+    assert result["arc_collective_backward_compute_overlap_ms"] == 0.0
+    assert result["exposed_gradient_sync_tail_ms"] == pytest.approx(0.3)
+
+
+def _write_profile_cell(root, cell, rank, trace):
+    path = root / cell / "profiler" / f"rank-{rank}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(trace))
+    (root / cell / "exit_code.txt").write_text("0\n")
+    (root / cell / "stdout.log").write_text(
+        "step:13/13 val_loss:1.0 train_time:10ms step_avg:10ms\n"
+    )
+
+
+@pytest.mark.parametrize("failure", ["signature", "seed"])
+def test_profile_summary_fails_closed_on_rank_divergence_or_seed(tmp_path, failure):
+    cell = "arc_ddp_hook-r1"
+    (tmp_path / "plan.json").write_text(json.dumps({
+        "world_size": 2,
+        "cells": [cell],
+        "require_final_timing": True,
+    }))
+    base = [
+        {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 1000},
+        {"ph": "X", "name": "arc_hook/sketch", "cat": "cpu_op", "ts": 100, "dur": 10,
+         "args": {"External id": 1, "bytes": 32}},
+        {"ph": "X", "name": "ncclDevKernel_AllReduce", "cat": "kernel", "ts": 200, "dur": 100,
+         "args": {"External id": 1}},
+    ]
+    _write_profile_cell(tmp_path, cell, 0, {"traceEvents": base})
+    second = list(base)
+    if failure == "signature":
+        second = second + [
+            {"ph": "X", "name": "ncclDevKernel_AllReduce", "cat": "kernel", "ts": 400, "dur": 100,
+             "args": {"External id": 1}},
+        ]
+    else:
+        second = second + [
+            {"ph": "X", "name": "arc/seed", "cat": "cpu_op", "ts": 400, "dur": 10,
+             "args": {"External id": 2}},
+            {"ph": "X", "name": "ncclDevKernel_Broadcast", "cat": "kernel", "ts": 450, "dur": 50,
+             "args": {"External id": 2}},
+        ]
+    _write_profile_cell(tmp_path, cell, 1, {"traceEvents": second})
+
+    with pytest.raises(SystemExit, match="signature|seed"):
+        summarize_profile_root(tmp_path, require_plan=True)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import re
 
 from pathlib import Path
 
@@ -32,12 +33,45 @@ def _validate_plan_completeness(artifact_root: Path, cells: list[dict]) -> None:
         )
     expected_ranks = set(range(int(plan["world_size"])))
     for cell in cells:
+        cell_dir = artifact_root / cell["cell"]
+        exit_path = cell_dir / "exit_code.txt"
+        if not exit_path.is_file() or exit_path.read_text().strip() != "0":
+            raise SystemExit(f"nonzero or missing exit code for {cell['cell']}")
+        logs = "\n".join(
+            path.read_text(errors="replace")
+            for path in (cell_dir / "stdout.log", cell_dir / "stderr.log")
+            if path.is_file()
+        )
+        if re.search(r"\b(OOM|out of memory|timeout|timed out|traceback)\b", logs, re.I):
+            raise SystemExit(f"failure marker found in logs for {cell['cell']}")
+        if plan.get("require_final_timing") and "step_avg:" not in logs:
+            raise SystemExit(f"missing final timing for {cell['cell']}")
         actual_ranks = {rank["rank"] for rank in cell["ranks"]}
         if actual_ranks != expected_ranks:
             raise SystemExit(
                 f"rank set mismatch for {cell['cell']}: "
                 f"expected {sorted(expected_ranks)}, got {sorted(actual_ranks)}"
             )
+        signatures = []
+        for rank in cell["ranks"]:
+            signature = (rank["bucket_count"],) + tuple(
+                (
+                    item["category"],
+                    item["kernel_count"],
+                    item["message_bytes"],
+                )
+                for item in rank["collectives"]
+                if item["category"].startswith("arc_hook_")
+            )
+            signatures.append(signature)
+        if len(set(signatures)) != 1:
+            raise SystemExit(f"rank-divergent hook signature for {cell['cell']}")
+        if cell["mode"].startswith("arc") and any(
+            item["category"] == "arc_seed"
+            for rank in cell["ranks"]
+            for item in rank["collectives"]
+        ):
+            raise SystemExit(f"seed collective found in ARC cell {cell['cell']}")
 
 
 def summarize_profile_root(artifact_root: Path, *, require_plan: bool = False) -> dict:
@@ -73,6 +107,12 @@ def summarize_profile_root(artifact_root: Path, *, require_plan: bool = False) -
             "rank_max_collective_time_ms": rank_max_collectives,
             "rank_max_nccl_union_time_ms": max(item["nccl_union_time_ms"] for item in traces),
             "rank_max_exposed_nccl_time_ms": max(item["exposed_nccl_time_ms"] for item in traces),
+            "rank_max_arc_collective_backward_compute_overlap_ms": max(
+                item["arc_collective_backward_compute_overlap_ms"] for item in traces
+            ),
+            "rank_max_exposed_gradient_sync_tail_ms": max(
+                item["exposed_gradient_sync_tail_ms"] for item in traces
+            ),
             "max_unattributed_nccl_fraction": max(item["unattributed_nccl_fraction"] for item in traces),
         })
     if not cells:
@@ -91,6 +131,14 @@ def summarize_profile_root(artifact_root: Path, *, require_plan: bool = False) -
             ),
             "mean_rank_max_exposed_nccl_time_ms": statistics.mean(
                 cell["rank_max_exposed_nccl_time_ms"] for cell in mode_cells
+            ),
+            "mean_rank_max_arc_collective_backward_compute_overlap_ms": statistics.mean(
+                cell["rank_max_arc_collective_backward_compute_overlap_ms"]
+                for cell in mode_cells
+            ),
+            "mean_rank_max_exposed_gradient_sync_tail_ms": statistics.mean(
+                cell["rank_max_exposed_gradient_sync_tail_ms"]
+                for cell in mode_cells
             ),
             "mean_rank_max_cpu_ranges_ms": _mean_mapping(mode_cells, "rank_max_cpu_ranges_ms"),
             "mean_rank_max_collective_time_ms": _mean_mapping(mode_cells, "rank_max_collective_time_ms"),

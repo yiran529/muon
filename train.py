@@ -52,6 +52,7 @@ class Hyperparameters:
     num_iterations: int = 5000
     warmup_ratio: float = 0.01
     warmdown_ratio: float = 0.2
+    timing_warmup_steps: int = 10
 
     # Model config
     model_dim: int = 768
@@ -185,6 +186,12 @@ def forward_backward_micro_step(
     return train_loss, callback_result
 
 
+def completed_timed_steps(*, step: int, timing_warmup_steps: int) -> int:
+    """Number of completed optimizer updates in the measured timing window."""
+
+    return max(0, step - timing_warmup_steps)
+
+
 def parse_cli_args(configure_parser=None):
     # --- Command-line argument parsing ---
     parser = argparse.ArgumentParser()
@@ -278,6 +285,8 @@ def parse_cli_args(configure_parser=None):
     parser.add_argument("--val_tokens", type=int, default=None)
     parser.add_argument("--warmup_ratio", type=float, default=None)
     parser.add_argument("--warmdown_ratio", type=float, default=None)
+    parser.add_argument("--timing-warmup-steps", type=int, default=None)
+    parser.add_argument("--bucket-cap-mb", type=float, default=None)
 
     # ---------- wandb logging ----------
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
@@ -1023,7 +1032,10 @@ def main(
         # Use LOCAL_RANK here (per-node GPU index)
         # This ensures each process is pinned to the correct local GPU
         local_rank = int(os.environ["LOCAL_RANK"])
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        ddp_kwargs = dict(device_ids=[local_rank], output_device=local_rank)
+        if cli_args.bucket_cap_mb is not None:
+            ddp_kwargs["bucket_cap_mb"] = cli_args.bucket_cap_mb
+        model = DDP(model, **ddp_kwargs)
         raw_model = model.module  # the underlying model
 
     # Ensure parameters are contiguous
@@ -1165,13 +1177,17 @@ def main(
     pbar.update(start_step)
     for step in range(start_step, hp.num_iterations + 1):
         # Skip the first few steps for timing to avoid torch.compile overhead
-        if step == 10:
+        if step == hp.timing_warmup_steps:
             training_time_ms = 0
             total_fwd_bwd_ms = 0
             total_opt_ms = 0
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-        timed_steps = (step - 10) if step > 10 else float("nan")
+        completed_steps = completed_timed_steps(
+            step=step,
+            timing_warmup_steps=hp.timing_warmup_steps,
+        )
+        timed_steps = completed_steps if completed_steps > 0 else float("nan")
 
         # --- Validation ---
         last_step = step == hp.num_iterations

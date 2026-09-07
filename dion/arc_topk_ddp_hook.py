@@ -11,6 +11,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.nn import Parameter
 from torch.optim import Optimizer
+from torch.profiler import record_function
 
 from .arc_topk_sync import ArcTopKSyncConfig
 from .arc_topk import (
@@ -26,6 +27,10 @@ from .collective_observer import observe_collective
 
 
 ARC_COMPRESSOR_SCHEMA_VERSION = 1
+
+
+def _profile_args(**values: Any) -> str:
+    return " ".join(f"{key}={value}" for key, value in sorted(values.items()))
 
 
 @dataclass(frozen=True)
@@ -339,7 +344,24 @@ class ArcTopKDDPState:
             self._active_contexts[context_id] = context
             self.tail_future = completion_future
 
+        arc_bytes = sum(
+            gradient.numel() * gradient.element_size()
+            for gradient, parameter_state in zip(gradients, context.parameter_states)
+            if parameter_state is not None
+        )
+        dense_bytes = buffer.numel() * buffer.element_size() - arc_bytes
+        with record_function(
+            "arc_hook/bucket_ready " + _profile_args(
+                bucket_bytes=buffer.numel() * buffer.element_size(),
+                arc_bytes=arc_bytes,
+                dense_bytes=dense_bytes,
+            ),
+        ):
+            pass
+
         def release(_future: torch.futures.Future) -> None:
+            with record_function("arc_hook/future_complete"):
+                pass
             with self._context_lock:
                 self._active_contexts.pop(context_id, None)
 
@@ -517,33 +539,28 @@ def _launch_full_support_bucket(
     context: BucketContext,
 ) -> torch.futures.Future:
     prepared_views = []
-    for gradient, parameter_state in zip(
-        context.gradients,
-        context.parameter_states,
-    ):
-        if parameter_state is None:
-            continue
-        prepared = prepare_arc_batch(
-            gradient.unsqueeze(0),
-            parameter_state.h_local.unsqueeze(0),
-            parameter_state.g_local.unsqueeze(0),
-            parameter_state.g_global.unsqueeze(0),
-            config=state.config,
-            step=context.step,
-            projection_batch=None,
-        )
-        gradient.copy_(parameter_state.h_local)
-        prepared_views.append((prepared, gradient, parameter_state))
+    with record_function("arc_hook/local_prepare"):
+        for gradient, parameter_state in zip(
+            context.gradients,
+            context.parameter_states,
+        ):
+            if parameter_state is None:
+                continue
+            prepared = prepare_arc_batch(
+                gradient.unsqueeze(0),
+                parameter_state.h_local.unsqueeze(0),
+                parameter_state.g_local.unsqueeze(0),
+                parameter_state.g_global.unsqueeze(0),
+                config=state.config,
+                step=context.step,
+                projection_batch=None,
+            )
+            gradient.copy_(parameter_state.h_local)
+            prepared_views.append((prepared, gradient, parameter_state))
     context.retained.extend(prepared_views)
 
     if state.process_group is not None and state.world_size > 1:
-        observe_collective("arc_hook/dense", "all_reduce", context.buffer)
-        source = dist.all_reduce(
-            context.buffer,
-            op=dist.ReduceOp.SUM,
-            group=state.process_group,
-            async_op=True,
-        ).get_future()
+        source = _all_reduce_future(state, context.buffer, "arc_hook/dense")
     else:
         source = torch.futures.Future(
             devices=_future_devices(context.buffer.device)
@@ -553,18 +570,19 @@ def _launch_full_support_bucket(
     finalized = context.completion_future
 
     def finalize(value: Any) -> Tensor:
-        buffer = _future_tensor(value)
-        if state.world_size > 1:
-            buffer.div_(state.world_size)
-        for prepared, averaged_gradient, parameter_state in prepared_views:
-            finalize_arc_full_support_(
-                prepared,
-                averaged_gradient.unsqueeze(0),
-            )
-            parameter_state.last_support = torch.arange(
-                parameter_state.h_local.shape[0],
-                device=parameter_state.h_local.device,
-            )
+        with record_function("arc_hook/finalize"):
+            buffer = _future_tensor(value)
+            if state.world_size > 1:
+                buffer.div_(state.world_size)
+            for prepared, averaged_gradient, parameter_state in prepared_views:
+                finalize_arc_full_support_(
+                    prepared,
+                    averaged_gradient.unsqueeze(0),
+                )
+                parameter_state.last_support = torch.arange(
+                    parameter_state.h_local.shape[0],
+                    device=parameter_state.h_local.device,
+                )
         return context.buffer
 
     bridge_future(source, finalized, finalize)
@@ -578,12 +596,18 @@ def _all_reduce_future(
 ) -> torch.futures.Future:
     if state.process_group is not None and state.world_size > 1:
         observe_collective(category, "all_reduce", tensor)
-        return dist.all_reduce(
-            tensor,
-            op=dist.ReduceOp.SUM,
-            group=state.process_group,
-            async_op=True,
-        ).get_future()
+        with record_function(category):
+            with record_function(
+                category + "/payload " + _profile_args(
+                    bytes=tensor.numel() * tensor.element_size()
+                )
+            ):
+                return dist.all_reduce(
+                    tensor,
+                    op=dist.ReduceOp.SUM,
+                    group=state.process_group,
+                    async_op=True,
+                ).get_future()
     future = torch.futures.Future(devices=_future_devices(tensor.device))
     future.set_result(tensor)
     return future
@@ -649,55 +673,57 @@ def _launch_sparse_bucket(
     )
     prepared_entries = []
     sketch_parts = []
-    for gradient, parameter_state in zip(
-        context.gradients,
-        context.parameter_states,
-    ):
-        if parameter_state is None:
-            continue
-        rows, columns = parameter_state.h_local.shape
-        seed = derive_arc_seed(
-            base_seed=state.config.seed,
-            step=context.step,
-            stable_task_id=parameter_state.spec.stable_id,
-        )
-        projection = make_gaussian_projection(
-            1,
-            columns,
-            state.config.projection_rank,
-            seed=seed,
-            device=gradient.device,
-            dtype=gradient.dtype,
-        )
-        prepared = prepare_arc_batch(
-            gradient.unsqueeze(0),
-            parameter_state.h_local.unsqueeze(0),
-            parameter_state.g_local.unsqueeze(0),
-            parameter_state.g_global.unsqueeze(0),
-            config=state.config,
-            step=context.step,
-            projection_batch=projection,
-        )
-        assert prepared.local_sketch_batch is not None
-        prepared_entries.append((prepared, gradient, parameter_state, rows, columns))
-        sketch_parts.append(prepared.local_sketch_batch.reshape(-1))
+    with record_function("arc_hook/local_prepare"):
+        for gradient, parameter_state in zip(
+            context.gradients,
+            context.parameter_states,
+        ):
+            if parameter_state is None:
+                continue
+            rows, columns = parameter_state.h_local.shape
+            seed = derive_arc_seed(
+                base_seed=state.config.seed,
+                step=context.step,
+                stable_task_id=parameter_state.spec.stable_id,
+            )
+            projection = make_gaussian_projection(
+                1,
+                columns,
+                state.config.projection_rank,
+                seed=seed,
+                device=gradient.device,
+                dtype=gradient.dtype,
+            )
+            prepared = prepare_arc_batch(
+                gradient.unsqueeze(0),
+                parameter_state.h_local.unsqueeze(0),
+                parameter_state.g_local.unsqueeze(0),
+                parameter_state.g_global.unsqueeze(0),
+                config=state.config,
+                step=context.step,
+                projection_batch=projection,
+            )
+            assert prepared.local_sketch_batch is not None
+            prepared_entries.append((prepared, gradient, parameter_state, rows, columns))
+            sketch_parts.append(prepared.local_sketch_batch.reshape(-1))
 
     final = context.completion_future
     if not prepared_entries:
         context.retained.append(dense_buffer)
 
         def finish_dense_only(completed: torch.futures.Future) -> Tensor:
-            averaged_dense = _future_tensor(completed.value())
-            if state.world_size > 1:
-                averaged_dense.div_(state.world_size)
-            offset = 0
-            for gradient in dense_views:
-                gradient.copy_(
-                    averaged_dense[offset : offset + gradient.numel()].view_as(
-                        gradient
+            with record_function("arc_hook/finalize"):
+                averaged_dense = _future_tensor(completed.value())
+                if state.world_size > 1:
+                    averaged_dense.div_(state.world_size)
+                offset = 0
+                for gradient in dense_views:
+                    gradient.copy_(
+                        averaged_dense[offset : offset + gradient.numel()].view_as(
+                            gradient
+                        )
                     )
-                )
-                offset += gradient.numel()
+                    offset += gradient.numel()
             return context.buffer
 
         dense_completion = _all_reduce_future(
@@ -724,30 +750,31 @@ def _launch_sparse_bucket(
             final.set_exception(exc)
 
     def finish_selected(completed: torch.futures.Future) -> Tensor:
-        averaged_buffer = _future_tensor(completed.value())
-        if state.world_size > 1:
-            averaged_buffer.div_(state.world_size)
-        offset = 0
-        for prepared, gradient, parameter_state, rows, columns in prepared_entries:
-            assert prepared.delta_batch is not None
-            support = parameter_state.last_support
-            assert support is not None
-            count = support.numel() * columns
-            averaged_selected = averaged_buffer[offset : offset + count].view(
-                1, support.numel(), columns
-            )
-            local_selected = gather_rows(
-                prepared.delta_batch,
-                support.unsqueeze(0),
-            )
-            finalize_arc_sparse_(
-                prepared,
-                support.unsqueeze(0),
-                local_selected,
-                averaged_selected,
-            )
-            gradient.copy_(parameter_state.g_global)
-            offset += count
+        with record_function("arc_hook/finalize"):
+            averaged_buffer = _future_tensor(completed.value())
+            if state.world_size > 1:
+                averaged_buffer.div_(state.world_size)
+            offset = 0
+            for prepared, gradient, parameter_state, rows, columns in prepared_entries:
+                assert prepared.delta_batch is not None
+                support = parameter_state.last_support
+                assert support is not None
+                count = support.numel() * columns
+                averaged_selected = averaged_buffer[offset : offset + count].view(
+                    1, support.numel(), columns
+                )
+                local_selected = gather_rows(
+                    prepared.delta_batch,
+                    support.unsqueeze(0),
+                )
+                finalize_arc_sparse_(
+                    prepared,
+                    support.unsqueeze(0),
+                    local_selected,
+                    averaged_selected,
+                )
+                gradient.copy_(parameter_state.g_global)
+                offset += count
         return context.buffer
 
     def finish_sketch(completed: torch.futures.Future) -> None:
@@ -757,21 +784,22 @@ def _launch_sparse_bucket(
                 averaged_sketch.div_(state.world_size)
             sketch_offset = 0
             local_selected_parts = []
-            for prepared, _gradient, parameter_state, rows, _columns in prepared_entries:
-                sketch_count = rows * state.config.projection_rank
-                parameter_sketch = averaged_sketch[
-                    sketch_offset : sketch_offset + sketch_count
-                ].view(1, rows, state.config.projection_rank)
-                support = arc_topk_support(
-                    parameter_sketch,
-                    math.ceil(state.config.ratio * rows),
-                ).squeeze(0)
-                parameter_state.last_support = support
-                assert prepared.delta_batch is not None
-                local_selected_parts.append(
-                    gather_rows(prepared.delta_batch, support.unsqueeze(0)).reshape(-1)
-                )
-                sketch_offset += sketch_count
+            with record_function("arc_hook/topk"):
+                for prepared, _gradient, parameter_state, rows, _columns in prepared_entries:
+                    sketch_count = rows * state.config.projection_rank
+                    parameter_sketch = averaged_sketch[
+                        sketch_offset : sketch_offset + sketch_count
+                    ].view(1, rows, state.config.projection_rank)
+                    support = arc_topk_support(
+                        parameter_sketch,
+                        math.ceil(state.config.ratio * rows),
+                    ).squeeze(0)
+                    parameter_state.last_support = support
+                    assert prepared.delta_batch is not None
+                    local_selected_parts.append(
+                        gather_rows(prepared.delta_batch, support.unsqueeze(0)).reshape(-1)
+                    )
+                    sketch_offset += sketch_count
             local_selected_buffer = torch.cat(local_selected_parts)
             averaged_selected_buffer = local_selected_buffer.clone()
             context.retained.extend(
