@@ -645,3 +645,11 @@ Dense 跨 rank 最大的 DDP gradient NCCL 为 `136.28 ms`，Muon result collect
 CM023b 的 `12.49%` 只针对约 0.2 秒的最后 micro-step + optimizer 尾部，不是完整训练 step。完整 step 还包含此前 255 个未采集的梯度累积 micro-steps，CM022 的无 profiler step 约为 8 秒。局部净节省 `26.06 ms` 若直接摊到 8 秒，只相当于约 `0.33%`，与 CM022 观察到的整体基本持平并不矛盾，也不足以证明稳定 wall-clock 加速。
 
 当前证据支持更具体的判断：optimizer-side ARC 确实减少了 dense DDP 梯度通信的 exposed 尾部，但收益只覆盖完整 step 的很小一部分，并被 ARC optimizer 内新增的状态处理和串行多阶段工作显著抵消。DDP bucket-hook 的潜在价值是把压缩通信重新移入 backward、争取与反向计算重叠；不过在实现前应先用四卡相同 workload 复测一次局部 trace，确认三卡观察能复现，再把 hook 与当前 optimizer-side ARC 做三方对照。
+
+## 2026-09-07：本地确定性 seed 与稳定 optimizer task ID
+
+按 ARC DDP bucket-hook 设计的 Task 1，optimizer-side ARC 已删除逐任务 device seed tensor、broadcast、等待和 `.item()`，改为纯整数公式 `base_seed + step * 1_000_003 + stable_task_id` 后按 `2**64` 规范化。本地 seed 不读取或修改全局 RNG；逻辑通信统计保留 `arc_seed_bytes` schema 字段，但其运行值固定为 0，benchmark collective signature 不再包含 `arc_seed`。
+
+`ArcTopKMuon` 在构造期冻结按 optimizer group 遍历、shape/dtype 首次出现顺序生成的 task ID。分布式构造现在要求调用方提供来自 `model.named_parameters()` 的稳定参数名映射；正式训练入口和现有 benchmark 已接入。canonical optimizer fingerprint、跨 rank layout/seed 校验和 checkpoint mismatch 处理仍按计划留在 Task 2，本阶段不提前实现。
+
+红—绿回归先冻结了两个同形矩阵、三步有损 EF21M 的 projection、support、三类 tracker、Muon momentum 和参数字面量轨迹；删除 seed collective 后轨迹保持不变。Task 1 完整 CPU/Gloo 集合结果为 `105 passed, 0 failed, 0 skipped`。沙箱内因禁止 loopback socket 无法执行 Gloo，随后在授权环境中用相同命令完成两 rank 回归；本阶段未运行 GPU 或性能实验，因此不作 wall-clock 改善判断。

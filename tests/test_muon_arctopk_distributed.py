@@ -75,6 +75,10 @@ def _worker(
         optimizer = ArcTopKMuon(
             param_groups,
             distributed_mesh=dist.group.WORLD,
+            arc_parameter_names={
+                matrix: "matrix",
+                **({scalar: "scalar"} if scalar is not None else {}),
+            },
             lr=0.125,
             mu=0.0,
             weight_decay=0.0,
@@ -132,6 +136,36 @@ def test_arc_topk_muon_two_rank_consistency(
     mp.spawn(
         _worker,
         args=(2, _free_port(), scalar_algorithm, missing_matrix_gradient),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _missing_parameter_names_worker(rank: int, world_size: int, port: int) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        parameter = torch.nn.Parameter(torch.zeros(4, 3))
+        with pytest.raises(ValueError, match="arc_parameter_names"):
+            ArcTopKMuon(
+                [parameter],
+                distributed_mesh=dist.group.WORLD,
+                newton_schulz_func=_identity_orthogonalizer,
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_distributed_arc_topk_muon_requires_stable_parameter_names():
+    mp.spawn(
+        _missing_parameter_names_worker,
+        args=(2, _free_port()),
         nprocs=2,
         join=True,
     )

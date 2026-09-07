@@ -4,6 +4,7 @@ import math
 
 import pytest
 import torch
+import dion.arc_topk as arc_topk_module
 
 from dion.arc_topk import (
     arc_topk_ef21m_async,
@@ -16,6 +17,7 @@ from dion.arc_topk import (
     scatter_rows,
     validate_arc_topk_config,
 )
+from dion.collective_observer import CollectiveObserver, set_active_observer
 
 
 def _run_generator(generator):
@@ -83,6 +85,87 @@ def test_gaussian_projection_is_reproducible_without_using_global_rng():
     assert first.shape == (2, 5, 3)
     torch.testing.assert_close(first, second)
     torch.testing.assert_close(torch.randn(1), expected_next_global_draw)
+
+
+def test_arc_seed_derivation_is_deterministic_and_does_not_use_global_rng():
+    torch.manual_seed(1234)
+    expected_next_global_draw = torch.randn(1)
+    torch.manual_seed(1234)
+
+    derive = arc_topk_module.derive_arc_seed
+    assert derive(base_seed=17, step=2, stable_task_id=3) == 2_000_026
+    assert derive(base_seed=17, step=2, stable_task_id=3) == 2_000_026
+    assert derive(base_seed=18, step=2, stable_task_id=3) != 2_000_026
+    assert derive(base_seed=17, step=3, stable_task_id=3) != 2_000_026
+    assert derive(base_seed=17, step=2, stable_task_id=4) != 2_000_026
+    torch.testing.assert_close(torch.randn(1), expected_next_global_draw)
+
+
+@pytest.mark.parametrize(
+    "base_seed,step,stable_task_id",
+    [
+        (-(2**100), -(2**80), -(2**70)),
+        (2**100, 2**80, 2**70),
+    ],
+)
+def test_arc_seed_derivation_normalizes_large_and_negative_inputs(
+    base_seed, step, stable_task_id
+):
+    seed = arc_topk_module.derive_arc_seed(
+        base_seed=base_seed,
+        step=step,
+        stable_task_id=stable_task_id,
+    )
+
+    assert 0 <= seed < 2**64
+    torch.Generator(device="cpu").manual_seed(seed)
+
+
+def test_compressed_arc_step_has_no_seed_collective_or_tensor_item(monkeypatch):
+    class _Work:
+        def wait(self):
+            return None
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda *args, **kwargs: _Work(),
+    )
+
+    def unexpected_broadcast(*args, **kwargs):
+        raise AssertionError("ARC seed synchronization must not broadcast")
+
+    def unexpected_item(self, *args, **kwargs):
+        raise AssertionError("ARC seed derivation must not call Tensor.item()")
+
+    monkeypatch.setattr(torch.distributed, "broadcast", unexpected_broadcast)
+    monkeypatch.setattr(torch.Tensor, "item", unexpected_item)
+    observer = CollectiveObserver()
+    gradient = torch.arange(12.0).reshape(4, 3)
+    states = [torch.zeros_like(gradient) for _ in range(3)]
+
+    set_active_observer(observer)
+    try:
+        _run_generator(
+            arc_topk_ef21m_async(
+                gradients=[gradient],
+                trackers=[states[0]],
+                local_estimates=[states[1]],
+                global_estimates=[states[2]],
+                process_group=object(),
+                ratio=0.5,
+                projection_rank=2,
+                eta=1.0,
+                base_seed=17,
+                step=2,
+                stable_task_id=3,
+            )
+        )
+    finally:
+        set_active_observer(None)
+
+    assert all(event.category != "arc/seed" for event in observer.events)
 
 
 def test_local_sketch_applies_batched_projection_and_rank_normalization():
@@ -197,7 +280,7 @@ def test_first_step_dense_initializes_h_and_g_before_compression():
             eta=0.1,
             base_seed=17,
             step=1,
-            task_index=0,
+            stable_task_id=0,
             start_compress_step=0,
         )
     )
@@ -227,7 +310,7 @@ def test_warmup_uses_dense_tracker_update_through_configured_step():
             eta=0.25,
             base_seed=17,
             step=1000,
-            task_index=0,
+            stable_task_id=0,
             start_compress_step=1000,
         )
     )
@@ -267,7 +350,7 @@ def test_step_after_warmup_uses_bfloat16_arc_compression():
             eta=1.0,
             base_seed=17,
             step=1001,
-            task_index=0,
+            stable_task_id=0,
             start_compress_step=1000,
         )
     )

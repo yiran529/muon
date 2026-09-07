@@ -285,7 +285,10 @@ def build_optimizer(config: BenchmarkConfig, model: GPT, process_group=None):
     if cls is ArcTopKMuon:
         kwargs.update(arc_topk_ratio=config.ratio, arc_projection_rank=config.projection_rank,
                       arc_eta=config.eta, arc_seed=config.seed,
-                      arc_start_compress_step=config.start_compress_step)
+                      arc_start_compress_step=config.start_compress_step,
+                      arc_parameter_names={
+                          parameter: name for name, parameter in model.named_parameters()
+                      })
     # DDP owns gradient synchronization, while Muon's separate result
     # collective shards orthogonalization work. Both dense and ARC use it.
     distributed_mesh = process_group if (
@@ -313,7 +316,7 @@ def _collective_signature(config: BenchmarkConfig) -> list[str]:
     if config.sync == "dense":
         categories = ["ddp_gradient"]
     else:
-        categories = ["arc_seed", "arc_sketch", "arc_selected_values", "arc_dense_uncompressed"]
+        categories = ["arc_sketch", "arc_selected_values", "arc_dense_uncompressed"]
     if config.optimizer == "muon":
         categories.append("muon_result")
     return categories

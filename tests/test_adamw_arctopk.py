@@ -210,7 +210,7 @@ def test_step_uses_three_way_async_runtime(monkeypatch):
         # ensures the test exercises task consumption, not task construction.
         yield
         calls.append(
-            (kwargs["task_index"], [tuple(param.shape) for param in kwargs["params"]])
+            (kwargs["stable_task_id"], [tuple(param.shape) for param in kwargs["params"]])
         )
         yield
         return [torch.zeros_like(param) for param in kwargs["params"]]

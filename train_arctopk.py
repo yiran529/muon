@@ -98,6 +98,9 @@ def init_arc_topk_optimizer(
         arc_eta=hp.arc_eta,
         arc_seed=hp.arc_seed,
         arc_start_compress_step=hp.arc_start_compress_step,
+        arc_parameter_names={
+            parameter: name for name, parameter in model.named_parameters()
+        },
     )
 
 

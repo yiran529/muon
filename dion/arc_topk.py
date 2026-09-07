@@ -11,6 +11,16 @@ from torch.distributed import ProcessGroup
 from .collective_observer import observe_collective
 
 
+_TORCH_SEED_MODULUS = 1 << 64
+
+
+def derive_arc_seed(*, base_seed: int, step: int, stable_task_id: int) -> int:
+    """Derive a task-local ARC seed accepted by ``Generator.manual_seed``."""
+
+    seed = int(base_seed) + int(step) * 1_000_003 + int(stable_task_id)
+    return seed % _TORCH_SEED_MODULUS
+
+
 def validate_arc_topk_config(
     ratio: float,
     projection_rank: int,
@@ -129,7 +139,7 @@ def arc_topk_ef21m_async(
     eta: float,
     base_seed: int,
     step: int,
-    task_index: int,
+    stable_task_id: int,
     start_compress_step: int = 0,
 ) -> Generator[None, None, List[Tensor]]:
     """Apply ARC-TopK Algorithm 1 to an EF21M shape group.
@@ -187,29 +197,11 @@ def arc_topk_ef21m_async(
         torch._foreach_copy_(global_estimates, list(global_estimate_batch.unbind(0)))
         return global_estimates
 
-    group_rank = dist.get_rank(process_group) if process_group is not None else 0
-    source_rank = (
-        dist.get_process_group_ranks(process_group)[0]
-        if process_group is not None
-        else 0
+    seed = derive_arc_seed(
+        base_seed=base_seed,
+        step=step,
+        stable_task_id=stable_task_id,
     )
-    seed_value = int(base_seed) + int(step) * 1_000_003 + int(task_index)
-    seed_tensor = torch.zeros((), dtype=torch.int64, device=gradients[0].device)
-    if group_rank == 0:
-        seed_tensor.fill_(seed_value)
-    if process_group is not None and world_size > 1:
-        observe_collective("arc/seed", "broadcast", seed_tensor)
-        with record_function("arc/seed"):
-            work = dist.broadcast(
-                seed_tensor,
-                src=source_rank,
-                group=process_group,
-                async_op=True,
-            )
-        yield
-        with record_function("arc/seed_wait"):
-            work.wait()
-    synchronized_seed = int(seed_tensor.item())
 
     delta_batch = tracker_batch - local_estimate_batch
     rows, columns = shape
@@ -218,7 +210,7 @@ def arc_topk_ef21m_async(
             count,
             columns,
             projection_rank,
-            seed=synchronized_seed,
+            seed=seed,
             device=gradient_batch.device,
             dtype=gradient_batch.dtype,
         )

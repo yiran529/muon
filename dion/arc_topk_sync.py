@@ -23,6 +23,7 @@ class ArcTopKSyncConfig:
     eta: float = 0.1
     seed: int = 42
     start_compress_step: int = 0
+    seed_scheme_version: int = 1
 
     def __post_init__(self) -> None:
         validate_arc_topk_config(
@@ -74,7 +75,7 @@ def synchronize_arc_batch_async(
     process_group: Optional[ProcessGroup],
     config: ArcTopKSyncConfig,
     step: int,
-    task_index: int,
+    stable_task_id: int,
 ) -> Generator[None, None, list[Tensor]]:
     """Synchronize one same-shaped parameter batch using the ARC-TopK primitive."""
 
@@ -101,7 +102,7 @@ def synchronize_arc_batch_async(
         eta=config.eta,
         base_seed=config.seed,
         step=step,
-        task_index=task_index,
+        stable_task_id=stable_task_id,
         start_compress_step=config.start_compress_step,
     ))
 
@@ -162,7 +163,6 @@ def estimate_arc_logical_bytes(
         rows, columns = first.shape
         k = max(1, math.ceil(rows * config.ratio))
         element_size = first.element_size()
-        arc_seed += 8
         arc_sketch += len(batch) * rows * config.projection_rank * element_size
         arc_selected_values += len(batch) * k * columns * element_size
 

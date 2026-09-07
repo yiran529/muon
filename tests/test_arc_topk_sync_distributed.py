@@ -48,7 +48,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 process_group=dist.group.WORLD,
                 config=config,
                 step=1,
-                task_index=0,
+                stable_task_id=0,
             )
 
         AsyncRuntime(iter([AsyncTask(task())]), max_concurrent_tasks=1).run()
@@ -68,7 +68,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 process_group=dist.group.WORLD,
                 config=config,
                 step=2,
-                task_index=0,
+                stable_task_id=0,
             )
 
         AsyncRuntime(iter([AsyncTask(second_task())]), max_concurrent_tasks=1).run()
@@ -88,7 +88,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 process_group=dist.group.WORLD,
                 config=config,
                 step=1,
-                task_index=1,
+                stable_task_id=1,
             )
 
         AsyncRuntime(iter([AsyncTask(third_task())]), max_concurrent_tasks=1).run()
@@ -115,7 +115,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                         process_group=dist.group.WORLD,
                         config=config,
                         step=1,
-                        task_index=task_index,
+                        stable_task_id=task_index,
                     )
                 )
             )

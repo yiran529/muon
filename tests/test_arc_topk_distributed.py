@@ -89,9 +89,9 @@ def _worker(rank: int, world_size: int, port: int, case: str, ratio: float) -> N
                 ratio=ratio,
                 projection_rank=2,
                 eta=0.5,
-                base_seed=19 + 100 * rank,
+                base_seed=19,
                 step=2,
-                task_index=3,
+                stable_task_id=3,
             )
 
         runtime = AsyncRuntime(iter([AsyncTask(task())]), max_concurrent_tasks=1)
@@ -158,7 +158,7 @@ def _initialization_worker(rank: int, world_size: int, port: int) -> None:
                 eta=0.1,
                 base_seed=19,
                 step=1,
-                task_index=0,
+                stable_task_id=0,
                 start_compress_step=1000,
             )
 

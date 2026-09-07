@@ -5,7 +5,8 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh
 from torch.optim.optimizer import ParamsT
-from typing import Callable, Generator, List, Optional, Union
+from torch.nn import Parameter
+from typing import Callable, Generator, List, Mapping, Optional, Union
 
 from .arc_topk import validate_arc_topk_config
 from .arc_topk_sync import (
@@ -42,6 +43,7 @@ class ArcTopKMuon(Muon):
         arc_eta: float = 0.1,
         arc_seed: int = 42,
         arc_start_compress_step: int = 300,
+        arc_parameter_names: Mapping[Parameter, str] | None = None,
         **kwargs,
     ):
         validate_arc_topk_config(
@@ -59,6 +61,13 @@ class ArcTopKMuon(Muon):
         self._arc_start_compress_step = arc_start_compress_step
         super().__init__(params, distributed_mesh=distributed_mesh, **kwargs)
 
+        if self._process_group is not None and arc_parameter_names is None:
+            raise ValueError(
+                "distributed ArcTopKMuon requires arc_parameter_names from "
+                "model.named_parameters()"
+            )
+        self._arc_parameter_names = dict(arc_parameter_names or {})
+
         for group in self.param_groups:
             if group["algorithm"] != "muon":
                 continue
@@ -73,6 +82,15 @@ class ArcTopKMuon(Muon):
             group["arc_eta"] = arc_eta
             group["arc_seed"] = arc_seed
             group["arc_start_compress_step"] = arc_start_compress_step
+
+        self._arc_task_ids = {}
+        next_task_id = 0
+        for group in self.param_groups:
+            if group["algorithm"] != "muon":
+                continue
+            for task_params in group_parameters_by_shape_dtype(group["params"]):
+                self._arc_task_ids[tuple(map(id, task_params))] = next_task_id
+                next_task_id += 1
 
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
         state = super()._get_or_initialize_state(param, algo)
@@ -91,13 +109,13 @@ class ArcTopKMuon(Muon):
     def _create_ortho_tasks(
         self, param_groups: List[dict]
     ) -> Generator[AsyncTask, None, None]:
-        task_index = 0
         for group in param_groups:
             assert group["algorithm"] == "muon"
             if not all(p.ndim == 2 for p in group["params"]):
                 raise ValueError("ArcTopKMuon only supports 2D matrix parameters")
 
             for params in group_parameters_by_shape_dtype(group["params"]):
+                stable_task_id = self._arc_task_ids[tuple(map(id, params))]
                 states = [self._get_or_initialize_state(p, "muon") for p in params]
                 sync_config = ArcTopKSyncConfig(
                     ratio=group["arc_topk_ratio"],
@@ -124,10 +142,9 @@ class ArcTopKMuon(Muon):
                         cautious_wd=group["cautious_wd"],
                         sync_config=sync_config,
                         step=group["step"],
-                        task_index=task_index,
+                        stable_task_id=stable_task_id,
                     )
                 )
-                task_index += 1
 
     def _create_lion_tasks(
         self, param_groups: List[dict]
@@ -202,7 +219,7 @@ def arc_topk_muon_update_megabatch_async(
     cautious_wd: bool,
     sync_config: ArcTopKSyncConfig,
     step: int,
-    task_index: int,
+    stable_task_id: int,
 ) -> Generator[None, None, None]:
     synchronized_gradients = yield from synchronize_arc_batch_async(
         params=X,
@@ -210,7 +227,7 @@ def arc_topk_muon_update_megabatch_async(
         process_group=process_group,
         config=sync_config,
         step=step,
-        task_index=task_index,
+        stable_task_id=stable_task_id,
     )
 
     updates = muon_update_pre_orthogonalize(

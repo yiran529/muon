@@ -247,7 +247,7 @@ class ArcTopKAdamW(Optimizer):
                         process_group=self._process_group,
                         config=config,
                         step=self._arc_step,
-                        task_index=task_index,
+                        stable_task_id=task_index,
                     )
                 )
                 task_index += 1
@@ -294,7 +294,7 @@ def _arc_adamw_update_async(
     process_group: Optional[ProcessGroup],
     config: ArcTopKSyncConfig,
     step: int,
-    task_index: int,
+    stable_task_id: int,
 ) -> Generator[None, None, None]:
     gradients = yield from synchronize_arc_batch_async(
         params=params,
@@ -302,7 +302,7 @@ def _arc_adamw_update_async(
         process_group=process_group,
         config=config,
         step=step,
-        task_index=task_index,
+        stable_task_id=stable_task_id,
     )
     yield from _adamw_update(params, gradients, states, group)
 

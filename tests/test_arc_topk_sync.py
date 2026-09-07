@@ -96,7 +96,7 @@ def test_arc_logical_bytes_count_dense_and_compressed_payloads():
 
     assert result == ArcTopKLogicalBytes(
         dense_gradient=2 * 10 * 8 * 2,
-        arc_seed=8,
+        arc_seed=0,
         arc_sketch=2 * 10 * 4 * 2,
         arc_selected_values=2 * math.ceil(10 * 0.2) * 8 * 2,
         uncompressed=7 * 8 * 2,
@@ -139,4 +139,5 @@ def test_average_gradients_without_process_group_returns_copies():
 def test_arc_config_defaults_are_valid(step):
     config = ArcTopKSyncConfig()
     assert config.start_compress_step == 0
+    assert config.seed_scheme_version == 1
     assert step >= 0

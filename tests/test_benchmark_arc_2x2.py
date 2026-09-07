@@ -93,6 +93,7 @@ def test_muon_collective_signature_includes_result_sharding():
     )
     assert _collective_signature(dense) == ["ddp_gradient", "muon_result"]
     assert "muon_result" in _collective_signature(arc)
+    assert "arc_seed" not in _collective_signature(arc)
 
 
 def test_result_skeleton_has_schema_and_metadata():
@@ -109,7 +110,7 @@ def test_result_skeleton_has_schema_and_metadata():
 
 def test_communication_result_uses_compressed_step_and_schema_keys():
     result = communication_result(_config(sync="arc"), [[torch.zeros(10, 8, dtype=torch.bfloat16)]], [torch.zeros(7, 8, dtype=torch.bfloat16)])
-    assert result["arc_seed_bytes"] == 8
+    assert result["arc_seed_bytes"] == 0
     assert result["arc_sketch_bytes"] > 0
     assert result["arc_selected_values_bytes"] > 0
 

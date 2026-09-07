@@ -106,8 +106,9 @@ def test_arctopk_optimizer_builds_matrix_and_scalar_groups():
     )
     ddp_model = argparse.Namespace(process_group=None)
 
+    model = _StubModel()
     opt = module.init_arc_topk_optimizer(
-        model=_StubModel(),
+        model=model,
         device_mesh=None,
         ddp_model=ddp_model,
         hp=hp,
@@ -128,6 +129,10 @@ def test_arctopk_optimizer_builds_matrix_and_scalar_groups():
         opt.param_groups[0]["arc_start_compress_step"]
         == hp.arc_start_compress_step
     )
+    expected_names = {
+        parameter: name for name, parameter in model.named_parameters()
+    }
+    assert opt._arc_parameter_names == expected_names
 
 
 def test_m001_yaml_loads_through_shared_parser():
