@@ -4,7 +4,7 @@
 
 **Goal:** Remove per-task seed synchronization from optimizer-side ARC-TopK, then move complete ARC-TopK/EF21M data-parallel gradient synchronization into a real asynchronous DDP communication hook so compressed communication can overlap backward.
 
-**Architecture:** Keep `ArcTopKMuon` as the corrected optimizer-side comparison path and add `arc_seed_mode=broadcast|local_deterministic`, with `broadcast` remaining the compatibility default. The new hook path registers one stateful DDP bucket hook, maps bucket views to stable parameter identities, runs complete EF21M dense/full-support or sparse sketch/selected-value synchronization, returns a `Future[Tensor]`, and then lets ordinary `Muon` consume synchronized gradients. A single cross-bucket tail Future fixes collective order in the first production version. This plan deliberately skips the selective-dense intermediate hook and never uses per-parameter autograd hooks.
+**Architecture:** Delete the per-task seed tensor, broadcast, and `.item()` path and use deterministic local seed derivation everywhere. Keep `ArcTopKMuon` temporarily as the corrected optimizer-side experiment baseline, while the new hook path registers one stateful DDP bucket hook, maps bucket views to stable parameter identities, runs complete EF21M dense/full-support or sparse sketch/selected-value synchronization, returns a `Future[Tensor]`, and lets ordinary `Muon` consume synchronized gradients. A single cross-bucket tail Future fixes collective order in the first production version; this plan skips the selective-dense intermediate hook and never uses per-parameter autograd hooks.
 
 **Tech Stack:** Python 3.10, PyTorch 2.11+ DDP/GradBucket/Future, Gloo, NCCL, DCP, pytest, Bash, existing GPT-350M training and profiler entries.
 
@@ -13,10 +13,9 @@
 ## Global constraints and acceptance boundary
 
 - Do not change production behavior before the corresponding focused test fails for the intended reason.
-- Preserve low-level/optimizer API `arc_seed_mode=broadcast` semantics, including the existing behavior in which rank 0's configured base seed wins. The dedicated training entry uses an unset seed-mode default and derives `optimizer -> broadcast`, `ddp_hook -> local_deterministic`.
-- `local_deterministic` must use fixed integer arithmetic only. It must not use Python `hash()`, global RNG state, rank, a transient bucket index, or callback arrival order.
-- `local_deterministic` performs one initialization/resume fingerprint validation, but performs no seed collective, device-to-host `.item()`, or seed tensor allocation in a training step.
-- `arc_sync_mode=ddp_hook` requires `arc_seed_mode=local_deterministic`; the compatibility `broadcast` seed path is supported only by optimizer-side ARC.
+- Local seed derivation must use fixed integer arithmetic only. It must not use Python `hash()`, global RNG state, rank, a transient bucket index, or callback arrival order.
+- All ARC modes perform one initialization/resume fingerprint validation, but no seed collective, device-to-host `.item()`, or seed tensor allocation in a training step.
+- Differing `base_seed` or task layouts across ranks fail initialization; rank-0 override is intentionally removed.
 - The full hook owns only data-parallel gradient synchronization. Ordinary Muon still owns momentum, orthogonalization, Muon result communication, and parameter updates.
 - With gradient accumulation, only the final micro-batch enables the reducer/hook. The first `N-1` micro-batches keep forward and backward together under `DDP.no_sync()`.
 - Hook mode requires DDP, `find_unused_parameters=False`, a static participating parameter set, and exactly one synchronization role for every optimizer parameter.
@@ -27,47 +26,41 @@
 
 ---
 
-### Task 1: Add explicit seed modes without changing the compatibility path
+### Task 1: Replace seed broadcast with deterministic local derivation
 
 **Files:**
 - Modify: `dion/arc_topk.py`
 - Modify: `dion/arc_topk_sync.py`
 - Modify: `dion/muon_arctopk.py`
-- Modify: `dion/adamw_arctopk.py`
 - Modify: `train_arctopk.py`
 - Modify: `tests/test_arc_topk.py`
 - Modify: `tests/test_arc_topk_distributed.py`
 - Modify: `tests/test_arc_topk_sync.py`
 - Modify: `tests/test_muon_arctopk.py`
 - Modify: `tests/test_train_arctopk.py`
+- Modify: `tests/test_benchmark_arc_2x2.py`
 
 **Interfaces:**
 
 ```python
-ArcSeedMode = Literal["broadcast", "local_deterministic"]
-
-def validate_arc_seed_mode(mode: str) -> None: ...
-
 def derive_arc_seed(*, base_seed: int, step: int, stable_task_id: int) -> int: ...
 
 class ArcTopKSyncConfig:
-    seed_mode: ArcSeedMode = "broadcast"
     seed_scheme_version: int = 1
 
 class ArcTopKMuon(Muon):
-    def __init__(..., arc_seed_mode: ArcSeedMode = "broadcast",
-                 arc_parameter_names: Mapping[Parameter, str] | None = None): ...
+    def __init__(..., arc_parameter_names: Mapping[Parameter, str] | None = None): ...
 ```
 
-`derive_arc_seed` uses the current arithmetic `base_seed + step * 1_000_003 + stable_task_id`, normalized into the range accepted by `torch.Generator.manual_seed`. This preserves the existing projection sequence for ordinary non-negative inputs when all ranks already agree, while making overflow/negative behavior explicit. `ArcTopKMuon` stores `arc_seed_mode` in each Muon group and its state dict. The CLI/config field is nullable `arc_seed_mode`; only the low-level constructor defaults directly to `broadcast`.
+`derive_arc_seed` uses `base_seed + step * 1_000_003 + stable_task_id`, normalized into the range accepted by `torch.Generator.manual_seed`. This preserves the existing projection sequence for normal non-negative inputs when rank configurations agree. Distributed construction requires `arc_parameter_names`, supplied by `train_arctopk.init_arc_topk_optimizer` from `raw_model.named_parameters()`.
 
-- [ ] **Step 1: Write failing validation and deterministic-derivation tests**
+- [ ] **Step 1: Freeze the current same-seed optimizer trajectory**
 
-Add tests asserting that unsupported modes raise, identical triples produce the same integer across processes, changing any component changes the result, standard positive inputs exactly match the historical formula, large and negative base seeds remain valid, and calls do not mutate `torch.random.get_rng_state()`.
+Before changing production code, add a three-step lossy EF21M regression with at least two same-shaped parameters and fixed gradients. Record literal expected projection/support, `h_local/g_local/g_global`, momentum, and parameter tensors from the current implementation when every rank uses the same `base_seed`. This test must pass before the deletion and remain unchanged afterward.
 
-- [ ] **Step 2: Write the failing local-mode primitive test**
+- [ ] **Step 2: Write failing local-seed and no-seed-collective tests**
 
-Instrument `dist.broadcast` and `Tensor.item` around a compressed `arc_topk_ef21m_async` step. Assert that `broadcast` mode retains one seed broadcast, while `local_deterministic` performs neither a seed broadcast nor `.item()` and produces the same projection on two independent invocations. With identical rank base seeds and stable task IDs, run at least three lossy EF21M steps and require local mode to match the broadcast path's support, three compressor states, synchronized gradient, momentum, and parameter trajectory within dtype tolerance.
+Assert identical `(base_seed, step, stable_task_id)` triples produce the same seed without mutating global RNG state; changing any component changes the result; standard inputs match the historical arithmetic; large/negative inputs remain valid. Instrument a compressed `arc_topk_ef21m_async` step and require zero `dist.broadcast`, zero seed-tensor `.item()`, zero `arc/seed` observer events, and `arc_seed_bytes == 0`.
 
 - [ ] **Step 3: Run RED**
 
@@ -79,15 +72,15 @@ uv run --frozen --extra dev pytest \
   tests/test_train_arctopk.py -v
 ```
 
-Expected: fail because `ArcSeedMode`, `derive_arc_seed`, `seed_mode`, and the CLI field do not exist.
+Expected: the frozen trajectory passes; the new focused tests fail because `derive_arc_seed` is absent and the old primitive still broadcasts a device seed.
 
-- [ ] **Step 4: Implement the minimal dual path**
+- [ ] **Step 4: Delete the old seed synchronization path**
 
-Keep the current seed tensor/broadcast/`.item()` code under `broadcast`. Under `local_deterministic`, compute the seed on the host before projection construction and bypass that entire block. Pass `stable_task_id` through `synchronize_arc_batch_async`; for the optimizer route it is the frozen first-seen shape/dtype task index. Distributed local mode requires `arc_parameter_names`, supplied by `train_arctopk.init_arc_topk_optimizer` from `raw_model.named_parameters()`; direct distributed callers that omit it fail before the first step.
+Delete `seed_tensor`, `dist.broadcast`, `arc/seed_wait`, and `seed_tensor.item()` from `arc_topk_ef21m_async`. Compute the integer seed locally before projection construction. Pass `stable_task_id` through `synchronize_arc_batch_async`; for the optimizer route it is the frozen first-seen shape/dtype task index. Direct distributed optimizer callers that omit stable names fail before the first step.
 
-- [ ] **Step 5: Preserve state-dict compatibility**
+- [ ] **Step 5: Replace the rank-0 override contract**
 
-Old checkpoints missing `arc_seed_mode` load as `broadcast`. New state dicts persist the selected mode. Add an explicit migration assertion to `tests/test_muon_arctopk.py`.
+Delete the synthetic low-level test that supplies rank-specific `base_seed` and expects rank 0 to win; the primitive now assumes its caller has validated distributed configuration. Task 2 immediately replaces this coverage with an optimizer/factory-level test requiring inconsistent seed/layout fingerprints to make all ranks raise `ArcTopKLayoutMismatch` before the first training collective. No `arc_seed_mode` field or state-dict migration is introduced.
 
 - [ ] **Step 6: Run GREEN and the existing optimizer regressions**
 
@@ -101,12 +94,13 @@ uv run --frozen --extra dev pytest \
   tests/test_muon_arctopk_distributed.py \
   tests/test_adamw_arctopk.py \
   tests/test_adamw_arctopk_distributed.py \
-  tests/test_train_arctopk.py -v
+  tests/test_train_arctopk.py \
+  tests/test_benchmark_arc_2x2.py -v
 ```
 
 - [ ] **Step 7: Review checkpoint**
 
-Confirm from a profiler/observer unit fixture that local mode reports `arc_seed_bytes == 0` and no `arc/seed` range. Do not yet infer wall-clock improvement.
+Confirm the frozen optimizer trajectory is unchanged, while profiler/observer fixtures report `arc_seed_bytes == 0` and no `arc/seed` range. Do not infer wall-clock improvement yet.
 
 ---
 
@@ -232,7 +226,7 @@ Then implement the minimum functions and replace duplicated state math inside `a
 
 - [ ] **Step 3: Prove optimizer-side behavior did not regress**
 
-Run the full ARC optimizer suite from Task 1. For `broadcast`, require the old distributed literal test to retain rank-0 seed semantics. With identical base seeds and layout, require optimizer `local_deterministic` to match the broadcast projection/support/state trajectory; the hook's parameter-level seed scheme remains a separate, versioned trajectory.
+Run the full ARC optimizer suite from Task 1. Require the optimizer route to match the frozen same-seed projection/support/state trajectory, including the original batched RNG/BMM behavior. The hook's parameter-level seed scheme remains a separate, versioned trajectory and is tested against the EF21M oracle rather than against optimizer-side bit patterns.
 
 ---
 
@@ -424,9 +418,7 @@ class GradientSyncRuntime:
 
 def init_arc_topk_optimizer(...) -> tuple[Optimizer, GradientSyncRuntime]: ...
 
-def resolve_arc_sync_policy(*, arc_sync_mode: ArcSyncMode,
-                            legacy_replicate_mesh_grad_sync: bool | None,
-                            arc_seed_mode: ArcSeedMode) -> bool: ...
+def arc_optimizer_owns_gradient_sync(arc_sync_mode: ArcSyncMode) -> bool: ...
 ```
 
 The shared `train.main` normalizes legacy factories returning only an optimizer to `GradientSyncRuntime(optimizer_owns_gradient_sync=hp.replicate_mesh_grad_sync)`. The ARC factory returns:
@@ -434,13 +426,13 @@ The shared `train.main` normalizes legacy factories returning only an optimizer 
 - `optimizer`: `ArcTopKMuon` + runtime `optimizer_owns_gradient_sync=True`;
 - `ddp_hook`: ordinary `Muon` + registered `ArcTopKDDPState` runtime with `optimizer_owns_gradient_sync=False`.
 
-In the dedicated ARC hyperparameters, make both the legacy `replicate_mesh_grad_sync` and `arc_seed_mode` nullable so “unset” differs from an explicit conflict. `arc_sync_mode` derives gradient ownership and the seed default: optimizer mode derives `broadcast`, hook mode derives `local_deterministic`. Explicit incompatible legacy ownership or explicit `ddp_hook + broadcast` fails, while setting only `arc_sync_mode=ddp_hook` works.
+In the dedicated ARC entry, `arc_sync_mode` is the only user-facing ownership selector. Remove `replicate_mesh_grad_sync` from ARC config files; if the legacy flag is explicitly supplied to `train_arctopk.py`, reject it with a migration message rather than reconciling two sources. Internally derive `optimizer_owns_gradient_sync=True` for optimizer mode and `False` for hook mode. There is no seed-mode field: both routes use local deterministic derivation.
 
 The shared loop calls `runtime.begin_step()` immediately before the first training micro-batch, passes the runtime boolean to `forward_backward_micro_step`, calls `runtime.finish_step()` after backward and before gradient norm/optimizer step, calls `runtime.commit_step()` only after `optimizer.step()` succeeds, and exposes `runtime.checkpoint_state` to checkpointing. This first version supports the current unscaled, no-retry training loop: compressor and Muon steps must be equal after commit, and checkpointing is legal only at that boundary. AMP GradScaler skip/retry behavior is out of scope and must fail fast if later introduced without a runtime abort protocol.
 
 - [ ] **Step 1: Write failing factory and context-policy tests**
 
-Assert exact optimizer class, hook registration count, runtime policy, DDP-only rejection, no `ArcTopKMuon` in hook mode, no hook in optimizer mode, `ddp_hook + broadcast` rejection, setting only the new mode successfully overrides the nullable legacy default, and startup failure for explicitly ambiguous combinations.
+Assert exact optimizer class, hook registration count, runtime policy, DDP-only rejection, no `ArcTopKMuon` in hook mode, no hook in optimizer mode, both modes having zero seed collectives, and rejection of an explicitly supplied legacy ownership flag.
 
 - [ ] **Step 2: Write a failing real two-rank formal-loop test**
 
@@ -526,11 +518,11 @@ uv run --frozen --extra dev pytest \
 
 - [ ] **Step 1: Write failing summary and launcher contract tests**
 
-Extend cells to `dense`, `arc_optimizer`, and `arc_ddp_hook`; rotate all six cell orders across paired repeats rather than always favoring one mode. Add CLI options `--world-size`, `--global-batch-size`, `--gpu-list`, `--exclude-gpus`, `--bucket-cap-mb`, `--arc-seed-mode`, `--timing-warmup-steps`, measured step count, and artifact root. No GPU IDs are hard-coded. Replace `train.py`'s hard-coded step-10 timer reset with `timing_warmup_steps` while keeping 10 as the default; set `num_iterations = timing_warmup_steps + measured_steps` so the terminal validation reports exactly the requested measured window.
+Extend cells to `dense`, `arc_optimizer`, and `arc_ddp_hook`; rotate all six cell orders across paired repeats rather than always favoring one mode. Add CLI options `--world-size`, `--global-batch-size`, `--gpu-list`, `--exclude-gpus`, `--bucket-cap-mb`, `--timing-warmup-steps`, measured step count, and artifact root. No GPU IDs are hard-coded and no seed-mode option exists. Replace `train.py`'s hard-coded step-10 timer reset with `timing_warmup_steps` while keeping 10 as the default; set `num_iterations = timing_warmup_steps + measured_steps` so the terminal validation reports exactly the requested measured window.
 
 - [ ] **Step 2: Implement trace ranges and fail-closed summarization**
 
-Teach `profiler_trace.py` to classify hook dense/sketch/selected-values NCCL explicitly instead of falling through to `ddp_gradient`. Correlate callback-thread ranges with GPU kernels and compute overlap from GPU time intervals, not containment inside the CPU `backward` range. Add a counterexample trace in which ARC communication is entirely inside the backward CPU range but begins after the last backward compute kernel; its computed overlap must be zero. Reject missing rank traces, rank-divergent hook counts/signatures, missing final timings, OOM/timeout, incomplete cells, or local mode containing a seed collective. Keep raw traces as source of truth.
+Teach `profiler_trace.py` to classify hook dense/sketch/selected-values NCCL explicitly instead of falling through to `ddp_gradient`. Correlate callback-thread ranges with GPU kernels and compute overlap from GPU time intervals, not containment inside the CPU `backward` range. Add a counterexample trace in which ARC communication is entirely inside the backward CPU range but begins after the last backward compute kernel; its computed overlap must be zero. Reject missing rank traces, rank-divergent hook counts/signatures, missing final timings, OOM/timeout, incomplete cells, or any ARC cell containing a seed collective. Keep raw traces as source of truth.
 
 - [ ] **Step 3: Run CPU contracts**
 

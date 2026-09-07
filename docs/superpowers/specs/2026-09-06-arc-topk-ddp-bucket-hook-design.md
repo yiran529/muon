@@ -10,7 +10,8 @@
 
 - 2026-09-06 首次独立架构审阅后，补充训练循环现状核验、EF21M full-support 语义、跨 bucket 全局 collective 顺序、rank-local DCP schema 和首版 unused-parameter 支持边界。
 - 2026-09-06 二次独立架构审阅后，补充 dense accumulation 基线、compiled 正式入口、有限精度、Future 生命周期和 checkpoint snapshot 约束；审阅结论为无新增架构阻断。
-- 2026-09-07 已修复并验证 shared training loop 的 `no_sync()` 放置；结合 CM023b profiler，将逐任务 seed broadcast/`.item()` 识别为可独立消除的同步开销。本次路线先提供兼容的本地确定性 seed，再直接实现完整 DDP bucket hook；明确不实施 selective-dense 中间 hook，也不采用 per-parameter autograd hook。
+- 2026-09-07 已修复并验证 shared training loop 的 `no_sync()` 放置；结合 CM023b profiler，将逐任务 seed broadcast/`.item()` 识别为可独立消除的同步开销。本次路线直接删除 seed broadcast，统一使用本地确定性 seed，再实现完整 DDP bucket hook；明确不实施 selective-dense 中间 hook，也不采用 per-parameter autograd hook。
+- 2026-09-07 精简兼容范围：不保留 rank-0 seed override、seed 双模式、legacy ARC 同步所有权配置或跨 optimizer/hook 模式 checkpoint 迁移。optimizer-side `ArcTopKMuon` 仅作为三方实验基线暂时保留。
 - 2026-09-07 Astra 独立审查指出 bucket tail 不隐含本 bucket 梯度的 CUDA stream 可见性、optimizer fingerprint 必须包含真实 task layout。设计据此增加 bucket-ready event/CUDA-aware Future、分路线 fingerprint、fresh DCP load schema 和真实 GPU kernel overlap 验收；结论为修订后可实施。
 
 ## 1. 背景与问题
@@ -295,16 +296,11 @@ bucket views、projection、delta、local selected、averaged selected 和 packi
 
 训练循环在一个 optimizer step 的 backward 开始前，显式调用类似 `arc_state.begin_step(step)` 的接口。hook 调用时捕获该 step 的局部值；step 不按 bucket 自增，避免异步 callback 观察到下一步编号。
 
-增加显式 `arc_seed_mode`：
-
-- `broadcast`：兼容现有 optimizer-side 行为，由 group source 决定 seed，允许各 rank 配置的 `base_seed` 不同；作为底层 API/optimizer 构造器默认值，避免静默改变历史调用语义。
-- `local_deterministic`：不构造 device seed tensor，不执行 seed broadcast，也不调用 `.item()`。每个同步任务的投影 seed 仅由固定整数混合函数、`base_seed`、optimizer step 和稳定任务身份确定，各 rank 本地计算相同值。
-
-专用训练入口的 `arc_seed_mode` 默认值为 unset，由 `arc_sync_mode` 派生：optimizer 模式选择 `broadcast`，hook 模式选择 `local_deterministic`。显式 `ddp_hook + broadcast` 在启动时拒绝。
+所有 ARC 路线统一使用本地确定性 seed：不构造 device seed tensor，不执行 seed broadcast，也不调用 `.item()`。每个同步任务的投影 seed 仅由 `base_seed + optimizer_step * 1_000_003 + stable_task_id` 确定，并规范化到 `torch.Generator.manual_seed` 接受的整数范围。正常非负输入保持历史 rank 配置一致时的投影序列；不再支持不同 rank 配置不同 `base_seed` 后由 rank 0 静默覆盖。
 
 hook 模式的稳定任务身份是稳定参数名/序号；optimizer-side shape/dtype megabatch 模式使用构造期冻结的稳定 batch/task 序号。optimizer fingerprint 必须包含真实执行顺序中的 optimizer group、task、ordered members、shape/dtype 和每组 ARC 配置；只有模型参数表一致并不充分。hook fingerprint 则描述稳定参数角色表，两种 fingerprint 不要求相等。不得使用 Python `hash()`、全局 RNG 状态、rank、临时 bucket index 或 callback 到达顺序。bucket rebuild 不改变某个参数的 seed。两条路线在 `ratio < 1` 时可能因投影分组不同而不消费同一随机序列，因此不要求逐 bit 相同。
 
-使用 `local_deterministic` 的前提是：初始化时对 process group 的有序 rank membership、base seed、ARC 配置、稳定参数/任务表、shape/dtype、角色和 optimizer parameter coverage 生成 canonical fingerprint，并在所有 rank 上做一次一致性校验；不能使用各进程不同的 process-group 对象身份。恢复 checkpoint 时再次校验。不一致立即报错，不能继续训练。该一次性校验不位于训练 step 的关键路径。
+使用本地 seed 的前提是：初始化时对 process group 的有序 rank membership、base seed、ARC 配置、稳定参数/任务表、shape/dtype、角色和 optimizer parameter coverage 生成 canonical fingerprint，并在所有 rank 上做一次一致性校验；不能使用各进程不同的 process-group 对象身份。恢复 checkpoint 时再次校验。不一致立即报错，不能继续训练。该一次性校验不位于训练 step 的关键路径。
 
 这保证 hook 模式自身可重复，但不承诺与旧 shape-batched 路线在 `ratio < 1` 时使用完全相同的随机投影。
 
@@ -339,23 +335,25 @@ checkpoint snapshot 只能在本 optimizer step 的所有 hook Future、Muon 通
 增加显式同步模式，例如：
 
 ```yaml
-arc_sync_mode: optimizer  # 现有 ArcTopKMuon，默认兼容模式
+arc_sync_mode: optimizer  # 现有 ArcTopKMuon，临时实验基线
 # 或
 arc_sync_mode: ddp_hook   # 新路线
 ```
+
+`arc_sync_mode` 是 ARC 专用入口唯一的梯度同步所有权配置。旧 `replicate_mesh_grad_sync` 不再作为 ARC 行为开关；现有 ARC 配置文件迁移到显式 `arc_sync_mode`。seed 没有运行时模式选择，optimizer 与 hook 都使用本地确定性派生。
 
 选择 `ddp_hook` 时：
 
 - 必须将模型包装为 DDP 并在 backward 前注册 hook。
 - optimizer 必须是普通 `Muon`，不能再由 `ArcTopKMuon` 同步梯度，否则会发生双重同步。
 - gradient accumulation 仅让非最后 micro-batch 的 forward 和 backward 使用 `no_sync()`。
-- `replicate_mesh_grad_sync` 不能继续独立决定 DDP context；由 `arc_sync_mode` 派生唯一同步策略，冲突配置立即报错。
+- DDP context 策略仅由 `arc_sync_mode` 派生，不能再由 legacy 字段覆盖。
 - 要求 `find_unused_parameters=False`，首版不支持动态 unused parameters。
 - hook process group 必须与 Muon distributed process group 相同，每个 optimizer 参数必须恰有一个同步角色。
 - 单 rank 训练可以省略 collective，但仍执行完整 EF21M 状态更新。
-- 要求 `arc_seed_mode=local_deterministic`；不在 hook 中重新引入逐参数 seed broadcast。
+- 不在 hook 中重新引入逐参数 seed broadcast。
 
-选择 `optimizer` 时，所有 micro-batch 的 forward/backward 都必须处于 `no_sync()`；当前 corrected shared loop 已满足这一语义。`arc_seed_mode` 可选 `broadcast` 或 `local_deterministic`。除非新路线改变 ARC/EF21M 数学语义，否则仍归入 M001，作为新的同步调度实现，不创建新方法编号。
+选择 `optimizer` 时，所有 micro-batch 的 forward/backward 都必须处于 `no_sync()`；当前 corrected shared loop 已满足这一语义。该路线暂时保留用于与 dense DDP、DDP-hook ARC 做同 workload 性能对照，不作为必须永久维护的公共后端。除非新路线改变 ARC/EF21M 数学语义，否则仍归入 M001，作为新的同步调度实现，不创建新方法编号。
 
 ## 11. 正确性不变量
 
@@ -391,7 +389,7 @@ arc_sync_mode: ddp_hook   # 新路线
 优先用 Gloo CPU 测试控制流和数值正确性：
 
 - 保留历史 backward-only 诊断作为回归特征；验证当前 dense/optimizer/hook 三种 context 策略分别只产生预期 hook 次数。
-- 对 `broadcast` 与 `local_deterministic` 做多步两 rank对照；验证相同配置同轨迹、fingerprint 不一致一致失败，并确认 local 模式没有 `arc/seed` collective 或 `.item()` 路径。
+- 用删除 broadcast 前冻结的同 seed 多步轨迹验证本地派生不改变 optimizer-side projection/support/state；fingerprint 不一致时所有 rank 一致失败，并确认训练 step 中没有 `arc/seed` collective 或 `.item()` 路径。
 - `eta=1, ratio=1` 对照标准 DDP all-reduce；一般 `eta` 对照多步 EF21M oracle。
 - `ratio<1` 不仅验证 rank 一致，还逐项验证 `h_local/g_local/g_global` 和最终参数的 oracle。
 - 两个以上 bucket，人为引入不同 rank 的 prepare/callback 延迟，验证全局 collective 标签、shape、顺序和完成 Future。
@@ -415,13 +413,13 @@ arc_sync_mode: ddp_hook   # 新路线
 - 通信字节、bucket 数、bucket size、gradient accumulation 和压缩率。
 - eager 与正式 `model.compile()` 入口的 bucket-ready 时序、hook trace 和 wall-clock；不能从 eager 骨架直接外推 compiled 路径。
 
-三方对照中的 dense DDP 和 optimizer-side ARC 都必须使用修复后的 accumulation context；两个 ARC 模式统一使用 `local_deterministic`，避免把 seed broadcast 差异误归因于 overlap。历史入口行为和修复后行为分开报告。正式训练还需记录 hook 调用次数和实际 collective signature，排除 dense DDP 与 ARC 双重同步。
+三方对照中的 dense DDP 和 optimizer-side ARC 都必须使用修复后的 accumulation context；两个 ARC 路线统一使用本地确定性 seed。历史入口行为和修复后行为分开报告。正式训练还需记录 hook 调用次数和实际 collective signature，排除 dense DDP 与 ARC 双重同步。
 
 只有 profiler 显示 ARC 通信 GPU kernel 与其后的真实 backward compute GPU kernel 存在时间区间交集，才能声称恢复了 DDP overlap；仅位于 host backward range 内不够，因为 backward 返回前本来就会等待 hook Future。只有端到端 wall-clock 改善，才能声称该路线带来训练加速。专门 benchmark 的单步改善不能自动外推到长训练；数据加载、验证、checkpoint、日志、不同 gradient accumulation/bucket layout 和系统抖动都需分别核对。
 
 ## 13. 分阶段交付
 
-1. 在保留 `broadcast` 默认兼容行为的前提下实现 `local_deterministic` seed、一次性 fingerprint 校验和多步分布式回归；先独立确认 seed collective 与 `.item()` 从关键路径消失。
+1. 删除逐任务 seed tensor、broadcast 与 `.item()`，实现唯一的本地确定性 seed、一次性 fingerprint 校验和多步分布式回归。
 2. 抽离可复用的 ARC 本地数学原语，以多步 EF21M oracle 保持旧 optimizer-side 语义。
 3. 用 dummy payload 实现全局 tail Future、多 bucket、多 collective 的最小骨架；先验证 Gloo/NCCL 顺序、异常传播和 CUDA completion。
 4. 实现 hook state、静态参数角色/fingerprint 和 fail-fast unused 支持边界。
