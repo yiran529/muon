@@ -1,7 +1,8 @@
 """ARC-TopK compression primitives and EF21M state updates."""
 
 import math
-from typing import Generator, List, Optional
+from dataclasses import dataclass
+from typing import Generator, List, Optional, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -10,8 +11,23 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from .collective_observer import observe_collective
 
+if TYPE_CHECKING:
+    from .arc_topk_sync import ArcTopKSyncConfig
+
 
 _TORCH_SEED_MODULUS = 1 << 64
+
+
+@dataclass
+class ArcPreparedBatch:
+    """Collective-free ARC state prepared for full or sparse finalization."""
+
+    tracker_batch: Tensor
+    local_estimate_batch: Tensor
+    global_estimate_batch: Tensor
+    delta_batch: Optional[Tensor]
+    projection_batch: Optional[Tensor]
+    local_sketch_batch: Optional[Tensor]
 
 
 def derive_arc_seed(*, base_seed: int, step: int, stable_task_id: int) -> int:
@@ -127,6 +143,92 @@ def ef21m_apply_delta_(
     global_estimate.add_(averaged_delta.to(dtype=global_estimate.dtype))
 
 
+def prepare_arc_batch(
+    gradient_batch: Tensor,
+    tracker_batch: Tensor,
+    local_estimate_batch: Tensor,
+    global_estimate_batch: Tensor,
+    *,
+    config: "ArcTopKSyncConfig",
+    step: int,
+    projection_batch: Optional[Tensor],
+) -> ArcPreparedBatch:
+    """Update the EF21M tracker and prepare collective-free ARC tensors."""
+
+    if gradient_batch.ndim != 3:
+        raise ValueError("gradient_batch must be a batched 3D tensor")
+    if not (
+        tracker_batch.shape
+        == local_estimate_batch.shape
+        == global_estimate_batch.shape
+        == gradient_batch.shape
+    ):
+        raise ValueError("gradient and EF21M state batches must have equal shapes")
+
+    if step == 1:
+        tracker_batch.copy_(gradient_batch.to(dtype=tracker_batch.dtype))
+    else:
+        ef21m_update_tracker_(tracker_batch, gradient_batch, config.eta)
+
+    is_warmup = step == 1 or step <= config.start_compress_step
+    if is_warmup or (config.ratio == 1.0 and projection_batch is None):
+        return ArcPreparedBatch(
+            tracker_batch=tracker_batch,
+            local_estimate_batch=local_estimate_batch,
+            global_estimate_batch=global_estimate_batch,
+            delta_batch=None,
+            projection_batch=None,
+            local_sketch_batch=None,
+        )
+    if projection_batch is None:
+        raise ValueError("projection_batch is required for sparse ARC preparation")
+
+    delta_batch = tracker_batch - local_estimate_batch
+    return ArcPreparedBatch(
+        tracker_batch=tracker_batch,
+        local_estimate_batch=local_estimate_batch,
+        global_estimate_batch=global_estimate_batch,
+        delta_batch=delta_batch,
+        projection_batch=projection_batch,
+        local_sketch_batch=arc_topk_local_sketch(delta_batch, projection_batch),
+    )
+
+
+def finalize_arc_full_support_(
+    prepared: ArcPreparedBatch,
+    averaged_tracker_batch: Tensor,
+) -> Tensor:
+    """Commit complete tracker support into local and global estimates."""
+
+    prepared.local_estimate_batch.copy_(prepared.tracker_batch)
+    prepared.global_estimate_batch.copy_(
+        averaged_tracker_batch.to(dtype=prepared.global_estimate_batch.dtype)
+    )
+    return prepared.global_estimate_batch
+
+
+def finalize_arc_sparse_(
+    prepared: ArcPreparedBatch,
+    indices: Tensor,
+    local_selected: Tensor,
+    averaged_selected: Tensor,
+) -> Tensor:
+    """Commit selected local and averaged deltas into EF21M estimates."""
+
+    if prepared.delta_batch is None:
+        raise ValueError("sparse finalization requires a prepared delta batch")
+    rows = prepared.tracker_batch.shape[1]
+    local_compressed = scatter_rows(local_selected, indices, rows)
+    averaged_compressed = scatter_rows(averaged_selected, indices, rows)
+    ef21m_apply_delta_(
+        prepared.local_estimate_batch,
+        prepared.global_estimate_batch,
+        local_compressed,
+        averaged_compressed,
+    )
+    return prepared.global_estimate_batch
+
+
 def arc_topk_ef21m_async(
     gradients: List[Tensor],
     trackers: List[Tensor],
@@ -168,21 +270,34 @@ def arc_topk_ef21m_async(
         local_estimate_batch = torch.stack(local_estimates)
         global_estimate_batch = torch.stack(global_estimates)
 
-    with record_function("arc/ef21m"):
-        if step == 1:
-            tracker_batch.copy_(gradient_batch)
-        else:
-            ef21m_update_tracker_(tracker_batch, gradient_batch, eta)
-
     world_size = dist.get_world_size(process_group) if process_group is not None else 1
     if step == 1 or step <= start_compress_step:
-        local_estimate_batch.copy_(tracker_batch)
-        global_estimate_batch.copy_(tracker_batch)
+        from .arc_topk_sync import ArcTopKSyncConfig
+
+        with record_function("arc/ef21m"):
+            prepared = prepare_arc_batch(
+                gradient_batch,
+                tracker_batch,
+                local_estimate_batch,
+                global_estimate_batch,
+                config=ArcTopKSyncConfig(
+                    ratio=ratio,
+                    projection_rank=projection_rank,
+                    eta=eta,
+                    seed=base_seed,
+                    start_compress_step=start_compress_step,
+                ),
+                step=step,
+                projection_batch=None,
+            )
+        averaged_tracker_batch = tracker_batch.clone()
         if process_group is not None and world_size > 1:
-            observe_collective("arc/dense_uncompressed", "all_reduce", global_estimate_batch)
+            observe_collective(
+                "arc/dense_uncompressed", "all_reduce", averaged_tracker_batch
+            )
             with record_function("arc/dense_uncompressed"):
                 work = dist.all_reduce(
-                    global_estimate_batch,
+                    averaged_tracker_batch,
                     op=dist.ReduceOp.SUM,
                     group=process_group,
                     async_op=True,
@@ -190,7 +305,10 @@ def arc_topk_ef21m_async(
             yield
             with record_function("arc/dense_uncompressed_wait"):
                 work.wait()
-            global_estimate_batch.div_(world_size)
+            averaged_tracker_batch.div_(world_size)
+
+        with record_function("arc/ef21m"):
+            finalize_arc_full_support_(prepared, averaged_tracker_batch)
 
         torch._foreach_copy_(trackers, list(tracker_batch.unbind(0)))
         torch._foreach_copy_(local_estimates, list(local_estimate_batch.unbind(0)))
@@ -203,7 +321,6 @@ def arc_topk_ef21m_async(
         stable_task_id=stable_task_id,
     )
 
-    delta_batch = tracker_batch - local_estimate_batch
     rows, columns = shape
     with record_function("arc/projection"):
         projection = make_gaussian_projection(
@@ -214,8 +331,27 @@ def arc_topk_ef21m_async(
             device=gradient_batch.device,
             dtype=gradient_batch.dtype,
         )
+    from .arc_topk_sync import ArcTopKSyncConfig
+
+    with record_function("arc/ef21m"):
+        prepared = prepare_arc_batch(
+            gradient_batch,
+            tracker_batch,
+            local_estimate_batch,
+            global_estimate_batch,
+            config=ArcTopKSyncConfig(
+                ratio=ratio,
+                projection_rank=projection_rank,
+                eta=eta,
+                seed=base_seed,
+                start_compress_step=start_compress_step,
+            ),
+            step=step,
+            projection_batch=projection,
+        )
     with record_function("arc/sketch_compute"):
-        global_sketch = arc_topk_local_sketch(delta_batch, projection)
+        global_sketch = prepared.local_sketch_batch
+        assert global_sketch is not None
     if process_group is not None and world_size > 1:
         observe_collective("arc/sketch", "all_reduce", global_sketch)
         with record_function("arc/sketch"):
@@ -234,7 +370,8 @@ def arc_topk_ef21m_async(
     with record_function("arc/topk"):
         indices = arc_topk_support(global_sketch, k)
     with record_function("arc/gather"):
-        local_selected = gather_rows(delta_batch, indices)
+        assert prepared.delta_batch is not None
+        local_selected = gather_rows(prepared.delta_batch, indices)
     averaged_selected = local_selected.clone()
     if process_group is not None and world_size > 1:
         observe_collective("arc/selected_values", "all_reduce", averaged_selected)
@@ -250,15 +387,12 @@ def arc_topk_ef21m_async(
             work.wait()
         averaged_selected.div_(world_size)
 
-    with record_function("arc/scatter"):
-        local_compressed = scatter_rows(local_selected, indices, rows)
-        averaged_compressed = scatter_rows(averaged_selected, indices, rows)
     with record_function("arc/ef21m"):
-        ef21m_apply_delta_(
-            local_estimate_batch,
-            global_estimate_batch,
-            local_compressed,
-            averaged_compressed,
+        finalize_arc_sparse_(
+            prepared,
+            indices,
+            local_selected,
+            averaged_selected,
         )
 
     with record_function("arc/state_copy"):
