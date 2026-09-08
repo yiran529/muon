@@ -57,10 +57,10 @@ def _validate_plan_completeness(artifact_root: Path, cells: list[dict]) -> None:
             signature = (rank["bucket_count"],) + tuple(
                 (
                     item["category"],
-                    item["launch_count"],
+                    item["operation"],
                     item["message_bytes"],
                 )
-                for item in rank["collectives"]
+                for item in rank["collective_launches"]
                 if item["category"].startswith("arc_hook_")
             )
             signatures.append(signature)

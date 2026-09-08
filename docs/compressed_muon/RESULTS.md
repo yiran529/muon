@@ -34,7 +34,7 @@
 
 ## CM024：本地 seed 与异步 DDP bucket hook（2026-09-08）
 
-CM024 的 CPU correctness gate 为 `192 passed, 0 failed, 0 skipped`；两卡 NCCL hook stress 为 `2 passed`，三模式正式入口 smoke 为 `1 passed`。三卡 GPT-350M、BF16、compile、seq 1024、GA256 的 5/25/50 MiB attribution scan 均为正常 NCCL、每 cell 三份 rank trace、unattributed fraction 0，且没有 seed collective：
+CM024 Task 11 在 compatible-shape batching 之前的 CPU correctness gate 为 `192 passed, 0 failed, 0 skipped`；两卡 NCCL hook stress 为 `2 passed`，三模式正式入口 smoke 为 `1 passed`。三卡 GPT-350M、BF16、compile、seq 1024、GA256 的 5/25/50 MiB attribution scan 均为正常 NCCL、每 cell 三份 rank trace、unattributed fraction 0，且没有 seed collective：
 
 | bucket | hook ARC/backward GPU overlap | hook exposed gradient tail | optimizer ARC tail | hook profile window |
 |---:|---:|---:|---:|---:|
@@ -54,6 +54,8 @@ CM024 的 CPU correctness gate 为 `192 passed, 0 failed, 0 skipped`；两卡 NC
 | optimizer ARC | 262.68±4.71 ms (1.79%) | 31.2k token/s | 189.572 ms | 0 | 88.409 ms |
 | DDP-hook ARC | 271.38±3.48 ms (1.28%) | 30.2k token/s | 205.512 ms | 14.717 ms | 0.586 ms |
 
-以完整 paired block 为统计单位，hook 相对 dense 平均快 `21.12%`，三样本穷举 paired bootstrap 区间为 `[20.47%, 21.99%]`；hook 相对 optimizer ARC 平均慢 `3.32%`，区间为慢 `[2.61%, 3.96%]`。因此 CM024 支持“hook 恢复局部 overlap 并几乎消除同步尾部”，但不支持“hook 比保留的 optimizer-side ARC 更快”。GA256 中局部几十毫秒收益被约 9.2 秒完整 step 稀释；GA4 下 ARC 相对 dense 的收益显现，但第一版 hook 的 per-parameter dispatch、更多 collective launch 与串行 bucket chain 仍有成本。seq 与 batch 同时变化，所以 GA4 结果是 workload sensitivity，不是单变量 GA 消融，也不用于训练质量结论。
+以完整 paired block 为统计单位，hook 相对 dense 平均快 `21.12%`，三样本穷举 paired bootstrap 区间为 `[20.47%, 21.99%]`；hook 相对 optimizer ARC 平均慢 `3.32%`，区间为慢 `[2.61%, 3.96%]`。因此 CM024 支持“hook 恢复局部 overlap 并几乎消除同步尾部”，但不支持“hook 比保留的 optimizer-side ARC 更快”。GA256 中局部几十毫秒收益被约 9.2 秒完整 step 稀释；GA4 下 ARC 相对 dense 的收益显现，但 batching 前第一版 hook 的 per-parameter dispatch、更多 collective launch 与串行 bucket chain 仍有成本。seq 与 batch 同时变化，所以 GA4 结果是 workload sensitivity，不是单变量 GA 消融，也不用于训练质量结论。
 
 作为后续优化，sparse hook 在 bucket 内按兼容 shape/dtype 批处理，同时保留每参数 stable seed、EF21M state、collective 顺序、Future chain 和 checkpoint schema。两卡同拓扑短 A/B 中，本地 ARC kernel 数从约 `2151` 降至 `803`；singleton 单次 hook/optimizer 劣势为 `12.34%`，batched 三组为平均慢 `6.87%`。但 batched stack/state-copy 使本地 ARC GPU interval 从约 18 ms 增至约 42 ms，故该结果只证明 dispatch 数下降和相对差距缩小，不证明已消除 hook overhead。下一研究点是持久化 grouped state/workspace 或减少 stack/copy，而不是重新引入 seed collective。
+
+Task 12 在 batching 后的最终 HEAD 上运行方案指定的完整 repository-relevant suite，结果为 `178 passed, 0 failed, 0 skipped`（15 warnings，含两项审查修复的新增回归）。独立审查未发现 hook 的 Critical/Important 正确性问题；审查发现的两项 profiler evidence 问题已修正：跨 rank 校验现在比较按 launch 时间排序的 `(category, operation, bytes)` 序列，而非仅比较类别聚合值；backward compute 只接受关联到 `final_backward` 内 CPU op 的 GPU kernel，未关联 kernel 视为 unknown。用严格 parser 重新解析 5/25/50 MiB scan、四卡 100 MiB confirmation 和两卡 batched confirmation 后，所有有序 signature 均一致，上表及 batched run 的 overlap/tail 数值不变。最终 HEAD 的两卡 NCCL hook stress 与三模式正式入口 smoke 另为 `3 passed`（14 warnings）。

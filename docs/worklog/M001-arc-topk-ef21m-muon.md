@@ -709,3 +709,11 @@ Task 11 完整 CPU gate 为 `192 passed`；两卡 NCCL stress `2 passed`，新�
 TDD 的 CPU profiler fixture 使用 `shape A, B, A` 的 interleaved bucket：旧实现 `aten::bmm=3` 按预集失败，新实现 `bmm/topk/gather=2`，同时三类 EF21M state、support 和原 bucket offset 与逐参数 stable-seed oracle 一致。同-shape 两 rank Gloo oracle 验证压缩 payload 和普通 Muon 参数一致；最终相关 CPU/Gloo/Future/checkpoint suite 为 `59 passed`，GPU 2/3 上 NCCL/正式入口为 `3 passed`。独立 code review 未发现 Critical/Important 问题。
 
 两卡、seq512、GA4、100 MiB 的同拓扑短 A/B 显示本地 hook kernel 数从约 `2151` 降至 `803`。singleton 单次 hook/optimizer ratio 为 `1.1234`；batched 三组 hook 为 `272.88±4.43 ms (CV 1.62%)`，optimizer 为 `255.35±3.35 ms (1.31%)`，即 hook 仍平均慢 `6.87%`，paired bootstrap 区间为慢 `[5.95%, 7.63%]`。batching 同时把本地 ARC GPU interval 从约 18 ms 增至约 42 ms，表明大 tensor stack/state copy 抵消了部分 launch 减少。该优化保留，因为它正确地降低 dispatch 并在单次同拓扑基线中缩小相对差距；下一步若继续优化，应优先研究持久 grouped state/workspace 或减少 stack/copy，不能把本结果表述为 hook 已反超 optimizer。
+
+## 2026-09-08：Task 12 最终验证与 integration boundary
+
+compatible-shape batching 后，在最终 HEAD 上重新运行方案列出的完整 repository-relevant suite，结果为 `178 passed, 0 failed, 0 skipped`（15 warnings，含两项审查修复的新增回归），因此与 Task 11 batching 前的 `192 passed` gate 明确分开。最终 HEAD 的两卡 NCCL hook stress 与三模式正式入口 smoke 另为 `3 passed`（14 warnings）。生产 hook 关键路径静态检查没有 `Work.wait`、`torch.cuda.synchronize`、Tensor `.item()`、host polling 或 seed collective。
+
+独立最终审查未发现 hook collective ordering、Future completion/exception、tensor lifetime、EF21M state、gradient accumulation ownership、rank-local checkpoint 等方面的 Critical/Important 正确性缺陷。审查指出 profiler 的 rank signature 曾只比较类别聚合值而不保留 launch 顺序，且 backward compute 判定仍允许未关联 GPU kernel 仅凭 host 时间包含关系进入 overlap。两项均按 red-green 修正：parser 现在输出并校验按时间排序的 `(category, operation, bytes)` launch 序列；只有关联 CPU op 位于 `final_backward` 内、且不属于 hook-local range 的 GPU kernel才算 genuine backward compute，未关联 kernel 视为 unknown。
+
+严格 parser 重新解析三卡 5/25/50 MiB scan、四卡 100 MiB confirmation 和两卡 batched confirmation 后，所有 artifact 的跨 rank 有序 launch signature 一致，既有 overlap/tail 数值不变。integration boundary 保持不变：保留 optimizer-side ARC 作为实验对照，DDP hook 继续由 `arc_sync_mode=ddp_hook` 显式启用；当前证据证明局部 overlap 恢复和 dense-relative 收益，但没有通过相对 optimizer-side ARC 的 wall-clock acceptance。下一性能问题是 grouped state/workspace 的 stack/copy 与 bucket scheduling，而不是 seed 或新的 collective 微优化。

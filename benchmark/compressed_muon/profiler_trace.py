@@ -317,10 +317,6 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
                 for cpu_event in correlated_cpu_events
             )
             is_backward_compute = any(
-                backward[1] <= start and end <= backward[2]
-                for backward in backward_ranges
-            )
-            is_backward_compute = is_backward_compute or any(
                 any(
                     backward[1] <= float(cpu_event.get("ts", 0.0))
                     and float(cpu_event.get("ts", 0.0)) + _duration(cpu_event) <= backward[2]
@@ -333,16 +329,22 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
     launch_metrics: dict[str, dict[str, int]] = defaultdict(
         lambda: {"count": 0, "message_bytes": 0}
     )
+    collective_launches = []
     for category, _start, _end, _corr, range_event in ranges:
         if category not in _COLLECTIVE_CATEGORIES:
             continue
         if "/payload " not in str(range_event.get("name", "")):
             continue
+        message_bytes = _numeric_arg(range_event, "bytes")
         launch_metrics[category]["count"] += 1
-        launch_metrics[category]["message_bytes"] += _numeric_arg(
-            range_event,
-            "bytes",
-        )
+        launch_metrics[category]["message_bytes"] += message_bytes
+        collective_launches.append({
+            "category": category,
+            "operation": "broadcast" if category == "arc_seed" else "all_reduce",
+            "message_bytes": message_bytes,
+            "start_us": _start,
+        })
+    collective_launches.sort(key=lambda item: item["start_us"])
 
     collectives = []
     for category in sorted(groups):
@@ -402,6 +404,7 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
             else None
         ),
         "collectives": collectives,
+        "collective_launches": collective_launches,
     }
 
 
