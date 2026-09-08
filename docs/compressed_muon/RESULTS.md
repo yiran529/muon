@@ -59,3 +59,18 @@ CM024 Task 11 在 compatible-shape batching 之前的 CPU correctness gate 为 `
 作为后续优化，sparse hook 在 bucket 内按兼容 shape/dtype 批处理，同时保留每参数 stable seed、EF21M state、collective 顺序、Future chain 和 checkpoint schema。两卡同拓扑短 A/B 中，本地 ARC kernel 数从约 `2151` 降至 `803`；singleton 单次 hook/optimizer 劣势为 `12.34%`，batched 三组为平均慢 `6.87%`。但 batched stack/state-copy 使本地 ARC GPU interval 从约 18 ms 增至约 42 ms，故该结果只证明 dispatch 数下降和相对差距缩小，不证明已消除 hook overhead。下一研究点是持久化 grouped state/workspace 或减少 stack/copy，而不是重新引入 seed collective。
 
 Task 12 在 batching 后的最终 HEAD 上运行方案指定的完整 repository-relevant suite，结果为 `178 passed, 0 failed, 0 skipped`（15 warnings，含两项审查修复的新增回归）。独立审查未发现 hook 的 Critical/Important 正确性问题；审查发现的两项 profiler evidence 问题已修正：跨 rank 校验现在比较按 launch 时间排序的 `(category, operation, bytes)` 序列，而非仅比较类别聚合值；backward compute 只接受关联到 `final_backward` 内 CPU op 的 GPU kernel，未关联 kernel 视为 unknown。用严格 parser 重新解析 5/25/50 MiB scan、四卡 100 MiB confirmation 和两卡 batched confirmation 后，所有有序 signature 均一致，上表及 batched run 的 overlap/tail 数值不变。最终 HEAD 的两卡 NCCL hook stress 与三模式正式入口 smoke 另为 `3 passed`（14 warnings）。
+
+## CM025：四卡 batched hook bucket-cap sensitivity（2026-09-08）
+
+保持 GPT-350M、4 GPU、BF16、compile、seq 512、global batch 16、device batch 1、GA4 和 ARC 数学配置不变，对 64/80/120/160/256/384 MiB 各运行单个 20 warmup + 50 measured cell，并串行运行同期 dense/optimizer ARC 各一次。全部 cell exit 0、各有四份 rank trace，有序 collective signature 一致且没有 seed collective。同期 dense 为 `316.69 ms`，optimizer ARC 为 `267.58 ms`。
+
+| bucket cap | DDP buckets | sketch / selected launches | step average | ARC/backward overlap | exposed gradient tail | profile window |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 MiB | 17 | 15 / 15 | 282.80 ms | 12.094 ms | 26.522 ms | 192.405 ms |
+| 80 MiB | 14 | 12 / 12 | 280.57 ms | 16.466 ms | 35.638 ms | 194.242 ms |
+| 120 MiB | 9 | 8 / 8 | 271.91 ms | 13.353 ms | 29.755 ms | 188.165 ms |
+| 160 MiB | 8 | 6 / 6 | **269.78 ms** | 15.634 ms | 34.390 ms | 197.803 ms |
+| 256 MiB | 5 | 5 / 5 | 280.14 ms | 14.064 ms | 36.754 ms | 206.210 ms |
+| 384 MiB | 4 | 4 / 4 | 273.72 ms | 13.507 ms | 0.149 ms | 198.862 ms |
+
+160 MiB 是本次单次扫描的最优点，相对同期 dense 快 `14.81%`，相对 optimizer ARC 慢 `0.82%`。结果不是随 bucket 增大单调改善：更大的 bucket 继续减少 launch 和本地 prepare/Top-K/finalize，但会改变 ready 时机、collective duration 和 overlap；384 MiB 即使只有 4/4 次压缩 collective 且 trace tail 接近零，完整 step 仍慢于 160 MiB。因此 exposed tail 或 collective 次数都不能单独预测 wall-clock。每个 cell 仅一次，本节只用于选择候选参数，不作稳定反超或统计显著性结论。

@@ -717,3 +717,18 @@ compatible-shape batching 后，在最终 HEAD 上重新运行方案列出的完
 独立最终审查未发现 hook collective ordering、Future completion/exception、tensor lifetime、EF21M state、gradient accumulation ownership、rank-local checkpoint 等方面的 Critical/Important 正确性缺陷。审查指出 profiler 的 rank signature 曾只比较类别聚合值而不保留 launch 顺序，且 backward compute 判定仍允许未关联 GPU kernel 仅凭 host 时间包含关系进入 overlap。两项均按 red-green 修正：parser 现在输出并校验按时间排序的 `(category, operation, bytes)` launch 序列；只有关联 CPU op 位于 `final_backward` 内、且不属于 hook-local range 的 GPU kernel才算 genuine backward compute，未关联 kernel 视为 unknown。
 
 严格 parser 重新解析三卡 5/25/50 MiB scan、四卡 100 MiB confirmation 和两卡 batched confirmation 后，所有 artifact 的跨 rank 有序 launch signature 一致，既有 overlap/tail 数值不变。integration boundary 保持不变：保留 optimizer-side ARC 作为实验对照，DDP hook 继续由 `arc_sync_mode=ddp_hook` 显式启用；当前证据证明局部 overlap 恢复和 dense-relative 收益，但没有通过相对 optimizer-side ARC 的 wall-clock acceptance。下一性能问题是 grouped state/workspace 的 stack/copy 与 bucket scheduling，而不是 seed 或新的 collective 微优化。
+
+## 2026-09-08：CM025 四卡 bucket-cap 单次扩展扫描
+
+按用户要求，保持 batched hook 的 GPT-350M、4 GPU、BF16、compile、seq512、global batch16、device batch1、GA4、seed42、ratio0.2、projection rank4、eta0.1、compression start0 不变。controller 在 GPU 2/3/4/6 上串行执行同期 dense/optimizer ARC 各一次，以及 hook 的 64/80/120/160/256/384 MiB 各一次；每 cell 为 20 warmup + 50 measured steps并采集一个 final-microstep/optimizer trace。所有 8 个 cell exit 0，各生成 4 份 rank trace，严格 summary 通过 rank set、有序 collective signature、seed collective、日志和最终 timing gate。产物位于 `artifacts/compressed_muon/CM025-arc-hook-bucket-cap-scan-ws4-single/`。
+
+| cap | buckets | sketch/selected | step | overlap | exposed tail | profile window |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 MiB | 17 | 15/15 | 282.80 ms | 12.094 ms | 26.522 ms | 192.405 ms |
+| 80 MiB | 14 | 12/12 | 280.57 ms | 16.466 ms | 35.638 ms | 194.242 ms |
+| 120 MiB | 9 | 8/8 | 271.91 ms | 13.353 ms | 29.755 ms | 188.165 ms |
+| 160 MiB | 8 | 6/6 | 269.78 ms | 15.634 ms | 34.390 ms | 197.803 ms |
+| 256 MiB | 5 | 5/5 | 280.14 ms | 14.064 ms | 36.754 ms | 206.210 ms |
+| 384 MiB | 4 | 4/4 | 273.72 ms | 13.507 ms | 0.149 ms | 198.862 ms |
+
+同期 dense 为 316.69 ms，optimizer ARC 为 267.58 ms；160 MiB hook 单次最快，相对 dense 快 14.81%，相对 optimizer ARC 慢 0.82%。从 64 增至 160 MiB 时，bucket/collective 与本地 prepare/Top-K/finalize 开销明显下降；继续增至 256/384 MiB 没有单调改善完整 step，表明更晚 bucket-ready、更大 collective/workspace 和资源重叠也参与关键路径。384 MiB 的 exposed tail 接近零但仍非最快，进一步说明 tail 不能单独作为选择标准。由于每 cell 只有一次且没有轮换/repeat，本结果只把 160 MiB 提升为后续确认候选，不支持 hook 已稳定追平或反超 optimizer ARC。
