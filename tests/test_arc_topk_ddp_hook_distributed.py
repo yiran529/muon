@@ -166,7 +166,7 @@ class _SparseControlledGradientModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.first = torch.nn.Parameter(torch.zeros(3, 2))
-        self.second = torch.nn.Parameter(torch.zeros(2, 3))
+        self.second = torch.nn.Parameter(torch.zeros(3, 2))
         self.dense = torch.nn.Parameter(torch.zeros(2))
 
     def forward(self, first_source, second_source, dense_source):
@@ -180,7 +180,7 @@ class _SparseControlledGradientModel(torch.nn.Module):
 def _sparse_gradients(rank, step):
     return (
         torch.arange(6.0).reshape(3, 2) + step + 2 * rank,
-        torch.arange(6.0).reshape(2, 3) + 2 * step + 3 * rank,
+        torch.arange(6.0).reshape(3, 2) + 2 * step + 3 * rank,
         torch.tensor([step + rank, 2 * step - rank], dtype=torch.float32),
     )
 
@@ -317,16 +317,21 @@ def _sparse_worker(rank, world_size, port):
                 torch.testing.assert_close(gathered[0], gathered[1])
             optimizer.zero_grad(set_to_none=True)
 
-        signature = [(event.category, event.bytes) for event in observer.events]
-        assert signature == [
+        signature = [
+            (event.category, event.bytes)
+            for event in observer.events
+            if event.category.startswith("arc_hook/")
+        ]
+        expected_signature = [
             ("arc_hook/dense", 56),
             ("arc_hook/dense", 8),
-            ("arc_hook/sketch", 40),
-            ("arc_hook/selected_values", 28),
+            ("arc_hook/sketch", 48),
+            ("arc_hook/selected_values", 32),
             ("arc_hook/dense", 8),
-            ("arc_hook/sketch", 40),
-            ("arc_hook/selected_values", 28),
+            ("arc_hook/sketch", 48),
+            ("arc_hook/selected_values", 32),
         ]
+        assert signature == expected_signature, signature
         assert all(event.category != "arc/seed" for event in observer.events)
     finally:
         set_active_observer(None)

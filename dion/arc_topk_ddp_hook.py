@@ -15,6 +15,7 @@ from torch.profiler import record_function
 
 from .arc_topk_sync import ArcTopKSyncConfig
 from .arc_topk import (
+    ArcPreparedBatch,
     arc_topk_support,
     derive_arc_seed,
     finalize_arc_full_support_,
@@ -64,6 +65,17 @@ class BucketContext:
     previous_tail: torch.futures.Future
     completion_future: torch.futures.Future
     retained: list[Any] = field(default_factory=list)
+
+
+@dataclass
+class _SparseBucketGroup:
+    gradients: tuple[Tensor, ...]
+    parameter_states: tuple[ArcParameterState, ...]
+    prepared: ArcPreparedBatch
+    rows: int
+    columns: int
+    support_batch: Optional[Tensor] = None
+    local_selected_batch: Optional[Tensor] = None
 
 
 def _future_devices(device: torch.device) -> list[torch.device]:
@@ -671,44 +683,82 @@ def _launch_sparse_bucket(
         if dense_views
         else context.buffer.new_empty(0)
     )
-    prepared_entries = []
+    grouped_entries: dict[
+        tuple[torch.Size, torch.dtype, torch.device, torch.dtype],
+        list[tuple[Tensor, ArcParameterState]],
+    ] = {}
+    for gradient, parameter_state in zip(
+        context.gradients,
+        context.parameter_states,
+    ):
+        if parameter_state is None:
+            continue
+        key = (
+            gradient.shape,
+            gradient.dtype,
+            gradient.device,
+            parameter_state.h_local.dtype,
+        )
+        grouped_entries.setdefault(key, []).append((gradient, parameter_state))
+
+    prepared_groups = []
     sketch_parts = []
     with record_function("arc_hook/local_prepare"):
-        for gradient, parameter_state in zip(
-            context.gradients,
-            context.parameter_states,
-        ):
-            if parameter_state is None:
-                continue
-            rows, columns = parameter_state.h_local.shape
-            seed = derive_arc_seed(
-                base_seed=state.config.seed,
-                step=context.step,
-                stable_task_id=parameter_state.spec.stable_id,
+        for entries in grouped_entries.values():
+            gradients = tuple(gradient for gradient, _parameter_state in entries)
+            parameter_states = tuple(
+                parameter_state for _gradient, parameter_state in entries
             )
-            projection = make_gaussian_projection(
-                1,
-                columns,
-                state.config.projection_rank,
-                seed=seed,
-                device=gradient.device,
-                dtype=gradient.dtype,
+            rows, columns = parameter_states[0].h_local.shape
+            projections = [
+                make_gaussian_projection(
+                    1,
+                    columns,
+                    state.config.projection_rank,
+                    seed=derive_arc_seed(
+                        base_seed=state.config.seed,
+                        step=context.step,
+                        stable_task_id=parameter_state.spec.stable_id,
+                    ),
+                    device=gradient.device,
+                    dtype=gradient.dtype,
+                )
+                for gradient, parameter_state in entries
+            ]
+            tracker_batch = torch.stack(
+                [parameter_state.h_local for parameter_state in parameter_states]
             )
             prepared = prepare_arc_batch(
-                gradient.unsqueeze(0),
-                parameter_state.h_local.unsqueeze(0),
-                parameter_state.g_local.unsqueeze(0),
-                parameter_state.g_global.unsqueeze(0),
+                torch.stack(gradients),
+                tracker_batch,
+                torch.stack(
+                    [parameter_state.g_local for parameter_state in parameter_states]
+                ),
+                torch.stack(
+                    [parameter_state.g_global for parameter_state in parameter_states]
+                ),
                 config=state.config,
                 step=context.step,
-                projection_batch=projection,
+                projection_batch=torch.cat(projections, dim=0),
             )
             assert prepared.local_sketch_batch is not None
-            prepared_entries.append((prepared, gradient, parameter_state, rows, columns))
+            torch._foreach_copy_(
+                [parameter_state.h_local for parameter_state in parameter_states],
+                list(tracker_batch.unbind(0)),
+            )
+            prepared_groups.append(
+                _SparseBucketGroup(
+                    gradients=gradients,
+                    parameter_states=parameter_states,
+                    prepared=prepared,
+                    rows=rows,
+                    columns=columns,
+                )
+            )
             sketch_parts.append(prepared.local_sketch_batch.reshape(-1))
 
     final = context.completion_future
-    if not prepared_entries:
+    if not prepared_groups:
         context.retained.append(dense_buffer)
 
         def finish_dense_only(completed: torch.futures.Future) -> Tensor:
@@ -742,7 +792,7 @@ def _launch_sparse_bucket(
 
     sketch_buffer = torch.cat(sketch_parts)
     context.retained.extend(
-        [dense_buffer, sketch_buffer, prepared_entries, sketch_parts]
+        [dense_buffer, sketch_buffer, prepared_groups, sketch_parts]
     )
 
     def fail(exc: BaseException) -> None:
@@ -755,25 +805,39 @@ def _launch_sparse_bucket(
             if state.world_size > 1:
                 averaged_buffer.div_(state.world_size)
             offset = 0
-            for prepared, gradient, parameter_state, rows, columns in prepared_entries:
-                assert prepared.delta_batch is not None
-                support = parameter_state.last_support
-                assert support is not None
-                count = support.numel() * columns
+            for group in prepared_groups:
+                assert group.support_batch is not None
+                assert group.local_selected_batch is not None
+                count = group.support_batch.numel() * group.columns
                 averaged_selected = averaged_buffer[offset : offset + count].view(
-                    1, support.numel(), columns
-                )
-                local_selected = gather_rows(
-                    prepared.delta_batch,
-                    support.unsqueeze(0),
+                    len(group.gradients),
+                    group.support_batch.shape[1],
+                    group.columns,
                 )
                 finalize_arc_sparse_(
-                    prepared,
-                    support.unsqueeze(0),
-                    local_selected,
+                    group.prepared,
+                    group.support_batch,
+                    group.local_selected_batch,
                     averaged_selected,
                 )
-                gradient.copy_(parameter_state.g_global)
+                torch._foreach_copy_(
+                    [
+                        parameter_state.g_local
+                        for parameter_state in group.parameter_states
+                    ],
+                    list(group.prepared.local_estimate_batch.unbind(0)),
+                )
+                torch._foreach_copy_(
+                    [
+                        parameter_state.g_global
+                        for parameter_state in group.parameter_states
+                    ],
+                    list(group.prepared.global_estimate_batch.unbind(0)),
+                )
+                torch._foreach_copy_(
+                    list(group.gradients),
+                    list(group.prepared.global_estimate_batch.unbind(0)),
+                )
                 offset += count
         return context.buffer
 
@@ -785,19 +849,35 @@ def _launch_sparse_bucket(
             sketch_offset = 0
             local_selected_parts = []
             with record_function("arc_hook/topk"):
-                for prepared, _gradient, parameter_state, rows, _columns in prepared_entries:
-                    sketch_count = rows * state.config.projection_rank
+                for group in prepared_groups:
+                    sketch_count = (
+                        len(group.gradients)
+                        * group.rows
+                        * state.config.projection_rank
+                    )
                     parameter_sketch = averaged_sketch[
                         sketch_offset : sketch_offset + sketch_count
-                    ].view(1, rows, state.config.projection_rank)
-                    support = arc_topk_support(
+                    ].view(
+                        len(group.gradients),
+                        group.rows,
+                        state.config.projection_rank,
+                    )
+                    group.support_batch = arc_topk_support(
                         parameter_sketch,
-                        math.ceil(state.config.ratio * rows),
-                    ).squeeze(0)
-                    parameter_state.last_support = support
-                    assert prepared.delta_batch is not None
+                        math.ceil(state.config.ratio * group.rows),
+                    )
+                    for parameter_state, support in zip(
+                        group.parameter_states,
+                        group.support_batch.unbind(0),
+                    ):
+                        parameter_state.last_support = support
+                    assert group.prepared.delta_batch is not None
+                    group.local_selected_batch = gather_rows(
+                        group.prepared.delta_batch,
+                        group.support_batch,
+                    )
                     local_selected_parts.append(
-                        gather_rows(prepared.delta_batch, support.unsqueeze(0)).reshape(-1)
+                        group.local_selected_batch.reshape(-1)
                     )
                     sketch_offset += sketch_count
             local_selected_buffer = torch.cat(local_selected_parts)

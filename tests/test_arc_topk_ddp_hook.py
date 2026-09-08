@@ -178,3 +178,69 @@ def test_sparse_hook_preserves_per_parameter_state_across_mixed_shape_bucket_ste
             gradients[1],
         )
         state.commit_step()
+
+
+def test_sparse_hook_batches_compatible_shapes_without_changing_stable_seed_state():
+    first = torch.nn.Parameter(torch.zeros(3, 2))
+    different = torch.nn.Parameter(torch.zeros(2, 3))
+    second = torch.nn.Parameter(torch.zeros(3, 2))
+    parameters = [first, different, second]
+    state = _state(
+        [
+            (first, "first", "arc_matrix"),
+            (different, "different", "arc_matrix"),
+            (second, "second", "arc_matrix"),
+        ],
+        start_compress_step=0,
+    )
+    first_step = [
+        torch.arange(6.0).view_as(first) + 1,
+        torch.arange(6.0).view_as(different) + 21,
+        torch.arange(6.0).view_as(second) + 11,
+    ]
+    state.begin_step()
+    arc_topk_ddp_hook(state, FakeGradBucket(parameters, first_step)).wait()
+    state.finish_step()
+    state.commit_step()
+
+    second_step = [
+        torch.tensor([[8.0, 1.0], [3.0, 7.0], [2.0, 9.0]]),
+        torch.tensor([[9.0, 2.0, 8.0], [1.0, 7.0, 3.0]]),
+        torch.tensor([[4.0, 12.0], [10.0, 5.0], [13.0, 6.0]]),
+    ]
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profiler:
+        state.begin_step()
+        result = arc_topk_ddp_hook(
+            state,
+            FakeGradBucket(parameters, second_step),
+        ).wait()
+        state.finish_step()
+
+    operator_counts = {event.key: event.count for event in profiler.key_averages()}
+    assert operator_counts["aten::bmm"] == 2
+    assert operator_counts["aten::topk"] == 2
+    assert operator_counts["aten::gather"] == 2
+
+    offset = 0
+    for stable_id, (parameter, previous, gradient) in enumerate(
+        zip(parameters, first_step, second_step)
+    ):
+        expected_h, expected_g, expected_support = _manual_sparse_step(
+            gradient,
+            previous,
+            previous,
+            step=2,
+            stable_id=stable_id,
+        )
+        parameter_state = state.parameter_state(parameter)
+        torch.testing.assert_close(parameter_state.h_local, expected_h)
+        torch.testing.assert_close(parameter_state.g_local, expected_g)
+        torch.testing.assert_close(parameter_state.g_global, expected_g)
+        torch.testing.assert_close(parameter_state.last_support, expected_support)
+        torch.testing.assert_close(
+            result[offset : offset + parameter.numel()].view_as(parameter),
+            expected_g,
+        )
+        offset += parameter.numel()
