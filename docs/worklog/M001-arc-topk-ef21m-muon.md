@@ -747,3 +747,11 @@ compatible-shape batching 后，在最终 HEAD 上重新运行方案列出的完
 | 32 | 1057.19 ms | 976.88 ms | 1007.51 ms | 快 4.70% | 慢 3.14% |
 
 hook 在所有 GA 均快于 dense、慢于 optimizer ARC。hook trace 的 backward overlap 保持约 11.4–15.8 ms，exposed gradient tail 保持约 25.9–28.9 ms，而 optimizer tail 约 84.1–98.6 ms；这些局部收益近似固定，随 GA 增大被更多 accumulation compute 稀释，因此 ARC 相对 dense 的收益总体下降。GA4 的 hook/optimizer 单次差值异常偏高，且其他点也不严格单调；由于没有 repeat、dense 还是后续 supplement 而非三模式交错，本实验只支持趋势归因，不支持选择稳定最优 GA。
+
+## 2026-09-09：CM027/CM028 论文规模 60M/130M 质量实验设计
+
+用户决定直接比较 GPT-60M/130M 的 dense Muon 与 optimizer-side ARC-TopK Muon，并尽量仿照 ARC-TopK 论文的语言模型预训练设置。仓库已有 `gpt60m`（dim 512、4 layers、8 heads，64,094,208 参数）和 `gpt130m`（dim 768、8 layers、12 heads，133,890,048 参数）preset。本机没有 C4，故使用现有 FineWeb10B；模型为仓库 GPT、优化器为 Muon + scalar AdamW，而非论文的 LLaMA + Adam。该实验是面向 ARC-TopK+Muon 的 paper-like 对照，不表述为论文复现。
+
+两档均使用 4 卡 DDP、BF16、compile、seq 256、effective local batch 128/global batch 512、training seed 42、正常 NCCL。60M 运行 8393 updates（1,100,087,296 tokens），130M 运行 16785 updates（2,200,043,520 tokens）。ARC 固定 ratio 0.2、projection rank 4、eta 1、本地确定性 seed 42，并在 1000 optimizer updates 后开始压缩。每个模型先用内存占用更高的 ARC 路径按 device batch 128/64/32/16 探测，对应 GA 1/2/4/8；选中后 dense 使用相同 physical batch/GA，只有明确 OOM 才回退，其他错误 fail closed。
+
+正式编号为 CM027a/b（60M dense/ARC）与 CM028a/b（130M dense/ARC）。配置位于 `configs/compressed_muon/cm027*.yaml`、`configs/compressed_muon/cm028*.yaml`，串行 controller 为 `benchmark/compressed_muon/run_cm027_cm028_paperlike_quality.sh`。任务通过后台 tmux 一次性运行，不使用 Agent 循环轮询；原始日志、命令、环境、所选 batch 和最终摘要写入对应 `artifacts/compressed_muon/` 目录。

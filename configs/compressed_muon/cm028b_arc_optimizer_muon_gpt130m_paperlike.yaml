@@ -1,0 +1,41 @@
+# CM028b: paper-scale GPT-130M optimizer-side ARC-TopK Muon on FineWeb10B.
+model_dim: 768
+n_layer: 8
+n_head: 12
+sequence_length: 256
+
+batch_size: 512
+device_batch_size: 128
+num_iterations: 16785
+warmup_ratio: 0.0
+warmdown_ratio: 0.2
+timing_warmup_steps: 10
+
+val_loss_every: 500
+val_tokens: 10485760
+checkpoint_freq: 0
+wandb_project_name: gpt-train
+wandb_job_name: CM028b-m001-arc-optimizer-muon-gpt130m-paperlike-train-ddp-ws4-s42
+no_wandb: false
+
+dp_size: null
+fs_size: null
+tp_size: null
+debug: false
+no_compile: false
+no_triton: false
+use_polar_express: true
+
+optimizer: arc_topk_muon
+arc_sync_mode: optimizer
+scalar_opt: adamw
+adjust_lr: spectral_norm
+mu: 0.95
+weight_decay: 0.01
+lr: 0.02
+
+arc_topk_ratio: 0.2
+arc_projection_rank: 4
+arc_eta: 1.0
+arc_seed: 42
+arc_start_compress_step: 1000

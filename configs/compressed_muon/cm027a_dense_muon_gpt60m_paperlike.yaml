@@ -1,0 +1,36 @@
+# CM027a: paper-scale GPT-60M dense Muon quality baseline on FineWeb10B.
+model_dim: 512
+n_layer: 4
+n_head: 8
+sequence_length: 256
+
+# Paper-style effective local batch 128 on four ranks. The launcher may lower
+# device_batch_size and increase GA while preserving batch_size=512.
+batch_size: 512
+device_batch_size: 128
+num_iterations: 8393
+warmup_ratio: 0.0
+warmdown_ratio: 0.2
+timing_warmup_steps: 10
+
+val_loss_every: 500
+val_tokens: 10485760
+checkpoint_freq: 0
+wandb_project_name: gpt-train
+wandb_job_name: CM027a-muon-dense-gpt60m-paperlike-train-ddp-ws4-s42
+no_wandb: false
+
+dp_size: null
+fs_size: null
+tp_size: null
+debug: false
+no_compile: false
+no_triton: false
+use_polar_express: true
+
+optimizer: muon
+scalar_opt: adamw
+adjust_lr: spectral_norm
+mu: 0.95
+weight_decay: 0.01
+lr: 0.02
