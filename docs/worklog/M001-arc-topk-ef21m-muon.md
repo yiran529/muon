@@ -755,3 +755,5 @@ hook 在所有 GA 均快于 dense、慢于 optimizer ARC。hook trace 的 backwa
 两档均使用 4 卡 DDP、BF16、compile、seq 256、effective local batch 128/global batch 512、training seed 42、正常 NCCL。60M 运行 8393 updates（1,100,087,296 tokens），130M 运行 16785 updates（2,200,043,520 tokens）。ARC 固定 ratio 0.2、projection rank 4、eta 1、本地确定性 seed 42，并在 1000 optimizer updates 后开始压缩。每个模型先用内存占用更高的 ARC 路径按 device batch 128/64/32/16 探测，对应 GA 1/2/4/8；选中后 dense 使用相同 physical batch/GA，只有明确 OOM 才回退，其他错误 fail closed。
 
 正式编号为 CM027a/b（60M dense/ARC）与 CM028a/b（130M dense/ARC）。配置位于 `configs/compressed_muon/cm027*.yaml`、`configs/compressed_muon/cm028*.yaml`，串行 controller 为 `benchmark/compressed_muon/run_cm027_cm028_paperlike_quality.sh`。任务通过后台 tmux 一次性运行，不使用 Agent 循环轮询；原始日志、命令、环境、所选 batch 和最终摘要写入对应 `artifacts/compressed_muon/` 目录。
+
+配置与 controller 在 commit `c7f8fd8` 落盘；YAML 入口解析、token 预算、GA 回退不变量、shell 语法与 `git diff --check` 均通过。2026-09-09 00:29 CST 在确认 GPU 2–5 均仅占用 3 MiB 且 W&B 凭据可用后，以 tmux session `cm027_cm028_quality` 启动 controller，PID 为 `510613`。一次性启动检查确认进程存活、tmux pane 未退出，并已进入 GPT-60M ARC `device_batch=128/GA1` probe；后续不主动轮询。
