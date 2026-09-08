@@ -5,8 +5,9 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 python_bin="$repo_dir/.venv/bin/python"
 torchrun_bin="$repo_dir/.venv/bin/torchrun"
 data_dir="$repo_dir/data/fineweb10B"
-dense_config="$repo_dir/configs/compressed_muon/cm020a_dense_muon_gpt350m.yaml"
-arc_config="$repo_dir/configs/compressed_muon/m001_arc_topk_muon_ddp.yaml"
+dense_config="$repo_dir/configs/compressed_muon/cm024a_dense_muon_gpt350m.yaml"
+arc_optimizer_config="$repo_dir/configs/compressed_muon/cm024b_arc_optimizer_local_seed_gpt350m.yaml"
+arc_hook_config="$repo_dir/configs/compressed_muon/cm024c_arc_ddp_hook_local_seed_gpt350m.yaml"
 world_size=3
 global_batch_size=768
 device_batch_size=1
@@ -144,7 +145,7 @@ fi
 timestamp > "$artifact_root/started_at.txt"
 print_plan > "$artifact_root/plan.json"
 
-for required in "$python_bin" "$torchrun_bin" "$data_dir" "$dense_config" "$arc_config"; do
+for required in "$python_bin" "$torchrun_bin" "$data_dir" "$dense_config" "$arc_optimizer_config" "$arc_hook_config"; do
     [[ -e "$required" ]] || { log "BLOCKED missing=$required"; exit 66; }
 done
 
@@ -175,7 +176,11 @@ run_cell() {
     local cell="$1" mode_name="$2" entry config cell_dir rc
     cell_dir="$artifact_root/$cell"
     entry="$repo_dir/train.py"; config="$dense_config"
-    [[ "$mode_name" != "dense" ]] && { entry="$repo_dir/train_arctopk.py"; config="$arc_config"; }
+    if [[ "$mode_name" == "arc_optimizer" ]]; then
+        entry="$repo_dir/train_arctopk.py"; config="$arc_optimizer_config"
+    elif [[ "$mode_name" == "arc_ddp_hook" ]]; then
+        entry="$repo_dir/train_arctopk.py"; config="$arc_hook_config"
+    fi
     while ! selected_idle; do log "GPU_WAIT_SELECTED list=$gpu_list"; sleep "$poll_seconds"; done
     mkdir -p "$cell_dir/profiler"
     local -a command=(env -u NCCL_DEBUG -u NCCL_P2P_DISABLE -u NCCL_SHM_DISABLE

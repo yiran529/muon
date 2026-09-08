@@ -330,12 +330,28 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
             )
             if is_backward_compute and not is_hook_local:
                 compute_intervals.append((start, end))
+    launch_metrics: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"count": 0, "message_bytes": 0}
+    )
+    for category, _start, _end, _corr, range_event in ranges:
+        if category not in _COLLECTIVE_CATEGORIES:
+            continue
+        if "/payload " not in str(range_event.get("name", "")):
+            continue
+        launch_metrics[category]["count"] += 1
+        launch_metrics[category]["message_bytes"] += _numeric_arg(
+            range_event,
+            "bytes",
+        )
+
     collectives = []
     for category in sorted(groups):
         item = groups[category]
+        launches = launch_metrics.get(category)
         collectives.append({"category": category, "kernel_count": item["kernel_count"],
+                            "launch_count": (launches["count"] if launches else item["kernel_count"]),
                             "duration_ms": item["duration_us"] / 1000.0,
-                            "message_bytes": item["message_bytes"]})
+                            "message_bytes": (launches["message_bytes"] if launches else item["message_bytes"])})
     union_us = _interval_union(nccl_intervals)
     overlap_us = _overlap(nccl_intervals, compute_intervals)
     arc_intervals = [

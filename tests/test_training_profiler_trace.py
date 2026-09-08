@@ -170,7 +170,7 @@ def test_profile_summary_fails_closed_on_rank_divergence_or_seed(tmp_path, failu
         {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 1000},
         {"ph": "X", "name": "arc_hook/sketch", "cat": "cpu_op", "ts": 100, "dur": 10,
          "args": {"External id": 1, "bytes": 32}},
-        {"ph": "X", "name": "ncclDevKernel_AllReduce", "cat": "kernel", "ts": 200, "dur": 100,
+        {"ph": "X", "name": "ncclDevKernel_AllReduce", "cat": "kernel", "ts": 110, "dur": 5,
          "args": {"External id": 1}},
     ]
     _write_profile_cell(tmp_path, cell, 0, {"traceEvents": base})
@@ -191,3 +191,20 @@ def test_profile_summary_fails_closed_on_rank_divergence_or_seed(tmp_path, failu
 
     with pytest.raises(SystemExit, match="signature|seed"):
         summarize_profile_root(tmp_path, require_plan=True)
+
+
+def test_payload_ranges_define_signature_even_if_kernel_correlation_differs():
+    trace = {"traceEvents": [
+        {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 1000},
+        {"ph": "X", "name": "arc_hook/sketch", "cat": "cpu_op", "ts": 100, "dur": 30},
+        {"ph": "X", "name": "arc_hook/sketch/payload bytes=64", "cat": "cpu_op", "ts": 105, "dur": 20,
+         "args": {"External id": 9}},
+        {"ph": "X", "name": "ncclDevKernel_AllReduce", "cat": "kernel", "ts": 110, "dur": 5,
+         "args": {"External id": 999}},
+    ]}
+
+    result = summarize_training_trace(trace)
+    sketch = next(item for item in result["collectives"] if item["category"] == "arc_hook_sketch")
+
+    assert sketch["launch_count"] == 1
+    assert sketch["message_bytes"] == 64

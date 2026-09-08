@@ -693,3 +693,19 @@ Task 8 规定的 formal-entry suite 使用 `python -m pytest` 执行（本环境
 Overlap 口径改为 GPU interval：用 Kineto external ID 将 GPU compute kernel 关联到 `final_backward` 内发射的 CPU op，排除 NCCL 和 hook prepare/Top-K/finalize 的本地 kernel，再计算 ARC collective 与 genuine backward compute 的时间交集及最后 compute kernel 之后的 exposed gradient-sync tail。合成反例覆盖“ARC NCCL 完全位于 host backward range、但开始于最后 backward compute 之后”，其 overlap 必须为 0。摘要同时输出首个 bucket/ARC collective 相对 backward start、最后 ARC kernel/Future 相对 backward end、bucket count/bytes，并拒绝 rank-divergent hook signature、任何 ARC seed collective、缺 rank/cell、非零 exit、OOM/timeout/traceback 和缺少最终 timing。
 
 launcher 现包含 dense、optimizer-side ARC 和 DDP-hook ARC 三个 cell，按六种排列轮换 paired block；支持 world/global batch、GPU include/exclude、bucket cap、timing warmup、measured steps 和 artifact root，`num_iterations=warmup+measured`，无 hard-coded GPU 或 seed mode。共享训练入口将原 hard-coded 10-step timing reset 参数化，默认仍为 10，并将 DDP bucket cap 显式传给构造器。Task 10 CPU contracts 为 `23 passed`；与 hook/训练回归合并为 `39 passed`，shell syntax 和 `--print-plan` JSON 均通过。真实 trace 是否满足 positive overlap acceptance 仍需 Task 11 GPU scan 验证。
+
+## 2026-09-08：CM024 correctness、overlap 与 wall-clock 边界
+
+Task 11 完整 CPU gate 为 `192 passed`；两卡 NCCL stress `2 passed`，新增三模式三步正式入口 smoke `1 passed`，三种模式参数均在 rank 间一致、collective signature rank-identical 且没有 `arc/seed`。三卡 GPT-350M/seq1024/GA256 的 5/25/50 MiB scan 均 exit 0、每 cell 三份 trace、unattributed NCCL fraction 0。hook 的 ARC/backward GPU overlap 分别为 `18.920/17.874/6.373 ms`，exposed gradient tail 为 `24.505/0.130/24.713 ms`，而 optimizer ARC tail 为 `77.618/73.719/83.197 ms`。这证明 overlap 是真实 GPU interval intersection，不是 host backward containment。25 MiB 以最小 tail 进入正式 run。
+
+四卡 seq1024、global batch1024、GA256、20 warmup+100 measured 的正式 run 完成 r1/r2 后，用户要求停止并改用更小 workload。两个完整 block 中 hook 相对 optimizer ARC 分别慢 `0.83%/1.39%`；由于 r3 中止，不能计算预登记的三 block interval，也不能作正式 acceleration claim。旧 artifact 保留在 `CM024-formal-bucket25-ws4-r3/`，缺失 r3 完整 cell 是有意中止而非 launcher 成功。
+
+用户指定的 sensitivity probe 保持 GPT-350M 和 ARC 数学配置，改为 seq512、global batch16、device batch1、GA4。25 MiB 三组中 hook 相对 dense 平均快 `13.16%`、相对 optimizer ARC 慢 `5.86%`。50/100/200 MiB 短扫描选择 100 MiB 后，三组确认得到 dense `344.11±7.61 ms`、optimizer ARC `262.68±4.71 ms`、hook `271.38±3.48 ms`；hook 相对 dense paired improvement `21.12% [20.47%, 21.99%]`，相对 optimizer ARC 为 `-3.32% [-3.96%, -2.61%]`。hook trace 同时有 `14.717 ms` genuine overlap 和 `0.586 ms` tail，说明局部目标实现，但 per-parameter hook overhead 仍使它没有超过 optimizer baseline。seq 与 batch 同时改变，因此该结果不解释为纯 GA 因果消融。
+
+## 2026-09-08：bucket 内 compatible-shape batching
+
+根据 CM024 trace，100 MiB hook 每步有 10 次 sketch 和 10 次 selected all-reduce，而 optimizer ARC 各 3 次；本地 hook ARC 约 2151 个 CUDA kernels，对照 optimizer 约 96。独立只读复核认为 bucket 内 batching 值得作为局部优化，但没有 A/B 前不能承诺提速。实现按 bucket 内 shape/dtype/device/state dtype 稳定分组；每参数仍独立使用 stable ID seed 生成 projection，之后 batched prepare/BMM、TopK/gather 和 finalize。TopK 阶段的 local-selected batch 被保留到 selected collective 完成，删除 finalize 的重复 gather。collective count/order/payload、全局 tail Future、execution stream、per-name checkpoint state 和 schema 均不变。
+
+TDD 的 CPU profiler fixture 使用 `shape A, B, A` 的 interleaved bucket：旧实现 `aten::bmm=3` 按预集失败，新实现 `bmm/topk/gather=2`，同时三类 EF21M state、support 和原 bucket offset 与逐参数 stable-seed oracle 一致。同-shape 两 rank Gloo oracle 验证压缩 payload 和普通 Muon 参数一致；最终相关 CPU/Gloo/Future/checkpoint suite 为 `59 passed`，GPU 2/3 上 NCCL/正式入口为 `3 passed`。独立 code review 未发现 Critical/Important 问题。
+
+两卡、seq512、GA4、100 MiB 的同拓扑短 A/B 显示本地 hook kernel 数从约 `2151` 降至 `803`。singleton 单次 hook/optimizer ratio 为 `1.1234`；batched 三组 hook 为 `272.88±4.43 ms (CV 1.62%)`，optimizer 为 `255.35±3.35 ms (1.31%)`，即 hook 仍平均慢 `6.87%`，paired bootstrap 区间为慢 `[5.95%, 7.63%]`。batching 同时把本地 ARC GPU interval 从约 18 ms 增至约 42 ms，表明大 tensor stack/state copy 抵消了部分 launch 减少。该优化保留，因为它正确地降低 dispatch 并在单次同拓扑基线中缩小相对差距；下一步若继续优化，应优先研究持久 grouped state/workspace 或减少 stack/copy，不能把本结果表述为 hook 已反超 optimizer。

@@ -57,7 +57,7 @@ def _validate_plan_completeness(artifact_root: Path, cells: list[dict]) -> None:
             signature = (rank["bucket_count"],) + tuple(
                 (
                     item["category"],
-                    item["kernel_count"],
+                    item["launch_count"],
                     item["message_bytes"],
                 )
                 for item in rank["collectives"]

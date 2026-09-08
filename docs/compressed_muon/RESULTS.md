@@ -31,3 +31,29 @@
 | GPT-1B P2P-disabled | 267.954±8.366 (3.12%) → 34.515±1.154 (3.34%) | 162.141±4.061 (2.50%) → 251.837±1.416 (0.56%) | 1419.783±115.261 (8.12%) → 707.302±33.905 (4.79%) | 311.818±9.069 (2.91%) → 433.016±1.401 (0.32%) |
 
 本轮 Muon 共生成 36 个 timing 与 36 个 profiler artifact，全部满足有限值、collective signature 和 exact parameter checksum agreement；无 OOM。旧 CM004–CM010 中 `distributed_mesh=None` 的 dense Muon 数据因使用了不受支持的 rank-local benchmark 路径而废弃，不再作为结果或探索性结论展示。当前结果仍是本机 synthetic short benchmark，不包含长训练收敛、validation perplexity、time-to-quality 或能耗证据。
+
+## CM024：本地 seed 与异步 DDP bucket hook（2026-09-08）
+
+CM024 的 CPU correctness gate 为 `192 passed, 0 failed, 0 skipped`；两卡 NCCL hook stress 为 `2 passed`，三模式正式入口 smoke 为 `1 passed`。三卡 GPT-350M、BF16、compile、seq 1024、GA256 的 5/25/50 MiB attribution scan 均为正常 NCCL、每 cell 三份 rank trace、unattributed fraction 0，且没有 seed collective：
+
+| bucket | hook ARC/backward GPU overlap | hook exposed gradient tail | optimizer ARC tail | hook profile window |
+|---:|---:|---:|---:|---:|
+| 5 MiB | 18.920 ms | 24.505 ms | 77.618 ms | 318.117 ms |
+| 25 MiB | 17.874 ms | 0.130 ms | 73.719 ms | 246.960 ms |
+| 50 MiB | 6.373 ms | 24.713 ms | 83.197 ms | 215.822 ms |
+
+该证据满足“真实 ARC NCCL kernel 与后续 genuine backward compute kernel 有正交集”的 overlap gate。25 MiB 按预登记规则以最小 exposed tail 进入四卡 GA256 正式比较。正式运行完成了 r1/r2 后，用户明确要求停止并改做低 GA sensitivity probe；r3 在 optimizer cell 中途终止，因此该 artifact 不满足三完整 paired blocks 的接受门槛。两个完整 block 中 hook 分别比 optimizer ARC 慢 `0.83%` 和 `1.39%`，也分别比 dense 慢 `0.16%` 和 `0.68%`；这些数字只记录中止边界，不构成正式 wall-clock 结论。
+
+随后按用户要求运行 GPT-350M、4 GPU、BF16、compile、seq 512、global batch 16、device batch 1、GA4 的探索性实验。25 MiB 三组结果为 dense `361.74±8.86 ms (CV 2.45%)`、optimizer ARC `296.94±11.13 ms (3.75%)`、hook ARC `314.02±1.46 ms (0.46%)`。hook 相对 dense 的平均 paired improvement 为 `13.16%`，但相对 optimizer ARC 平均慢 `5.86%`。
+
+50/100/200 MiB 单次扫描后以正 overlap 且最小 hook/optimizer step ratio 选择 100 MiB。100 MiB 三组确认如下：
+
+| 模式 | step mean±sd (CV) | throughput mean | trace profile window | ARC/backward overlap | exposed gradient tail |
+|---|---:|---:|---:|---:|---:|
+| dense | 344.11±7.61 ms (2.21%) | 23.8k token/s | 262.088 ms | 0 | 164.381 ms |
+| optimizer ARC | 262.68±4.71 ms (1.79%) | 31.2k token/s | 189.572 ms | 0 | 88.409 ms |
+| DDP-hook ARC | 271.38±3.48 ms (1.28%) | 30.2k token/s | 205.512 ms | 14.717 ms | 0.586 ms |
+
+以完整 paired block 为统计单位，hook 相对 dense 平均快 `21.12%`，三样本穷举 paired bootstrap 区间为 `[20.47%, 21.99%]`；hook 相对 optimizer ARC 平均慢 `3.32%`，区间为慢 `[2.61%, 3.96%]`。因此 CM024 支持“hook 恢复局部 overlap 并几乎消除同步尾部”，但不支持“hook 比保留的 optimizer-side ARC 更快”。GA256 中局部几十毫秒收益被约 9.2 秒完整 step 稀释；GA4 下 ARC 相对 dense 的收益显现，但第一版 hook 的 per-parameter dispatch、更多 collective launch 与串行 bucket chain 仍有成本。seq 与 batch 同时变化，所以 GA4 结果是 workload sensitivity，不是单变量 GA 消融，也不用于训练质量结论。
+
+作为后续优化，sparse hook 在 bucket 内按兼容 shape/dtype 批处理，同时保留每参数 stable seed、EF21M state、collective 顺序、Future chain 和 checkpoint schema。两卡同拓扑短 A/B 中，本地 ARC kernel 数从约 `2151` 降至 `803`；singleton 单次 hook/optimizer 劣势为 `12.34%`，batched 三组为平均慢 `6.87%`。但 batched stack/state-copy 使本地 ARC GPU interval 从约 18 ms 增至约 42 ms，故该结果只证明 dispatch 数下降和相对差距缩小，不证明已消除 hook overhead。下一研究点是持久化 grouped state/workspace 或减少 stack/copy，而不是重新引入 seed collective。
