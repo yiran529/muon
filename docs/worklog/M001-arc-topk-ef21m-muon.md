@@ -732,3 +732,18 @@ compatible-shape batching 后，在最终 HEAD 上重新运行方案列出的完
 | 384 MiB | 4 | 4/4 | 273.72 ms | 13.507 ms | 0.149 ms | 198.862 ms |
 
 同期 dense 为 316.69 ms，optimizer ARC 为 267.58 ms；160 MiB hook 单次最快，相对 dense 快 14.81%，相对 optimizer ARC 慢 0.82%。从 64 增至 160 MiB 时，bucket/collective 与本地 prepare/Top-K/finalize 开销明显下降；继续增至 256/384 MiB 没有单调改善完整 step，表明更晚 bucket-ready、更大 collective/workspace 和资源重叠也参与关键路径。384 MiB 的 exposed tail 接近零但仍非最快，进一步说明 tail 不能单独作为选择标准。由于每 cell 只有一次且没有轮换/repeat，本结果只把 160 MiB 提升为后续确认候选，不支持 hook 已稳定追平或反超 optimizer ARC。
+
+## 2026-09-08：CM026/CM026d 四卡 GA sensitivity
+
+固定 GPT-350M、4 GPU、BF16、compile、seq512、device batch1、160 MiB bucket cap、seed42 和 ARC ratio0.2/rank4/eta0.1/start0，扫描 GA 1/2/4/8/16/32。CM026 对每个 GA 各运行一次 optimizer ARC 与 hook ARC并交替 pair 顺序；CM026d 随后在相同 GPU 2/3/4/6 上补齐每个 GA 的单次 dense。每 cell 均为 20 warmup + 50 measured steps并采集 final-microstep/optimizer trace；18 个 cell 全部 exit 0，各生成四份 trace并通过 summary gate。
+
+| GA | dense | optimizer ARC | hook ARC | hook vs dense | hook vs optimizer |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 232.95 ms | 173.94 ms | 195.62 ms | 快 16.02% | 慢 12.46% |
+| 2 | 276.52 ms | 207.20 ms | 212.72 ms | 快 23.07% | 慢 2.66% |
+| 4 | 305.71 ms | 250.43 ms | 276.28 ms | 快 9.63% | 慢 10.32% |
+| 8 | 437.81 ms | 375.40 ms | 383.70 ms | 快 12.36% | 慢 2.21% |
+| 16 | 629.55 ms | 578.09 ms | 588.78 ms | 快 6.48% | 慢 1.85% |
+| 32 | 1057.19 ms | 976.88 ms | 1007.51 ms | 快 4.70% | 慢 3.14% |
+
+hook 在所有 GA 均快于 dense、慢于 optimizer ARC。hook trace 的 backward overlap 保持约 11.4–15.8 ms，exposed gradient tail 保持约 25.9–28.9 ms，而 optimizer tail 约 84.1–98.6 ms；这些局部收益近似固定，随 GA 增大被更多 accumulation compute 稀释，因此 ARC 相对 dense 的收益总体下降。GA4 的 hook/optimizer 单次差值异常偏高，且其他点也不严格单调；由于没有 repeat、dense 还是后续 supplement 而非三模式交错，本实验只支持趋势归因，不支持选择稳定最优 GA。

@@ -74,3 +74,18 @@ Task 12 在 batching 后的最终 HEAD 上运行方案指定的完整 repository
 | 384 MiB | 4 | 4 / 4 | 273.72 ms | 13.507 ms | 0.149 ms | 198.862 ms |
 
 160 MiB 是本次单次扫描的最优点，相对同期 dense 快 `14.81%`，相对 optimizer ARC 慢 `0.82%`。结果不是随 bucket 增大单调改善：更大的 bucket 继续减少 launch 和本地 prepare/Top-K/finalize，但会改变 ready 时机、collective duration 和 overlap；384 MiB 即使只有 4/4 次压缩 collective 且 trace tail 接近零，完整 step 仍慢于 160 MiB。因此 exposed tail 或 collective 次数都不能单独预测 wall-clock。每个 cell 仅一次，本节只用于选择候选参数，不作稳定反超或统计显著性结论。
+
+## CM026：四卡 gradient-accumulation sensitivity（2026-09-08）
+
+固定 GPT-350M、4 GPU、BF16、compile、seq 512、device batch 1、160 MiB bucket cap 和 ARC 数学配置，对 GA 1/2/4/8/16/32 的 dense、optimizer ARC、DDP-hook ARC 各运行单个 20 warmup + 50 measured cell。ARC pair 顺序交替；dense 由紧随其后的 CM026d supplement 在同一 GPU topology 上补齐。所有 cell exit 0、各有四份 rank trace并通过 summary gate。
+
+| GA | dense | optimizer ARC | DDP-hook ARC | hook 快于 dense | hook 慢于 optimizer |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 232.95 ms | 173.94 ms | 195.62 ms | 16.02% | 12.46% |
+| 2 | 276.52 ms | 207.20 ms | 212.72 ms | 23.07% | 2.66% |
+| 4 | 305.71 ms | 250.43 ms | 276.28 ms | 9.63% | 10.32% |
+| 8 | 437.81 ms | 375.40 ms | 383.70 ms | 12.36% | 2.21% |
+| 16 | 629.55 ms | 578.09 ms | 588.78 ms | 6.48% | 1.85% |
+| 32 | 1057.19 ms | 976.88 ms | 1007.51 ms | 4.70% | 3.14% |
+
+两个 ARC 路径在所有 GA 均快于 dense，optimizer ARC 在所有 GA 均最快。hook 的局部 trace overlap 约为 `11.4–15.8 ms`、exposed gradient tail 约为 `25.9–28.9 ms`，基本不随 GA 增大；完整 step 中累积计算增加后，这部分固定通信收益相对 dense 总体被稀释。hook/optimizer 差值明显非单调，尤其 GA4 是单次异常高点；每个模式/GA 只有一次且 dense 在补充队列中运行，因此该表支持 Amdahl 趋势观察，不支持对某个 GA 作稳定最优或显著性结论。
