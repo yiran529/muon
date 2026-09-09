@@ -767,3 +767,5 @@ hook 在所有 GA 均快于 dense、慢于 optimizer ARC。hook trace 的 backwa
 为解释 CM027/CM028 optimizer-side ARC 的负 wall-clock，用户要求在相同超参数负载上用一两百步直接比较 DDP hook 与 optimizer ARC。预登记 GPT-60M/130M 各两个 cell，保持 4 卡、BF16、compile、FineWeb10B、seq 256、effective local batch 128/global batch 512、ratio 0.2、projection rank 4、eta 1 和 seed 42；短测将 compression start 改为 0，并使用 20 warmup + 200 measured updates、160 MiB hook bucket cap、关闭 W&B/profiler。每个模型优先 device batch 128/GA1；hook 与 optimizer 都通过三步 compressed-path probe 后才正式运行，明确 OOM 时 pair 共同回退到 64/GA2、32/GA4，非 OOM 错误 fail closed。
 
 用户授权共享 GPU 4–7。启动前检查显示四卡各由用户 `wyz` 的既有进程占用约 1818 MiB，剩余约 22.7 GiB；controller 不停止、修改或向这些进程发送信号，只记录每个 cell 前后的 GPU/进程快照。由于外部进程可能造成竞争，CM029/CM030 定位为 shared-GPU、single-run exploratory evidence，不进入稳定正式性能主表。60M 按 optimizer→hook、130M 按 hook→optimizer 运行，以部分平衡固定顺序偏差。
+
+配置和 controller 在 commit `872309a` 落盘；正式入口 YAML 解析、20+200 计时窗口、ARC 参数、GA 回退不变量、shell syntax 与 `git diff --check` 均通过。2026-09-09 10:15 CST 在 GPU 4–7 各剩余约 22.25 GiB 时启动 tmux session `cm029_cm030_wallclock`，controller PID `1565531`。一次性检查确认进程和 pane 存活，并已开始 60M hook 的 device batch 128/GA1 probe；后续不主动轮询。
