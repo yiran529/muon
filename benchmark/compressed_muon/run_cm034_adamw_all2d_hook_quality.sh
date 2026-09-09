@@ -305,7 +305,7 @@ PY
 }
 
 cd "$repo_dir" || exit 2
-[[ ! -e "$artifact_root" ]] || {
+[[ -e "$artifact_root" || -L "$artifact_root" ]] && {
     printf 'refusing to overwrite existing controller artifact root: %s\n' "$artifact_root" >&2
     exit 73
 }

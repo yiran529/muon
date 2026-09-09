@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -9,6 +10,10 @@ REPO = Path(__file__).resolve().parents[1]
 DENSE_CONFIG = REPO / "configs/compressed_muon/cm034a_dense_adamw_gpt60m_paperlike.yaml"
 ARC_CONFIG = REPO / "configs/compressed_muon/cm034b_all2d_hook_adamw_gpt60m_paperlike.yaml"
 LAUNCHER = REPO / "benchmark/compressed_muon/run_cm034_adamw_all2d_hook_quality.sh"
+ARTIFACT_ROOT = Path(
+    "/home/wyr/dion/artifacts/compressed_muon/"
+    "CM034-m001-adamw-all2d-hook-gpt60m-paperlike-train-ddp-ws4-s42"
+)
 
 
 def test_cm034_configs_are_matched_gpt60m_adamw_quality_cells():
@@ -72,6 +77,7 @@ def test_cm034_configs_are_matched_gpt60m_adamw_quality_cells():
 
 
 def test_cm034_print_plan_orders_dense_then_arc_without_side_effects():
+    artifact_root_existed_before = os.path.lexists(ARTIFACT_ROOT)
     completed = subprocess.run(
         ["bash", str(LAUNCHER), "--print-plan"],
         cwd=REPO,
@@ -94,6 +100,8 @@ def test_cm034_print_plan_orders_dense_then_arc_without_side_effects():
     assert plan["oom_fallback_device_batches"] == [128, 64, 32, 16]
     assert plan["num_iterations"] == 8393
     assert plan["training_tokens"] == 1_100_087_296
+    assert plan["total_tokens"] == 1_100_087_296
     assert plan["validation_tokens"] == 10_485_760
     assert plan["training_seed"] == 42
     assert plan["cells_detail"][1]["hook_arc_scope"] == "all_ndim_2_parameters"
+    assert os.path.lexists(ARTIFACT_ROOT) is artifact_root_existed_before
