@@ -773,3 +773,9 @@ hook 在所有 GA 均快于 dense、慢于 optimizer ARC。hook trace 的 backwa
 controller 与四个 cell 均 exit 0，60M/130M 的 hook 和 optimizer probe 都在 device batch 128/GA1 通过，未触发 OOM 回退。60M optimizer/hook 的 step average 为 `131.01/133.29 ms`，hook 单次慢 `1.74%`，峰值显存为 `7009/7430 MiB`。130M optimizer/hook 为 `290.86/284.64 ms`，hook 单次快 `2.14%`，峰值显存为 `13709/14226 MiB`。短程最终 validation loss 分别为 60M `5.6014/5.5858`、130M `5.6211/5.6156`，只用于运行健全性检查，不作质量结论。
 
 两个规模的方向相反且绝对差异仅约 2%，符合“大 physical batch 下 hook overlap 的固定收益被计算稀释、两条 ARC 路径接近持平”的解释。由于 GPU 4–7 全程共享外部进程、每 cell 只有一次且顺序只做了跨模型反转，该结果不能支持 hook 稳定优于或劣于 optimizer；它只排除了当前负载下存在很大的 hook/optimizer wall-clock 差距。hook 额外峰值显存为 60M `421 MiB`、130M `517 MiB`。
+
+## 2026-09-09：CM031 shared-GPU targeted profiler 设计
+
+为分解 CM029/CM030 约 2% 的 hook/optimizer 差异，预登记 CM031：在完全相同的 GPT-60M/130M、device batch 128/GA1、global batch 512、seq 256、ratio 0.2、projection rank 4、eta 1、compression start 0 和 bucket cap 160 MiB 下，对每个模型/模式各采集一个稳定 final-microstep + optimizer targeted trace。每个 cell 运行到 step 22，在 step 20 开启 Kineto；不重复完整 200-step timing，不启用 W&B。
+
+继续使用用户授权的 shared GPU 4–7，并在 plan、cell environment、status 与 GPU snapshot 中显式记录 `shared_gpu=true` 和外部进程。controller 不等待 GPU idle，也不停止或修改外部进程；每个 cell 前要求四卡各至少 16 GiB 空闲，否则 fail closed。该 profiler 仅用于 kernel/collective 分类、真实 backward overlap 和 exposed tail 归因，不把 profile-window 时长当作无干扰的稳定 wall-clock 结论。
