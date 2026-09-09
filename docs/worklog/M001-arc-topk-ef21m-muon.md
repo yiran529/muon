@@ -779,3 +779,5 @@ controller 与四个 cell 均 exit 0，60M/130M 的 hook 和 optimizer probe 都
 为分解 CM029/CM030 约 2% 的 hook/optimizer 差异，预登记 CM031：在完全相同的 GPT-60M/130M、device batch 128/GA1、global batch 512、seq 256、ratio 0.2、projection rank 4、eta 1、compression start 0 和 bucket cap 160 MiB 下，对每个模型/模式各采集一个稳定 final-microstep + optimizer targeted trace。每个 cell 运行到 step 22，在 step 20 开启 Kineto；不重复完整 200-step timing，不启用 W&B。
 
 继续使用用户授权的 shared GPU 4–7，并在 plan、cell environment、status 与 GPU snapshot 中显式记录 `shared_gpu=true` 和外部进程。controller 不等待 GPU idle，也不停止或修改外部进程；每个 cell 前要求四卡各至少 16 GiB 空闲，否则 fail closed。该 profiler 仅用于 kernel/collective 分类、真实 backward overlap 和 exposed tail 归因，不把 profile-window 时长当作无干扰的稳定 wall-clock 结论。
+
+controller 在 commit `f81ef95` 落盘；shell syntax、四个目标 cell、shared-GPU provenance 和空闲显存门槛静态 gate 通过。2026-09-09 10:43 CST 在 GPU 4–7 各剩余约 22.25 GiB 时启动 tmux session `cm031_shared_profile`，PID `1621687`；一次性检查确认进程和 pane 存活，并已开始 60M optimizer profile，后续不主动轮询。
