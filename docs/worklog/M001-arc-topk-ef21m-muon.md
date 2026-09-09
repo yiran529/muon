@@ -769,3 +769,7 @@ hook 在所有 GA 均快于 dense、慢于 optimizer ARC。hook trace 的 backwa
 用户授权共享 GPU 4–7。启动前检查显示四卡各由用户 `wyz` 的既有进程占用约 1818 MiB，剩余约 22.7 GiB；controller 不停止、修改或向这些进程发送信号，只记录每个 cell 前后的 GPU/进程快照。由于外部进程可能造成竞争，CM029/CM030 定位为 shared-GPU、single-run exploratory evidence，不进入稳定正式性能主表。60M 按 optimizer→hook、130M 按 hook→optimizer 运行，以部分平衡固定顺序偏差。
 
 配置和 controller 在 commit `872309a` 落盘；正式入口 YAML 解析、20+200 计时窗口、ARC 参数、GA 回退不变量、shell syntax 与 `git diff --check` 均通过。2026-09-09 10:15 CST 在 GPU 4–7 各剩余约 22.25 GiB 时启动 tmux session `cm029_cm030_wallclock`，controller PID `1565531`。一次性检查确认进程和 pane 存活，并已开始 60M hook 的 device batch 128/GA1 probe；后续不主动轮询。
+
+controller 与四个 cell 均 exit 0，60M/130M 的 hook 和 optimizer probe 都在 device batch 128/GA1 通过，未触发 OOM 回退。60M optimizer/hook 的 step average 为 `131.01/133.29 ms`，hook 单次慢 `1.74%`，峰值显存为 `7009/7430 MiB`。130M optimizer/hook 为 `290.86/284.64 ms`，hook 单次快 `2.14%`，峰值显存为 `13709/14226 MiB`。短程最终 validation loss 分别为 60M `5.6014/5.5858`、130M `5.6211/5.6156`，只用于运行健全性检查，不作质量结论。
+
+两个规模的方向相反且绝对差异仅约 2%，符合“大 physical batch 下 hook overlap 的固定收益被计算稀释、两条 ARC 路径接近持平”的解释。由于 GPU 4–7 全程共享外部进程、每 cell 只有一次且顺序只做了跨模型反转，该结果不能支持 hook 稳定优于或劣于 optimizer；它只排除了当前负载下存在很大的 hook/optimizer wall-clock 差距。hook 额外峰值显存为 60M `421 MiB`、130M `517 MiB`。

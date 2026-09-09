@@ -100,3 +100,14 @@ Task 12 在 batching 后的最终 HEAD 上运行方案指定的完整 repository
 | GPT-130M | 3.5648 | 4.0944 | +0.5296 | 213.98 / 238.51 ms | 慢 11.46% | 12760 / 13422 MiB |
 
 四个 cell 和 controller 均 exit 0。两个模型上 ARC 均未通过预设 `Δloss≤0.02` 的质量非劣门槛，也未产生完整 step 加速。尽管只有一个 seed，差距方向跨规模一致且远大于门槛，因此不优先重复完全相同的配置；下一步应先改变算法/压缩配置，而不是追加相同 cell 的统计重复。
+
+## CM029/CM030：论文 batch 下 hook vs optimizer 单次短测（2026-09-09）
+
+保持 CM027/CM028 的 seq 256、effective local batch 128/global batch 512、ratio 0.2、rank 4、eta 1，但从 step 0 开始压缩；每个 cell 为 20 warmup + 200 measured。60M/130M 均在 device batch 128/GA1 通过，无 OOM。GPU 4–7 同时存在外部进程，因此以下只作为 shared-GPU exploratory evidence。
+
+| 模型 | optimizer ARC | DDP-hook ARC | hook vs optimizer | optimizer/hook peak memory |
+|---|---:|---:|---:|---:|
+| GPT-60M | 131.01 ms | 133.29 ms | 慢 1.74% | 7009 / 7430 MiB |
+| GPT-130M | 290.86 ms | 284.64 ms | 快 2.14% | 13709 / 14226 MiB |
+
+两个规模方向相反且差距约 2%，不支持稳定胜负，只支持“大 physical batch 下两条 ARC 路径基本持平”。hook 的额外峰值显存约为 421/517 MiB。
