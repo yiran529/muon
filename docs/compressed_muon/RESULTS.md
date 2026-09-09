@@ -149,3 +149,16 @@ optimizer ARC 的核心问题不是 NCCL 总量没有下降，而是压缩和通
 DDP-hook ARC 把梯度同步移入 backward，代价是 backward CPU range 相对 dense 增加 `6.181/20.037 ms`，其中包含 bucket callback、local prepare、Top-K、EF21M state 和 finalize。收益是 NCCL union 相对 dense 降低 `17.80%/25.93%`，gradient tail 降低 `98.53%/97.48%`；130M 还获得 `18.888 ms` genuine overlap。最终 profile window 相对 dense 低 `2.48%/0.93%`，但 60M 相对 optimizer ARC仍高 `2.20%`。60M hook 的 optimizer CPU range `29.174 ms` 中，`muon_result` annotation 单独达到异常的 `22.087 ms`，而对应 NCCL kernel 仅 `2.604 ms`，进一步显示共享 GPU/host 调度噪声，不应把该单点直接解释为算法固有成本。
 
 综合来看，optimizer ARC 慢在 backward 后串行暴露的压缩与多阶段通信；hook 已基本解决同步尾部，但剩余瓶颈是大量未压缩 dense gradient、bucket 内本地压缩/state 搬运，以及较小模型上难以形成有效 GPU overlap 的固定调度成本。CM031 支持这一机制归因，但由于 shared-GPU、每模式单 trace 和 profiler 扰动，只能与 CM029/CM030 的无 profiler timing 联合解读，不能单独声明稳定性能胜负。
+
+## CM032：all-2D hook 短程 wall-clock（2026-09-09）
+
+将 DDP hook 的压缩资格从 Transformer block 扩展到所有二维参数后，在 CM029/CM030 相同的 GPT-60M/130M、4 GPU、seq256、global batch512、device batch128/GA1、ratio0.2/rank4/eta1/start0 和 160 MiB bucket cap 下，分别串行运行一个 dense、既有 optimizer ARC 与 all-2D hook cell。每个 cell 为 20 warmup + 200 measured；6 个 cell 和 controller 均 exit 0。GPU 4–7 与外部进程共享，且每个设置只有一次，因此本节是探索性同期比较，不是稳定性能主结果。
+
+| 模型 | dense | optimizer ARC | all-2D hook | hook vs dense | hook vs optimizer | hook peak memory |
+|---|---:|---:|---:|---:|---:|---:|
+| GPT-60M | 143.37 ms | 143.77 ms | **130.22 ms** | 快 9.17% | 快 9.42% | 7844 MiB |
+| GPT-130M | 298.78 ms | 291.97 ms | **274.13 ms** | 快 8.25% | 快 6.11% | 15115 MiB |
+
+相对同期 dense，all-2D hook 的峰值显存增加 `979/2067 MiB`；相对 optimizer ARC 增加 `835/1406 MiB`。与 CM029/CM030 的旧 hook 数字跨运行比较时，60M 从 `133.29` 降至 `130.22 ms`、130M 从 `284.64` 降至 `274.13 ms`，方向与“减少未压缩 dense payload”一致，但 shared-GPU 负载不同，不能把这两个跨运行差值当作干净的 all-2D A/B 因果估计。本轮可信度更高的是同一队列内 hook 相对两个同期基线均快 `6%–9%`。
+
+速度收益伴随明显的短程质量风险。220 步最终 validation loss 在 60M 上为 dense/optimizer/hook `5.2222/5.5972/6.2157`，130M 为 `5.2599/5.6035/6.5219`。该实验从 step 0 压缩、步数很短且目标是 wall-clock，不足以判断最终收敛；但结果明确禁止把吞吐收益直接表述成 time-to-quality 收益。下一步应先调高 ratio 或恢复延迟压缩，并用较短质量筛选找出 loss 可接受点，再对候选配置做更长训练。
