@@ -89,3 +89,14 @@ Task 12 在 batching 后的最终 HEAD 上运行方案指定的完整 repository
 | 32 | 1057.19 ms | 976.88 ms | 1007.51 ms | 4.70% | 3.14% |
 
 两个 ARC 路径在所有 GA 均快于 dense，optimizer ARC 在所有 GA 均最快。hook 的局部 trace overlap 约为 `11.4–15.8 ms`、exposed gradient tail 约为 `25.9–28.9 ms`，基本不随 GA 增大；完整 step 中累积计算增加后，这部分固定通信收益相对 dense 总体被稀释。hook/optimizer 差值明显非单调，尤其 GA4 是单次异常高点；每个模式/GA 只有一次且 dense 在补充队列中运行，因此该表支持 Amdahl 趋势观察，不支持对某个 GA 作稳定最优或显著性结论。
+
+## CM027/CM028：论文规模 60M/130M 单 seed 质量实验（2026-09-09）
+
+使用 4×RTX 4090、BF16、compile、FineWeb10B、seq 256、device batch 128、GA1、effective local batch 128/global batch 512 和 seed 42。GPT-60M/130M 分别训练约 1.1B/2.2B tokens；ARC optimizer 配置为 ratio 0.2、projection rank 4、eta 1，并在 step 1000 后压缩。该实验仿照论文的模型量级、序列长度、batch、token 预算和压缩配置，但使用仓库 GPT + Muon 而非 LLaMA + Adam，数据为 FineWeb10B 而非 C4。
+
+| 模型 | dense val loss | ARC val loss | Δloss | dense/ARC step | ARC wall-clock | dense/ARC peak memory |
+|---|---:|---:|---:|---:|---:|---:|
+| GPT-60M | 3.8904 | 4.3355 | +0.4451 | 101.60 / 111.13 ms | 慢 9.38% | 6834 / 6977 MiB |
+| GPT-130M | 3.5648 | 4.0944 | +0.5296 | 213.98 / 238.51 ms | 慢 11.46% | 12760 / 13422 MiB |
+
+四个 cell 和 controller 均 exit 0。两个模型上 ARC 均未通过预设 `Δloss≤0.02` 的质量非劣门槛，也未产生完整 step 加速。尽管只有一个 seed，差距方向跨规模一致且远大于门槛，因此不优先重复完全相同的配置；下一步应先改变算法/压缩配置，而不是追加相同 cell 的统计重复。

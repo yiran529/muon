@@ -757,3 +757,7 @@ hook 在所有 GA 均快于 dense、慢于 optimizer ARC。hook trace 的 backwa
 正式编号为 CM027a/b（60M dense/ARC）与 CM028a/b（130M dense/ARC）。配置位于 `configs/compressed_muon/cm027*.yaml`、`configs/compressed_muon/cm028*.yaml`，串行 controller 为 `benchmark/compressed_muon/run_cm027_cm028_paperlike_quality.sh`。任务通过后台 tmux 一次性运行，不使用 Agent 循环轮询；原始日志、命令、环境、所选 batch 和最终摘要写入对应 `artifacts/compressed_muon/` 目录。
 
 配置与 controller 在 commit `c7f8fd8` 落盘；YAML 入口解析、token 预算、GA 回退不变量、shell 语法与 `git diff --check` 均通过。2026-09-09 00:29 CST 在确认 GPU 2–5 均仅占用 3 MiB 且 W&B 凭据可用后，以 tmux session `cm027_cm028_quality` 启动 controller，PID 为 `510613`。一次性启动检查确认进程存活、tmux pane 未退出，并已进入 GPT-60M ARC `device_batch=128/GA1` probe；后续不主动轮询。
+
+四组均正常完成，controller exit code 为 0；60M 和 130M 都在 `device_batch=128/GA1` 通过 ARC 与 dense probe，没有触发 OOM 回退。60M dense/ARC 的最终 validation loss 为 `3.8904/4.3355`，step average 为 `101.60/111.13 ms`，峰值显存为 `6834/6977 MiB`；ARC loss 高 `0.4451`，单步慢 `9.38%`。130M dense/ARC 的最终 validation loss 为 `3.5648/4.0944`，step average 为 `213.98/238.51 ms`，峰值显存为 `12760/13422 MiB`；ARC loss 高 `0.5296`，单步慢 `11.46%`。按 `exp(Δloss)-1` 换算，单 seed 最终 PPL 相对增幅约为 `56.06%/69.83%`。
+
+因此 CM027/CM028 在当前 GPT + FineWeb10B + Muon 配置下同时未通过质量非劣和 wall-clock 收益目标；`eta=1` 消除了先前 `eta=0.1` 的双重平滑嫌疑，但不足以避免 `ratio=0.2` 的明显收敛损失。结果只有一个 training seed，不用于估计方差，但两个规模方向一致且差距远大于预设 `Δloss≤0.02` 门槛，当前无需直接追加相同配置的多 seed 重复。
