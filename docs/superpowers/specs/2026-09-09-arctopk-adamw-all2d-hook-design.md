@@ -82,7 +82,9 @@ cannot drift. The builder receives the existing parameter groups and applies:
 ```text
 lr = hp.lr for every group
 betas = (0.9, 0.95) for every group
-weight_decay = hp.weight_decay
+weight_decay = hp.weight_decay as the optimizer default, while preserving
+               existing group-level overrides such as zero decay for
+               embedding and language-model-head groups
 eps = the torch.optim.AdamW default unless an existing explicit setting is added
 ```
 
@@ -262,4 +264,3 @@ and verifying the code and launcher.
 - Supporting world-size-changing resume.
 - Changing Muon update ownership or CM033 behavior.
 - Claiming quality or speed until the formal paired experiment completes.
-
