@@ -174,3 +174,16 @@ DDP-hook ARC 把梯度同步移入 backward，代价是 backward CPU range 相�
 | CM033 all-2D hook | 4.6718 | **100.43 ms** | 7844 MiB |
 
 all-2D hook 相对 dense 单步快 `1.15%`，相对 optimizer ARC 快 `9.63%`，说明完整异步 hook 加上更大压缩覆盖范围已经消除 optimizer-side 串行路径的 wall-clock 劣势。但它相对 dense 的 validation loss 高 `0.7814`，相对 optimizer ARC 也高 `0.3363`；峰值显存分别多 `1010/867 MiB`。因此该配置只通过速度目标，没有通过质量目标，不能声称 time-to-quality 改善，也不值得原样追加 130M。后续质量筛选应优先降低 embedding/lm_head 的压缩强度或采用分角色 ratio。
+
+## CM034：AdamW all-2D hook GPT-60M 1.1B-token 训练（2026-09-09）
+
+使用与 CM033 相同的 4 GPU、FineWeb10B、seq256、global batch512、device batch128/GA1、8393 updates（约 1.1B tokens）、seed42、ratio0.2/rank4/eta1、step1000 后压缩和 160 MiB bucket cap，串行比较标准 dense AdamW 与 all-2D ARC DDP-hook AdamW。两种模式先在共同 device batch 上通过 probe，两个 formal cell 和 controller 均 exit 0。
+
+| 模式 | final validation loss | PPL | step average | tokens/s | peak memory |
+|---|---:|---:|---:|---:|---:|
+| dense AdamW | **4.0959** | **60.09** | **100.15 ms** | **1,308,756.86** | **6882 MiB** |
+| all-2D ARC-hook AdamW | 4.7810 | 119.22 | 101.97 ms | 1,285,397.67 | 7893 MiB |
+
+all-2D ARC-hook AdamW 相对 dense 的 validation loss 高 `0.6851`，PPL 高约 `98.40%`，step average 慢 `1.82%`，吞吐低 `1.78%`，峰值显存多 `1011 MiB`（`14.69%`）。PPL 为 `exp(loss)`，采用当前 FineWeb10B/GPT-2 tokenizer validation 口径，只用于仓库内部对比，不能与官方 ARC-TopK 的 C4/T5-base tokenizer 数字直接比较。
+
+因此 CM034 同时未通过质量和 wall-clock 目标。它说明 CM033 的严重质量退化并非只与 Muon 更新规则有关：标准 AdamW 使用同一 all-2D、ratio0.2 压缩边界时也出现接近翻倍的 PPL，而且没有速度收益。当前配置不应原样扩展；后续应优先让 embedding/lm_head 恢复 dense，或采用更高、分角色的 ratio，再做短质量筛选。
