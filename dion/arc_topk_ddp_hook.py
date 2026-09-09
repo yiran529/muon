@@ -10,7 +10,6 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.nn import Parameter
-from torch.optim import Optimizer
 from torch.profiler import record_function
 
 from .arc_topk_sync import ArcTopKSyncConfig
@@ -89,7 +88,7 @@ def _completed_future(device: torch.device) -> torch.futures.Future:
 
 
 class ArcTopKDDPState:
-    """Stable per-parameter ARC state and explicit optimizer-step lifecycle."""
+    """Stable per-parameter ARC state and explicit compressor-step lifecycle."""
 
     def __init__(
         self,
@@ -100,7 +99,6 @@ class ArcTopKDDPState:
         optimizer_parameters: Sequence[Parameter],
         config: ArcTopKSyncConfig,
         find_unused_parameters: bool = False,
-        optimizer: Optional[Optimizer] = None,
     ) -> None:
         if find_unused_parameters:
             raise ValueError("ARC DDP hook requires find_unused_parameters=False")
@@ -144,7 +142,6 @@ class ArcTopKDDPState:
         self.process_group = process_group
         self.fingerprint = fingerprint
         self.config = config
-        self.optimizer = optimizer
         self.parameter_specs = tuple(parameter_specs)
         self.world_size = (
             dist.get_world_size(process_group) if process_group is not None else 1
@@ -193,33 +190,10 @@ class ArcTopKDDPState:
             for spec in self.parameter_specs
         ]
 
-    def _optimizer_step(self) -> Optional[int]:
-        if self.optimizer is None:
-            return None
-        steps = {int(group["step"]) for group in self.optimizer.param_groups}
-        if len(steps) != 1:
-            raise RuntimeError("Muon parameter groups disagree on their committed step")
-        return steps.pop()
-
-    def _require_committed_boundary(
-        self,
-        operation: str,
-        *,
-        require_optimizer_match: bool = True,
-    ) -> None:
+    def _require_committed_boundary(self, operation: str) -> None:
         if self._active_step is not None or not self.tail_future.done():
             raise RuntimeError(
                 f"ARC compressor {operation} requires a committed step boundary"
-            )
-        optimizer_step = self._optimizer_step()
-        if (
-            require_optimizer_match
-            and optimizer_step is not None
-            and optimizer_step != self.committed_step
-        ):
-            raise RuntimeError(
-                "Muon and ARC compressor committed steps disagree: "
-                f"Muon={optimizer_step}, compressor={self.committed_step}"
             )
 
     def checkpoint_metadata(self) -> dict[str, Any]:
@@ -431,7 +405,7 @@ class ArcTopKDDPState:
         }
 
     def load_state_dict(self, state_dict: dict) -> None:
-        self._require_committed_boundary("load", require_optimizer_match=False)
+        self._require_committed_boundary("load")
         try:
             shared = state_dict["shared"]
         except KeyError as exc:
@@ -485,12 +459,6 @@ class ArcTopKDDPState:
             parameter_state.g_local.copy_(tensors["g_local"])
             parameter_state.g_global.copy_(tensors["g_global"])
         checkpoint_step = int(shared["committed_step"])
-        optimizer_step = self._optimizer_step()
-        if optimizer_step is not None and optimizer_step != checkpoint_step:
-            raise ValueError(
-                "Muon and ARC compressor committed steps disagree: "
-                f"Muon={optimizer_step}, compressor={checkpoint_step}"
-            )
         self.committed_step = checkpoint_step
 
 

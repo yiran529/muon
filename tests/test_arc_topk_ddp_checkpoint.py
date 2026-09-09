@@ -2,6 +2,7 @@
 
 import copy
 import argparse
+import inspect
 import json
 import os
 import socket
@@ -36,7 +37,7 @@ class _FakeBucket:
         return self._buffer
 
 
-def _state(*, optimizer=None):
+def _state():
     matrix = torch.nn.Parameter(torch.zeros(3, 4))
     auxiliary = torch.nn.Parameter(torch.zeros(4))
     config = ArcTopKSyncConfig(
@@ -55,7 +56,6 @@ def _state(*, optimizer=None):
         ),
         optimizer_parameters=(matrix, auxiliary),
         config=config,
-        optimizer=optimizer,
     )
     return state, matrix
 
@@ -100,23 +100,22 @@ def test_checkpoint_metadata_validation_does_not_overwrite_runtime_identity():
     assert state.fingerprint == "a" * 64
 
 
-class _StepOptimizer:
-    def __init__(self, step):
-        self.param_groups = [{"step": step}]
+def test_hook_state_constructor_has_no_optimizer_dependency():
+    assert "optimizer" not in inspect.signature(ArcTopKDDPState).parameters
 
 
-def test_snapshot_and_load_require_matching_committed_muon_step():
-    state, _ = _state(optimizer=_StepOptimizer(step=1))
-
-    with pytest.raises(RuntimeError, match="Muon.*compressor"):
+def test_snapshot_progress_is_owned_only_by_compressor_commit():
+    state, matrix = _state()
+    state.begin_step()
+    context = state.note_bucket(
+        _FakeBucket([matrix, state.parameter_specs[1].parameter])
+    )
+    context.completion_future.set_result(context.buffer)
+    state.finish_step()
+    with pytest.raises(RuntimeError, match="committed step boundary"):
         state.state_dict()
-
-    source, _ = _state(optimizer=_StepOptimizer(step=0))
-    payload = source.state_dict()
-    payload["shared"]["committed_step"] = 2
-    destination, _ = _state(optimizer=_StepOptimizer(step=1))
-    with pytest.raises(ValueError, match="Muon.*compressor"):
-        destination.load_state_dict(payload)
+    state.commit_step()
+    assert state.state_dict()["shared"]["committed_step"] == 1
 
 
 def test_snapshot_rejects_an_active_step_or_in_flight_future():
