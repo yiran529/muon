@@ -116,9 +116,36 @@ Task 12 在 batching 后的最终 HEAD 上运行方案指定的完整 repository
 
 保持 CM029/CM030 的 GPT-60M/130M、4 GPU、device batch 128/GA1、seq 256、ARC 参数和 160 MiB bucket cap；每个模型/模式只采集一个稳定 final-microstep + optimizer trace。先完成 optimizer/hook 四个 cell，随后在同一 CM031 artifact 中补充两个 dense cell。6 个 cell 均 exit 0、各有 4 份 rank trace，unattributed NCCL fraction 为 0。GPU 4–7 与外部进程共享，以下数字只用于关键路径归因；profile window 也不能替代无 profiler 的稳定 wall-clock。
 
-| 模型 | dense / optimizer / hook profile window | dense / optimizer / hook NCCL union | dense / optimizer / hook exposed tail | hook ARC/backward overlap |
-|---|---:|---:|---:|---:|
-| GPT-60M | 166.280 / 158.670 / 162.164 ms | 87.510 / 78.095 / 71.929 ms | 81.042 / 73.380 / 1.189 ms | 0.000 ms |
-| GPT-130M | 261.345 / 274.757 / 258.927 ms | 79.545 / 70.398 / 58.918 ms | 45.735 / 60.023 / 1.154 ms | 18.888 ms |
+### 完整阶段与关键路径
 
-相对 dense，hook 将 exposed gradient-sync tail 降低 `98.53%/97.48%`，profile window 分别低 `2.48%/0.93%`；相对 optimizer ARC，hook tail 仍降低约 98%，130M 还把 18.888 ms ARC collective 与 genuine backward compute 重叠，profile window 低 5.76%。60M 没有测得严格 ARC overlap，hook profile window比 optimizer 高 2.20%，说明固定的 hook 调度/本地压缩成本在较短 backward 上仍会抵消部分通信重排收益。dense 补充 trace 进一步支持 hook 的关键路径机制有效，但 shared-GPU、单 trace 和 profiler 扰动意味着这里只能报告机制证据，不能报告稳定性能胜负。
+下表每行均取四个 rank 的最大值；不同列的最大值不保证来自同一 rank。forward、backward 和 optimizer 是 CPU annotation wall duration，包含其中的调度、hook callback 和可能的等待，不是纯 GPU compute。NCCL/backward overlap 则是 NCCL GPU kernel 与由 `final_backward` 内 CPU op 发射、且排除了 hook-local kernel 的 genuine backward GPU compute 的区间交集。
+
+| 模型 | 模式 | profile window | forward CPU | backward CPU | optimizer CPU | NCCL union | NCCL/backward overlap | exposed NCCL | gradient-sync tail |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| GPT-60M | dense | 166.280 ms | 7.192 ms | 8.020 ms | 8.591 ms | 87.510 ms | 0.000 ms | 87.510 ms | 81.042 ms |
+| GPT-60M | optimizer ARC | 158.670 ms | 5.712 ms | 9.040 ms | 18.714 ms | 78.095 ms | 0.000 ms | 78.095 ms | 73.380 ms |
+| GPT-60M | DDP-hook ARC | 162.164 ms | 5.946 ms | 14.201 ms | 29.174 ms | 71.929 ms | 0.000 ms | 71.929 ms | 1.189 ms |
+| GPT-130M | dense | 261.345 ms | 16.116 ms | 13.828 ms | 9.824 ms | 79.545 ms | 23.609 ms | 56.470 ms | 45.735 ms |
+| GPT-130M | optimizer ARC | 274.757 ms | 13.201 ms | 11.406 ms | 24.504 ms | 70.398 ms | 0.000 ms | 70.398 ms | 60.023 ms |
+| GPT-130M | DDP-hook ARC | 258.927 ms | 9.729 ms | 33.865 ms | 13.436 ms | 58.918 ms | 18.888 ms | 40.346 ms | 1.154 ms |
+
+130M dense 的 GPU overlap 大于 CPU backward annotation 并不矛盾：compute kernel 按其关联的 backward CPU op 归类，异步发射的 GPU kernel 可以在 CPU annotation 退出后继续执行。60M hook 虽没有严格的 kernel 时间交集，但 tail 已降至 1.189 ms，表示大部分梯度通信在最后一个 backward compute kernel 之前完成、落在 compute kernel 之间的空隙，而不是与 compute 同时执行。
+
+### Collective 分类
+
+以下仍是四 rank 最大 GPU kernel duration。ARC 并不压缩所有参数；不适合 ARC 的梯度继续走 dense all-reduce。hook 的 bucket 统计显示，60M 的 `244.5 MiB` 梯度中有 `196.5 MiB` 仍为 dense，130M 的 `510.75 MiB` 中有 `294.75 MiB` 仍为 dense。
+
+| 模型 | 模式 | dense gradient | ARC sketch | ARC selected values | Muon result | NCCL union |
+|---|---|---:|---:|---:|---:|---:|
+| GPT-60M | dense | 81.042 ms | — | — | 6.467 ms | 87.510 ms |
+| GPT-60M | optimizer ARC | 41.822 ms | 27.850 ms | 3.899 ms | 4.715 ms | 78.095 ms |
+| GPT-60M | DDP-hook ARC | 68.309 ms | 0.317 ms | 1.189 ms | 2.604 ms | 71.929 ms |
+| GPT-130M | dense | 70.981 ms | — | — | 8.563 ms | 79.545 ms |
+| GPT-130M | optimizer ARC | 34.915 ms | 18.176 ms | 6.977 ms | 10.967 ms | 70.398 ms |
+| GPT-130M | DDP-hook ARC | 44.435 ms | 0.766 ms | 5.222 ms | 8.624 ms | 58.918 ms |
+
+optimizer ARC 的核心问题不是 NCCL 总量没有下降，而是压缩和通信位于 backward 之后：它没有任何 NCCL/backward overlap，optimizer CPU range 相对 dense 增加 `10.123/14.680 ms`，130M 的 exposed NCCL 和 gradient tail 甚至分别比 dense 高 `13.928/14.288 ms`。因此通信字节减少并不自动转化为关键路径缩短。这与 CM027/CM028 长训练中的 wall-clock 劣势方向一致；CM031 的 60M 单 trace window 反而较低，属于 shared-GPU 单样本波动，不能推翻长训练 timing。
+
+DDP-hook ARC 把梯度同步移入 backward，代价是 backward CPU range 相对 dense 增加 `6.181/20.037 ms`，其中包含 bucket callback、local prepare、Top-K、EF21M state 和 finalize。收益是 NCCL union 相对 dense 降低 `17.80%/25.93%`，gradient tail 降低 `98.53%/97.48%`；130M 还获得 `18.888 ms` genuine overlap。最终 profile window 相对 dense 低 `2.48%/0.93%`，但 60M 相对 optimizer ARC仍高 `2.20%`。60M hook 的 optimizer CPU range `29.174 ms` 中，`muon_result` annotation 单独达到异常的 `22.087 ms`，而对应 NCCL kernel 仅 `2.604 ms`，进一步显示共享 GPU/host 调度噪声，不应把该单点直接解释为算法固有成本。
+
+综合来看，optimizer ARC 慢在 backward 后串行暴露的压缩与多阶段通信；hook 已基本解决同步尾部，但剩余瓶颈是大量未压缩 dense gradient、bucket 内本地压缩/state 搬运，以及较小模型上难以形成有效 GPU overlap 的固定调度成本。CM031 支持这一机制归因，但由于 shared-GPU、每模式单 trace 和 profiler 扰动，只能与 CM029/CM030 的无 profiler timing 联合解读，不能单独声明稳定性能胜负。
