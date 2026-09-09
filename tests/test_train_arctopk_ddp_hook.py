@@ -243,7 +243,9 @@ def _free_port():
         return sock.getsockname()[1]
 
 
-def _formal_loop_worker(rank, world_size, port, case_name, output_dir):
+def _formal_loop_worker(
+    rank, world_size, port, case_name, optimizer_steps, output_dir
+):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(
@@ -295,29 +297,33 @@ def _formal_loop_worker(rank, world_size, port, case_name, output_dir):
             if rank == 0
             else (torch.tensor([[3.0] + [0.0] * 7]), torch.tensor([[0.0, 4.0] + [0.0] * 6]))
         )
-        if runtime.begin_step is not None:
-            runtime.begin_step()
-        for micro_step, input_tensor in enumerate(inputs, start=1):
-            train.forward_backward_micro_step(
-                ddp,
-                input_tensor,
-                None,
-                autocast_ctx=nullcontext(),
-                micro_step=micro_step,
-                grad_accum_steps=2,
-                optimizer_owns_gradient_sync=runtime.optimizer_owns_gradient_sync,
-            )
-        gradient = ddp.module.transformer.h.weight.grad.detach().clone()
-        hook_calls = 0
-        tracker = None
-        if runtime.checkpoint_state is not None:
-            state = runtime.checkpoint_state
-            hook_calls = state._next_context_id
-            tracker = state.parameter_state(ddp.module.transformer.h.weight).h_local.clone()
-            runtime.finish_step()
-        optimizer.step()
-        if runtime.commit_step is not None:
-            runtime.commit_step()
+        for _ in range(optimizer_steps):
+            if runtime.begin_step is not None:
+                runtime.begin_step()
+            for micro_step, input_tensor in enumerate(inputs, start=1):
+                train.forward_backward_micro_step(
+                    ddp,
+                    input_tensor,
+                    None,
+                    autocast_ctx=nullcontext(),
+                    micro_step=micro_step,
+                    grad_accum_steps=2,
+                    optimizer_owns_gradient_sync=runtime.optimizer_owns_gradient_sync,
+                )
+            gradient = ddp.module.transformer.h.weight.grad.detach().clone()
+            hook_calls = 0
+            tracker = None
+            if runtime.checkpoint_state is not None:
+                state = runtime.checkpoint_state
+                hook_calls = state._next_context_id
+                tracker = state.parameter_state(
+                    ddp.module.transformer.h.weight
+                ).h_local.clone()
+                runtime.finish_step()
+            optimizer.step()
+            if runtime.commit_step is not None:
+                runtime.commit_step()
+            ddp.zero_grad(set_to_none=True)
         Path(output_dir, f"{case_name}-rank-{rank}.json").write_text(
             json.dumps(
                 {
@@ -361,11 +367,11 @@ def test_real_two_rank_formal_loop_uses_the_selected_sync_owner(case_name, mode)
         ]
 
 
-def _run_formal_loop_case(case_name):
+def _run_formal_loop_case(case_name, *, optimizer_steps=1):
     with tempfile.TemporaryDirectory(prefix="arc-formal-loop-") as output_dir:
         mp.spawn(
             _formal_loop_worker,
-            args=(2, _free_port(), case_name, output_dir),
+            args=(2, _free_port(), case_name, optimizer_steps, output_dir),
             nprocs=2,
             join=True,
         )
@@ -376,8 +382,8 @@ def _run_formal_loop_case(case_name):
 
 
 def test_real_two_rank_full_support_adamw_hook_matches_dense_adamw():
-    dense_results = _run_formal_loop_case("dense_adamw")
-    hook_results = _run_formal_loop_case("hook_adamw")
+    dense_results = _run_formal_loop_case("dense_adamw", optimizer_steps=2)
+    hook_results = _run_formal_loop_case("hook_adamw", optimizer_steps=2)
 
     for dense_result, hook_result in zip(dense_results, hook_results):
         dense_parameters = dense_result["parameters"]
