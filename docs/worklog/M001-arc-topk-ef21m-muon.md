@@ -781,3 +781,7 @@ controller 与四个 cell 均 exit 0，60M/130M 的 hook 和 optimizer probe 都
 继续使用用户授权的 shared GPU 4–7，并在 plan、cell environment、status 与 GPU snapshot 中显式记录 `shared_gpu=true` 和外部进程。controller 不等待 GPU idle，也不停止或修改外部进程；每个 cell 前要求四卡各至少 16 GiB 空闲，否则 fail closed。该 profiler 仅用于 kernel/collective 分类、真实 backward overlap 和 exposed tail 归因，不把 profile-window 时长当作无干扰的稳定 wall-clock 结论。
 
 controller 在 commit `f81ef95` 落盘；shell syntax、四个目标 cell、shared-GPU provenance 和空闲显存门槛静态 gate 通过。2026-09-09 10:43 CST 在 GPU 4–7 各剩余约 22.25 GiB 时启动 tmux session `cm031_shared_profile`，PID `1621687`；一次性检查确认进程和 pane 存活，并已开始 60M optimizer profile，后续不主动轮询。
+
+四个 cell 和 controller 均 exit 0，每个 cell 生成 4 份 rank trace，严格 summary 的 unattributed NCCL fraction 均为 0。60M optimizer/hook 的 profile window 为 `158.670/162.164 ms`，hook 慢 `2.20%`；NCCL union 为 `78.095/71.929 ms`，exposed gradient tail 从 `73.380 ms` 降至 `1.189 ms`，但严格口径下没有测得 ARC/backward compute overlap。130M optimizer/hook 的 profile window 为 `274.757/258.927 ms`，hook 快 `5.76%`；NCCL union 为 `70.398/58.918 ms`，exposed tail 从 `60.023 ms` 降至 `1.154 ms`，并测得 `18.888 ms` genuine overlap。
+
+因此 trace 明确支持 hook 把 ARC 同步从 optimizer 后置串行路径移出、几乎消除 gradient-sync tail；130M 的较长 backward 还能实际覆盖约 18.9 ms ARC collective。60M 虽然 tail 同样下降，但没有形成严格定义的 compute overlap，profile window 反而略高，说明较小模型下 hook 调度、本地压缩与后续 Muon 路径开销足以抵消尾部收益。该方向与 CM029/CM030 的单次 wall-clock 观察一致，但所有 GPU 均与外部任务共享、每模式只有一份 targeted trace，绝对时长受竞争和 profiler 扰动，不能据此声明稳定加速或显著性。
