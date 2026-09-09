@@ -761,3 +761,9 @@ hook 在所有 GA 均快于 dense、慢于 optimizer ARC。hook trace 的 backwa
 四组均正常完成，controller exit code 为 0；60M 和 130M 都在 `device_batch=128/GA1` 通过 ARC 与 dense probe，没有触发 OOM 回退。60M dense/ARC 的最终 validation loss 为 `3.8904/4.3355`，step average 为 `101.60/111.13 ms`，峰值显存为 `6834/6977 MiB`；ARC loss 高 `0.4451`，单步慢 `9.38%`。130M dense/ARC 的最终 validation loss 为 `3.5648/4.0944`，step average 为 `213.98/238.51 ms`，峰值显存为 `12760/13422 MiB`；ARC loss 高 `0.5296`，单步慢 `11.46%`。按 `exp(Δloss)-1` 换算，单 seed 最终 PPL 相对增幅约为 `56.06%/69.83%`。
 
 因此 CM027/CM028 在当前 GPT + FineWeb10B + Muon 配置下同时未通过质量非劣和 wall-clock 收益目标；`eta=1` 消除了先前 `eta=0.1` 的双重平滑嫌疑，但不足以避免 `ratio=0.2` 的明显收敛损失。结果只有一个 training seed，不用于估计方差，但两个规模方向一致且差距远大于预设 `Δloss≤0.02` 门槛，当前无需直接追加相同配置的多 seed 重复。
+
+## 2026-09-09：CM029/CM030 当前质量负载下 hook vs optimizer 短测设计
+
+为解释 CM027/CM028 optimizer-side ARC 的负 wall-clock，用户要求在相同超参数负载上用一两百步直接比较 DDP hook 与 optimizer ARC。预登记 GPT-60M/130M 各两个 cell，保持 4 卡、BF16、compile、FineWeb10B、seq 256、effective local batch 128/global batch 512、ratio 0.2、projection rank 4、eta 1 和 seed 42；短测将 compression start 改为 0，并使用 20 warmup + 200 measured updates、160 MiB hook bucket cap、关闭 W&B/profiler。每个模型优先 device batch 128/GA1；hook 与 optimizer 都通过三步 compressed-path probe 后才正式运行，明确 OOM 时 pair 共同回退到 64/GA2、32/GA4，非 OOM 错误 fail closed。
+
+用户授权共享 GPU 4–7。启动前检查显示四卡各由用户 `wyz` 的既有进程占用约 1818 MiB，剩余约 22.7 GiB；controller 不停止、修改或向这些进程发送信号，只记录每个 cell 前后的 GPU/进程快照。由于外部进程可能造成竞争，CM029/CM030 定位为 shared-GPU、single-run exploratory evidence，不进入稳定正式性能主表。60M 按 optimizer→hook、130M 按 hook→optimizer 运行，以部分平衡固定顺序偏差。
