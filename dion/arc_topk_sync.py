@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Generator, Iterable, Optional
+from typing import Generator, Iterable, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -24,6 +24,7 @@ class ArcTopKSyncConfig:
     seed: int = 42
     start_compress_step: int = 0
     seed_scheme_version: int = 1
+    error_feedback: Literal["ef21m", "ef14"] = "ef21m"
 
     def __post_init__(self) -> None:
         validate_arc_topk_config(
@@ -32,6 +33,10 @@ class ArcTopKSyncConfig:
             self.eta,
             self.start_compress_step,
         )
+        if self.error_feedback not in ("ef21m", "ef14"):
+            raise ValueError(
+                f"error_feedback must be 'ef21m' or 'ef14', got {self.error_feedback!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,8 @@ def synchronize_arc_batch_async(
         raise ValueError("params and states must have equal lengths")
     if not params:
         return []
+    if config.error_feedback != "ef21m":
+        raise ValueError("optimizer-side ARC synchronization supports only ef21m")
 
     for param, state in zip(params, states):
         initialize_arc_state_(state, param)

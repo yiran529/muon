@@ -24,6 +24,7 @@ from dion.opt_utils import lm_head_lr_scale
 
 
 ArcSyncMode = Literal["optimizer", "ddp_hook"]
+ArcErrorFeedback = Literal["ef21m", "ef14"]
 
 
 @dataclass
@@ -37,6 +38,7 @@ class ArcTopKHyperparameters(train.Hyperparameters):
     arc_eta: float = 0.1
     arc_seed: int = 42
     arc_start_compress_step: int = 300
+    arc_error_feedback: ArcErrorFeedback = "ef21m"
 
 
 def configure_arc_topk_parser(parser: argparse.ArgumentParser) -> None:
@@ -47,6 +49,9 @@ def configure_arc_topk_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--arc_eta", type=float, default=None)
     parser.add_argument("--arc_seed", type=int, default=None)
     parser.add_argument("--arc_start_compress_step", type=int, default=None)
+    parser.add_argument(
+        "--arc_error_feedback", choices=("ef21m", "ef14"), default=None
+    )
     parser.add_argument(
         "--arc_sync_mode",
         choices=("optimizer", "ddp_hook"),
@@ -69,6 +74,8 @@ def validate_arc_topk_hyperparameters(hp: ArcTopKHyperparameters) -> None:
         raise ValueError(f"Unsupported ARC optimizer: {hp.optimizer}")
     if hp.optimizer == "arc_topk_adamw" and hp.arc_sync_mode != "ddp_hook":
         raise ValueError("arc_topk_adamw requires arc_sync_mode=ddp_hook")
+    if hp.arc_error_feedback == "ef14" and hp.arc_sync_mode != "ddp_hook":
+        raise ValueError("ef14 requires arc_sync_mode=ddp_hook")
     arc_optimizer_owns_gradient_sync(hp.arc_sync_mode)
 
 
@@ -84,6 +91,7 @@ def install_arc_topk_ddp_hook(
         eta=hp.arc_eta,
         seed=hp.arc_seed,
         start_compress_step=hp.arc_start_compress_step,
+        error_feedback=hp.arc_error_feedback,
     )
     named_parameters = list(model.named_parameters())
     specs = tuple(
@@ -192,6 +200,7 @@ def init_arc_topk_optimizer(
     train.print0(f"ARC-TopK ratio: {hp.arc_topk_ratio}")
     train.print0(f"ARC projection rank: {hp.arc_projection_rank}")
     train.print0(f"EF21M eta: {hp.arc_eta}")
+    train.print0(f"ARC error feedback: {hp.arc_error_feedback}")
     train.print0(f"ARC compression starts after step: {hp.arc_start_compress_step}")
     train.print0(f"Muon LR adjust method: {hp.adjust_lr}")
     train.print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")

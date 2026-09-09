@@ -26,17 +26,18 @@ class FakeGradBucket:
         return self._buffer
 
 
-def _config():
+def _config(error_feedback="ef21m"):
     return ArcTopKSyncConfig(
         ratio=0.5,
         projection_rank=2,
         eta=0.25,
         seed=17,
         start_compress_step=1,
+        error_feedback=error_feedback,
     )
 
 
-def _make_state(parameters, specs=None, **kwargs):
+def _make_state(parameters, specs=None, config=None, **kwargs):
     if specs is None:
         specs = [
             ArcTopKDDPParameterSpec(
@@ -52,7 +53,7 @@ def _make_state(parameters, specs=None, **kwargs):
         fingerprint="a" * 64,
         parameter_specs=specs,
         optimizer_parameters=[parameter for parameter, _, _ in parameters],
-        config=_config(),
+        config=_config() if config is None else config,
         **kwargs,
     )
 
@@ -203,3 +204,58 @@ def test_fresh_state_dict_preallocates_complete_stable_name_tensor_schema():
     torch.testing.assert_close(
         payload["shared"]["g_global"]["matrix"], torch.zeros_like(matrix)
     )
+
+
+def test_ef14_state_dict_contains_only_rank_local_residual():
+    matrix = torch.nn.Parameter(torch.zeros(2, 2))
+    state = _make_state(
+        [(matrix, "matrix", "arc_matrix")],
+        config=_config(error_feedback="ef14"),
+    )
+
+    parameter_state = state.parameter_state(matrix)
+    assert parameter_state.h_local is None
+    assert parameter_state.g_local is None
+    assert parameter_state.g_global is None
+    torch.testing.assert_close(parameter_state.residual, torch.zeros_like(matrix))
+    payload = state.state_dict()
+    assert "g_global" not in payload["shared"]
+    assert set(payload["rank_0"]["matrix"]) == {"residual"}
+
+
+def test_ef14_checkpoint_round_trip_restores_residual_and_step():
+    matrix = torch.nn.Parameter(torch.zeros(2, 2))
+    config = _config(error_feedback="ef14")
+    source = _make_state(
+        [(matrix, "matrix", "arc_matrix")], config=config
+    )
+    source.parameter_state(matrix).residual.copy_(
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    )
+    source.committed_step = 7
+    payload = source.state_dict()
+
+    restored_matrix = torch.nn.Parameter(torch.zeros(2, 2))
+    restored = _make_state(
+        [(restored_matrix, "matrix", "arc_matrix")], config=config
+    )
+    restored.load_state_dict(payload)
+
+    assert restored.committed_step == 7
+    torch.testing.assert_close(
+        restored.parameter_state(restored_matrix).residual,
+        source.parameter_state(matrix).residual,
+    )
+
+
+def test_checkpoint_rejects_cross_error_feedback_mode():
+    matrix = torch.nn.Parameter(torch.zeros(2, 2))
+    ef14 = _make_state(
+        [(matrix, "matrix", "arc_matrix")],
+        config=_config(error_feedback="ef14"),
+    )
+    payload = ef14.state_dict()
+    ef21m = _make_state([(matrix, "matrix", "arc_matrix")])
+
+    with pytest.raises(ValueError, match="config"):
+        ef21m.load_state_dict(payload)

@@ -1,7 +1,7 @@
-"""Asynchronous DDP bucket communication state for ARC-TopK/EF21M."""
+"""Asynchronous DDP bucket communication state for ARC-TopK EF21M/EF14."""
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Optional, Sequence, Union
 import math
 import threading
 
@@ -15,18 +15,21 @@ from torch.profiler import record_function
 from .arc_topk_sync import ArcTopKSyncConfig
 from .arc_topk import (
     ArcPreparedBatch,
+    EF14PreparedBatch,
     arc_topk_support,
     derive_arc_seed,
     finalize_arc_full_support_,
     finalize_arc_sparse_,
+    finalize_ef14_sparse_,
     gather_rows,
     make_gaussian_projection,
     prepare_arc_batch,
+    prepare_ef14_batch,
 )
 from .collective_observer import observe_collective
 
 
-ARC_COMPRESSOR_SCHEMA_VERSION = 1
+ARC_COMPRESSOR_SCHEMA_VERSION = 2
 
 
 def _profile_args(**values: Any) -> str:
@@ -44,9 +47,10 @@ class ArcTopKDDPParameterSpec:
 @dataclass
 class ArcParameterState:
     spec: ArcTopKDDPParameterSpec
-    h_local: Tensor
-    g_local: Tensor
-    g_global: Tensor
+    h_local: Optional[Tensor]
+    g_local: Optional[Tensor]
+    g_global: Optional[Tensor]
+    residual: Optional[Tensor]
     last_support: Optional[Tensor] = None
 
 
@@ -70,7 +74,7 @@ class BucketContext:
 class _SparseBucketGroup:
     gradients: tuple[Tensor, ...]
     parameter_states: tuple[ArcParameterState, ...]
-    prepared: ArcPreparedBatch
+    prepared: Union[ArcPreparedBatch, EF14PreparedBatch]
     rows: int
     columns: int
     support_batch: Optional[Tensor] = None
@@ -156,9 +160,26 @@ class ArcTopKDDPState:
         self._parameter_states = {
             id(spec.parameter): ArcParameterState(
                 spec=spec,
-                h_local=torch.zeros_like(spec.parameter),
-                g_local=torch.zeros_like(spec.parameter),
-                g_global=torch.zeros_like(spec.parameter),
+                h_local=(
+                    torch.zeros_like(spec.parameter)
+                    if config.error_feedback == "ef21m"
+                    else None
+                ),
+                g_local=(
+                    torch.zeros_like(spec.parameter)
+                    if config.error_feedback == "ef21m"
+                    else None
+                ),
+                g_global=(
+                    torch.zeros_like(spec.parameter)
+                    if config.error_feedback == "ef21m"
+                    else None
+                ),
+                residual=(
+                    torch.zeros_like(spec.parameter)
+                    if config.error_feedback == "ef14"
+                    else None
+                ),
             )
             for spec in self.parameter_specs
             if spec.role == "arc_matrix"
@@ -233,9 +254,12 @@ class ArcTopKDDPState:
             raise ValueError("ARC compressor checkpoint committed step is invalid")
 
     def _validate_replicated_global_state(self) -> None:
+        if self.config.error_feedback == "ef14":
+            return
         if self.process_group is None or self.world_size <= 1:
             return
         for parameter_state in self._parameter_states.values():
+            assert parameter_state.g_global is not None
             gathered = [
                 torch.empty_like(parameter_state.g_global)
                 for _ in range(self.world_size)
@@ -388,21 +412,24 @@ class ArcTopKDDPState:
             for spec in self.parameter_specs
             if (state := self._parameter_states.get(id(spec.parameter))) is not None
         ]
-        return {
-            "shared": {
-                **self.checkpoint_metadata(),
-                "g_global": {
-                    state.spec.stable_name: state.g_global for state in arc_states
-                },
-            },
-            f"rank_{self.global_rank}": {
+        shared = self.checkpoint_metadata()
+        if self.config.error_feedback == "ef21m":
+            shared["g_global"] = {
+                state.spec.stable_name: state.g_global for state in arc_states
+            }
+            rank_state = {
                 state.spec.stable_name: {
                     "h_local": state.h_local,
                     "g_local": state.g_local,
                 }
                 for state in arc_states
-            },
-        }
+            }
+        else:
+            rank_state = {
+                state.spec.stable_name: {"residual": state.residual}
+                for state in arc_states
+            }
+        return {"shared": shared, f"rank_{self.global_rank}": rank_state}
 
     def load_state_dict(self, state_dict: dict) -> None:
         self._require_committed_boundary("load")
@@ -414,7 +441,6 @@ class ArcTopKDDPState:
         rank_key = f"rank_{self.global_rank}"
         try:
             rank_state = state_dict[rank_key]
-            global_state = shared["g_global"]
         except KeyError as exc:
             raise ValueError(
                 f"ARC compressor checkpoint is missing state for {rank_key}"
@@ -430,34 +456,47 @@ class ArcTopKDDPState:
                 "ARC compressor rank-local state mismatch; "
                 f"missing={missing}, extra={extra}"
             )
-        if set(global_state) != expected_names:
-            missing = sorted(expected_names - set(global_state))
-            extra = sorted(set(global_state) - expected_names)
-            raise ValueError(
-                "ARC compressor global state mismatch; "
-                f"missing={missing}, extra={extra}"
-            )
+        global_state = shared.get("g_global")
+        if self.config.error_feedback == "ef21m":
+            if not isinstance(global_state, dict) or set(global_state) != expected_names:
+                actual_names = set(global_state) if isinstance(global_state, dict) else set()
+                missing = sorted(expected_names - actual_names)
+                extra = sorted(actual_names - expected_names)
+                raise ValueError(
+                    "ARC compressor global state mismatch; "
+                    f"missing={missing}, extra={extra}"
+                )
+        elif global_state is not None:
+            raise ValueError("EF14 compressor checkpoint must not contain global state")
         for parameter_state in self._parameter_states.values():
             name = parameter_state.spec.stable_name
             local_entry = rank_state[name]
-            if set(local_entry) != {"h_local", "g_local"}:
+            expected_fields = (
+                {"h_local", "g_local"}
+                if self.config.error_feedback == "ef21m"
+                else {"residual"}
+            )
+            if set(local_entry) != expected_fields:
                 raise ValueError(
                     f"ARC compressor state fields mismatch for parameter {name!r}"
                 )
-            tensors = {
-                "h_local": local_entry["h_local"],
-                "g_local": local_entry["g_local"],
-                "g_global": global_state[name],
-            }
+            tensors = (
+                {
+                    "h_local": local_entry["h_local"],
+                    "g_local": local_entry["g_local"],
+                    "g_global": global_state[name],
+                }
+                if self.config.error_feedback == "ef21m"
+                else {"residual": local_entry["residual"]}
+            )
             for field_name, source in tensors.items():
                 destination = getattr(parameter_state, field_name)
+                assert destination is not None
                 if source.shape != destination.shape or source.dtype != destination.dtype:
                     raise ValueError(
                         f"ARC compressor tensor schema mismatch for {name!r}/{field_name}"
                     )
-            parameter_state.h_local.copy_(tensors["h_local"])
-            parameter_state.g_local.copy_(tensors["g_local"])
-            parameter_state.g_global.copy_(tensors["g_global"])
+                destination.copy_(source)
         checkpoint_step = int(shared["committed_step"])
         self.committed_step = checkpoint_step
 
@@ -519,6 +558,7 @@ def _launch_full_support_bucket(
     context: BucketContext,
 ) -> torch.futures.Future:
     prepared_views = []
+    ef14_states = []
     with record_function("arc_hook/local_prepare"):
         for gradient, parameter_state in zip(
             context.gradients,
@@ -526,6 +566,14 @@ def _launch_full_support_bucket(
         ):
             if parameter_state is None:
                 continue
+            if state.config.error_feedback == "ef14":
+                assert parameter_state.residual is not None
+                parameter_state.residual.zero_()
+                ef14_states.append(parameter_state)
+                continue
+            assert parameter_state.h_local is not None
+            assert parameter_state.g_local is not None
+            assert parameter_state.g_global is not None
             prepared = prepare_arc_batch(
                 gradient.unsqueeze(0),
                 parameter_state.h_local.unsqueeze(0),
@@ -562,6 +610,12 @@ def _launch_full_support_bucket(
                 parameter_state.last_support = torch.arange(
                     parameter_state.h_local.shape[0],
                     device=parameter_state.h_local.device,
+                )
+            for parameter_state in ef14_states:
+                assert parameter_state.residual is not None
+                parameter_state.last_support = torch.arange(
+                    parameter_state.residual.shape[0],
+                    device=parameter_state.residual.device,
                 )
         return context.buffer
 
@@ -661,11 +715,17 @@ def _launch_sparse_bucket(
     ):
         if parameter_state is None:
             continue
+        state_tensor = (
+            parameter_state.h_local
+            if state.config.error_feedback == "ef21m"
+            else parameter_state.residual
+        )
+        assert state_tensor is not None
         key = (
             gradient.shape,
             gradient.dtype,
             gradient.device,
-            parameter_state.h_local.dtype,
+            state_tensor.dtype,
         )
         grouped_entries.setdefault(key, []).append((gradient, parameter_state))
 
@@ -677,7 +737,13 @@ def _launch_sparse_bucket(
             parameter_states = tuple(
                 parameter_state for _gradient, parameter_state in entries
             )
-            rows, columns = parameter_states[0].h_local.shape
+            first_state_tensor = (
+                parameter_states[0].h_local
+                if state.config.error_feedback == "ef21m"
+                else parameter_states[0].residual
+            )
+            assert first_state_tensor is not None
+            rows, columns = first_state_tensor.shape
             projections = [
                 make_gaussian_projection(
                     1,
@@ -693,27 +759,33 @@ def _launch_sparse_bucket(
                 )
                 for gradient, parameter_state in entries
             ]
-            tracker_batch = torch.stack(
-                [parameter_state.h_local for parameter_state in parameter_states]
-            )
-            prepared = prepare_arc_batch(
-                torch.stack(gradients),
-                tracker_batch,
-                torch.stack(
-                    [parameter_state.g_local for parameter_state in parameter_states]
-                ),
-                torch.stack(
-                    [parameter_state.g_global for parameter_state in parameter_states]
-                ),
-                config=state.config,
-                step=context.step,
-                projection_batch=torch.cat(projections, dim=0),
-            )
-            assert prepared.local_sketch_batch is not None
-            torch._foreach_copy_(
-                [parameter_state.h_local for parameter_state in parameter_states],
-                list(tracker_batch.unbind(0)),
-            )
+            if state.config.error_feedback == "ef21m":
+                h_locals = [parameter_state.h_local for parameter_state in parameter_states]
+                g_locals = [parameter_state.g_local for parameter_state in parameter_states]
+                g_globals = [parameter_state.g_global for parameter_state in parameter_states]
+                assert all(tensor is not None for tensor in h_locals + g_locals + g_globals)
+                tracker_batch = torch.stack(h_locals)
+                prepared = prepare_arc_batch(
+                    torch.stack(gradients),
+                    tracker_batch,
+                    torch.stack(g_locals),
+                    torch.stack(g_globals),
+                    config=state.config,
+                    step=context.step,
+                    projection_batch=torch.cat(projections, dim=0),
+                )
+                assert prepared.local_sketch_batch is not None
+                torch._foreach_copy_(h_locals, list(tracker_batch.unbind(0)))
+            else:
+                residuals = [
+                    parameter_state.residual for parameter_state in parameter_states
+                ]
+                assert all(tensor is not None for tensor in residuals)
+                prepared = prepare_ef14_batch(
+                    torch.stack(gradients),
+                    torch.stack(residuals),
+                    projection_batch=torch.cat(projections, dim=0),
+                )
             prepared_groups.append(
                 _SparseBucketGroup(
                     gradients=gradients,
@@ -782,29 +854,41 @@ def _launch_sparse_bucket(
                     group.support_batch.shape[1],
                     group.columns,
                 )
-                finalize_arc_sparse_(
-                    group.prepared,
-                    group.support_batch,
-                    group.local_selected_batch,
-                    averaged_selected,
-                )
+                if state.config.error_feedback == "ef21m":
+                    assert isinstance(group.prepared, ArcPreparedBatch)
+                    finalize_arc_sparse_(
+                        group.prepared,
+                        group.support_batch,
+                        group.local_selected_batch,
+                        averaged_selected,
+                    )
+                    g_locals = [item.g_local for item in group.parameter_states]
+                    g_globals = [item.g_global for item in group.parameter_states]
+                    assert all(tensor is not None for tensor in g_locals + g_globals)
+                    torch._foreach_copy_(
+                        g_locals,
+                        list(group.prepared.local_estimate_batch.unbind(0)),
+                    )
+                    torch._foreach_copy_(
+                        g_globals,
+                        list(group.prepared.global_estimate_batch.unbind(0)),
+                    )
+                    output_batch = group.prepared.global_estimate_batch
+                else:
+                    assert isinstance(group.prepared, EF14PreparedBatch)
+                    output_batch = finalize_ef14_sparse_(
+                        group.prepared,
+                        group.support_batch,
+                        averaged_selected,
+                    )
+                    residuals = [item.residual for item in group.parameter_states]
+                    assert all(tensor is not None for tensor in residuals)
+                    torch._foreach_copy_(
+                        residuals,
+                        list(group.prepared.residual_batch.unbind(0)),
+                    )
                 torch._foreach_copy_(
-                    [
-                        parameter_state.g_local
-                        for parameter_state in group.parameter_states
-                    ],
-                    list(group.prepared.local_estimate_batch.unbind(0)),
-                )
-                torch._foreach_copy_(
-                    [
-                        parameter_state.g_global
-                        for parameter_state in group.parameter_states
-                    ],
-                    list(group.prepared.global_estimate_batch.unbind(0)),
-                )
-                torch._foreach_copy_(
-                    list(group.gradients),
-                    list(group.prepared.global_estimate_batch.unbind(0)),
+                    list(group.gradients), list(output_batch.unbind(0))
                 )
                 offset += count
         return context.buffer
@@ -839,9 +923,14 @@ def _launch_sparse_bucket(
                         group.support_batch.unbind(0),
                     ):
                         parameter_state.last_support = support
-                    assert group.prepared.delta_batch is not None
+                    source_batch = (
+                        group.prepared.delta_batch
+                        if isinstance(group.prepared, ArcPreparedBatch)
+                        else group.prepared.compensated_batch
+                    )
+                    assert source_batch is not None
                     group.local_selected_batch = gather_rows(
-                        group.prepared.delta_batch,
+                        source_batch,
                         group.support_batch,
                     )
                     local_selected_parts.append(

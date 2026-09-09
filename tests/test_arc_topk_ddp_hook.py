@@ -35,7 +35,13 @@ class FakeGradBucket:
         return self._buffer
 
 
-def _state(parameters_and_roles, *, ratio=0.5, start_compress_step=2):
+def _state(
+    parameters_and_roles,
+    *,
+    ratio=0.5,
+    start_compress_step=2,
+    error_feedback="ef21m",
+):
     parameters = [item[0] for item in parameters_and_roles]
     return ArcTopKDDPState(
         process_group=None,
@@ -51,6 +57,7 @@ def _state(parameters_and_roles, *, ratio=0.5, start_compress_step=2):
             eta=0.25,
             seed=17,
             start_compress_step=start_compress_step,
+            error_feedback=error_feedback,
         ),
     )
 
@@ -177,6 +184,51 @@ def test_sparse_hook_preserves_per_parameter_state_across_mixed_shape_bucket_ste
             result[first.numel() : first.numel() + dense.numel()],
             gradients[1],
         )
+        state.commit_step()
+
+
+def test_ef14_sparse_hook_outputs_compressed_gradient_and_carries_residual():
+    parameter = torch.nn.Parameter(torch.zeros(3, 2))
+    state = _state(
+        [(parameter, "matrix", "arc_matrix")],
+        start_compress_step=0,
+        error_feedback="ef14",
+    )
+    reference_residual = torch.zeros_like(parameter)
+
+    for step, gradient in enumerate(
+        [
+            torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]),
+            torch.tensor([[0.0, 0.0], [4.0, 4.0], [1.0, 1.0]]),
+            torch.tensor([[0.0, 0.0], [0.0, 0.0], [5.0, 5.0]]),
+        ],
+        start=1,
+    ):
+        bucket = FakeGradBucket([parameter], [gradient])
+        state.begin_step()
+        output = arc_topk_ddp_hook(state, bucket).wait().view_as(parameter).clone()
+        state.finish_step()
+
+        if step == 1:
+            expected_output = gradient
+            reference_residual.zero_()
+            expected_support = torch.arange(parameter.shape[0])
+        else:
+            compensated = gradient + reference_residual
+            generator = torch.Generator().manual_seed(
+                derive_arc_seed(base_seed=17, step=step, stable_task_id=0)
+            )
+            projection = torch.randn(1, 2, 2, generator=generator)
+            sketch = torch.bmm(compensated.unsqueeze(0), projection).squeeze(0) / math.sqrt(2.0)
+            expected_support = sketch.square().sum(-1).topk(2, sorted=True).indices
+            expected_output = torch.zeros_like(compensated)
+            expected_output[expected_support] = compensated[expected_support]
+            reference_residual = compensated - expected_output
+
+        parameter_state = state.parameter_state(parameter)
+        torch.testing.assert_close(output, expected_output)
+        torch.testing.assert_close(parameter_state.residual, reference_residual)
+        torch.testing.assert_close(parameter_state.last_support, expected_support)
         state.commit_step()
 
 

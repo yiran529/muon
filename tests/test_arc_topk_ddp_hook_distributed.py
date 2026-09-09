@@ -340,3 +340,108 @@ def _sparse_worker(rank, world_size, port):
 
 def test_two_rank_sparse_hook_matches_three_step_parameter_oracle_and_signature():
     mp.spawn(_sparse_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
+def _manual_ef14_oracle(residuals, gradients, *, step, stable_id, rows, columns):
+    if step == 1:
+        return [torch.zeros_like(value) for value in residuals], sum(gradients) / 2, torch.arange(rows)
+    compensated = [
+        gradient + residual for gradient, residual in zip(gradients, residuals)
+    ]
+    generator = torch.Generator().manual_seed(
+        derive_arc_seed(base_seed=17, step=step, stable_task_id=stable_id)
+    )
+    projection = torch.randn(1, columns, 2, generator=generator)
+    sketches = [
+        torch.bmm(value.unsqueeze(0), projection).squeeze(0) / math.sqrt(2.0)
+        for value in compensated
+    ]
+    support = ((sketches[0] + sketches[1]) / 2).square().sum(-1).topk(
+        math.ceil(rows * 0.5), sorted=True
+    ).indices
+    compressed = []
+    next_residuals = []
+    for value in compensated:
+        selected = torch.zeros_like(value)
+        selected[support] = value[support]
+        compressed.append(selected)
+        next_residuals.append(value - selected)
+    return next_residuals, sum(compressed) / 2, support
+
+
+def _ef14_worker(rank, world_size, port):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    try:
+        model = _SparseControlledGradientModel()
+        ddp = DDP(model, gradient_as_bucket_view=True)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, betas=(0.9, 0.999))
+        state = ArcTopKDDPState(
+            process_group=dist.group.WORLD,
+            fingerprint="2" * 64,
+            parameter_specs=[
+                ArcTopKDDPParameterSpec(model.first, "first", 0, "arc_matrix"),
+                ArcTopKDDPParameterSpec(model.second, "second", 1, "arc_matrix"),
+                ArcTopKDDPParameterSpec(model.dense, "dense", 2, "dense_aux"),
+            ],
+            optimizer_parameters=list(model.parameters()),
+            config=ArcTopKSyncConfig(
+                ratio=0.5,
+                projection_rank=2,
+                eta=1.0,
+                seed=17,
+                start_compress_step=0,
+                error_feedback="ef14",
+            ),
+        )
+        ddp.register_comm_hook(state, arc_topk_ddp_hook)
+        residuals = {
+            "first": [torch.zeros_like(model.first) for _ in range(2)],
+            "second": [torch.zeros_like(model.second) for _ in range(2)],
+        }
+
+        for step in range(1, 4):
+            all_gradients = [_sparse_gradients(source_rank, step) for source_rank in range(2)]
+            state.begin_step()
+            ddp(*all_gradients[rank]).backward()
+            state.finish_step()
+            for index, (name, parameter, stable_id) in enumerate(
+                (("first", model.first, 0), ("second", model.second, 1))
+            ):
+                next_residuals, expected_gradient, support = _manual_ef14_oracle(
+                    residuals[name],
+                    [all_gradients[0][index], all_gradients[1][index]],
+                    step=step,
+                    stable_id=stable_id,
+                    rows=parameter.shape[0],
+                    columns=parameter.shape[1],
+                )
+                residuals[name] = next_residuals
+                parameter_state = state.parameter_state(parameter)
+                torch.testing.assert_close(parameter_state.residual, next_residuals[rank])
+                torch.testing.assert_close(parameter_state.last_support, support)
+                torch.testing.assert_close(parameter.grad, expected_gradient)
+            torch.testing.assert_close(
+                model.dense.grad, (all_gradients[0][2] + all_gradients[1][2]) / 2
+            )
+            optimizer.step()
+            state.commit_step()
+            for parameter in model.parameters():
+                for tensor in (
+                    parameter,
+                    optimizer.state[parameter]["exp_avg"],
+                    optimizer.state[parameter]["exp_avg_sq"],
+                ):
+                    gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+                    dist.all_gather(gathered, tensor)
+                    torch.testing.assert_close(gathered[0], gathered[1])
+            optimizer.zero_grad(set_to_none=True)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_two_rank_ef14_hook_matches_reference_and_adamw_moments_agree():
+    mp.spawn(_ef14_worker, args=(2, _free_port()), nprocs=2, join=True)

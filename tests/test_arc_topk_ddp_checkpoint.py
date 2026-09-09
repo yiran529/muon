@@ -179,7 +179,7 @@ def _cli():
     )
 
 
-def _build_runtime(optimizer_name: str, bucket_cap_mb):
+def _build_runtime(optimizer_name: str, bucket_cap_mb, error_feedback="ef21m"):
     import train_arctopk
 
     torch.manual_seed(123)
@@ -195,6 +195,7 @@ def _build_runtime(optimizer_name: str, bucket_cap_mb):
             arc_projection_rank=2,
             arc_eta=0.25,
             arc_start_compress_step=0,
+            arc_error_feedback=error_feedback,
             scalar_opt="adamw",
             lr=0.01,
         ),
@@ -229,11 +230,16 @@ def _snapshot(ddp, state):
     for spec in state.parameter_specs:
         if spec.role == "arc_matrix":
             parameter_state = state.parameter_state(spec.parameter)
-            compressor[spec.stable_name] = {
-                "h_local": parameter_state.h_local.detach().clone(),
-                "g_local": parameter_state.g_local.detach().clone(),
-                "g_global": parameter_state.g_global.detach().clone(),
-            }
+            if state.config.error_feedback == "ef21m":
+                compressor[spec.stable_name] = {
+                    "h_local": parameter_state.h_local.detach().clone(),
+                    "g_local": parameter_state.g_local.detach().clone(),
+                    "g_global": parameter_state.g_global.detach().clone(),
+                }
+            else:
+                compressor[spec.stable_name] = {
+                    "residual": parameter_state.residual.detach().clone()
+                }
     return {
         "parameters": {
             name: parameter.detach().clone()
@@ -251,7 +257,7 @@ def _assert_snapshot_equal(actual, expected):
         torch.testing.assert_close(actual["parameters"][name], expected["parameters"][name])
     assert actual["compressor"].keys() == expected["compressor"].keys()
     for name in actual["compressor"]:
-        for field in ("h_local", "g_local", "g_global"):
+        for field in actual["compressor"][name]:
             torch.testing.assert_close(
                 actual["compressor"][name][field],
                 expected["compressor"][name][field],
@@ -259,7 +265,7 @@ def _assert_snapshot_equal(actual, expected):
 
 
 def _dcp_round_trip_worker(
-    rank, world_size, port, checkpoint_dir, output_dir, optimizer_name
+    rank, world_size, port, checkpoint_dir, output_dir, optimizer_name, error_feedback
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -270,7 +276,7 @@ def _dcp_round_trip_worker(
         import train
 
         ddp, optimizer, runtime = _build_runtime(
-            optimizer_name, bucket_cap_mb=25
+            optimizer_name, bucket_cap_mb=25, error_feedback=error_feedback
         )
         state = runtime.checkpoint_state
         train_loader = _Loader()
@@ -292,7 +298,7 @@ def _dcp_round_trip_worker(
         uninterrupted = _snapshot(ddp, state)
 
         rebuilt_ddp, rebuilt_optimizer, rebuilt_runtime = _build_runtime(
-            optimizer_name, bucket_cap_mb=0.0001
+            optimizer_name, bucket_cap_mb=0.0001, error_feedback=error_feedback
         )
         rebuilt_state = rebuilt_runtime.checkpoint_state
         rebuilt_manager = train.CheckpointManager(
@@ -317,25 +323,30 @@ def _dcp_round_trip_worker(
             _snapshot(rebuilt_ddp, rebuilt_state),
             uninterrupted,
         )
-        local_tracker = rebuilt_state.parameter_state(
+        parameter_state = rebuilt_state.parameter_state(
             rebuilt_ddp.module.transformer.h.weight
-        ).h_local
+        )
+        local_state = (
+            parameter_state.h_local
+            if error_feedback == "ef21m"
+            else parameter_state.residual
+        )
         Path(output_dir, f"rank-{rank}.json").write_text(
-            json.dumps({"tracker_sum": float(local_tracker.sum())})
+            json.dumps({"local_state_sum": float(local_state.sum())})
         )
         dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
-def run_dcp_round_trip_case(optimizer_name: str) -> None:
+def run_dcp_round_trip_case(optimizer_name: str, error_feedback="ef21m") -> None:
     with tempfile.TemporaryDirectory(prefix="arc-dcp-") as root:
         checkpoint_dir = str(Path(root, "checkpoint-root"))
         output_dir = str(Path(root, "output"))
         Path(output_dir).mkdir()
         mp.spawn(
             _dcp_round_trip_worker,
-            args=(2, _free_port(), checkpoint_dir, output_dir, optimizer_name),
+            args=(2, _free_port(), checkpoint_dir, output_dir, optimizer_name, error_feedback),
             nprocs=2,
             join=True,
         )
@@ -344,11 +355,18 @@ def run_dcp_round_trip_case(optimizer_name: str) -> None:
             for rank in range(2)
         ]
 
-    assert results[0]["tracker_sum"] != results[1]["tracker_sum"]
+    assert results[0]["local_state_sum"] != results[1]["local_state_sum"]
 
 
-@pytest.mark.parametrize("optimizer_name", ["arc_topk_muon", "arc_topk_adamw"])
+@pytest.mark.parametrize(
+    "optimizer_name,error_feedback",
+    [
+        ("arc_topk_muon", "ef21m"),
+        ("arc_topk_adamw", "ef21m"),
+        ("arc_topk_adamw", "ef14"),
+    ],
+)
 def test_real_dcp_two_rank_round_trip_preserves_local_state_and_continuation(
-    optimizer_name,
+    optimizer_name, error_feedback,
 ):
-    run_dcp_round_trip_case(optimizer_name)
+    run_dcp_round_trip_case(optimizer_name, error_feedback)

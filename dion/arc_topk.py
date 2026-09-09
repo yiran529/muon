@@ -30,6 +30,15 @@ class ArcPreparedBatch:
     local_sketch_batch: Optional[Tensor]
 
 
+@dataclass
+class EF14PreparedBatch:
+    """Collective-free EF14 tensors for a same-shaped parameter batch."""
+
+    residual_batch: Tensor
+    compensated_batch: Tensor
+    local_sketch_batch: Tensor
+
+
 def derive_arc_seed(*, base_seed: int, step: int, stable_task_id: int) -> int:
     """Derive a task-local ARC seed accepted by ``Generator.manual_seed``."""
 
@@ -227,6 +236,44 @@ def finalize_arc_sparse_(
         averaged_compressed,
     )
     return prepared.global_estimate_batch
+
+
+def prepare_ef14_batch(
+    gradient_batch: Tensor,
+    residual_batch: Tensor,
+    *,
+    projection_batch: Tensor,
+) -> EF14PreparedBatch:
+    """Prepare ``gradient + residual`` for ARC compression under EF14."""
+
+    if gradient_batch.ndim != 3 or residual_batch.shape != gradient_batch.shape:
+        raise ValueError("EF14 gradient and residual batches must have equal 3D shapes")
+    compensated_batch = gradient_batch + residual_batch.to(dtype=gradient_batch.dtype)
+    return EF14PreparedBatch(
+        residual_batch=residual_batch,
+        compensated_batch=compensated_batch,
+        local_sketch_batch=arc_topk_local_sketch(
+            compensated_batch, projection_batch
+        ),
+    )
+
+
+def finalize_ef14_sparse_(
+    prepared: EF14PreparedBatch,
+    indices: Tensor,
+    averaged_selected: Tensor,
+) -> Tensor:
+    """Commit EF14 residual and return the averaged sparse compressor output."""
+
+    rows = prepared.compensated_batch.shape[1]
+    local_selected = gather_rows(prepared.compensated_batch, indices)
+    local_compressed = scatter_rows(local_selected, indices, rows)
+    prepared.residual_batch.copy_(
+        (prepared.compensated_batch - local_compressed).to(
+            dtype=prepared.residual_batch.dtype
+        )
+    )
+    return scatter_rows(averaged_selected, indices, rows)
 
 
 def arc_topk_ef21m_async(

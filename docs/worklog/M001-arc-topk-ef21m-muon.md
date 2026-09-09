@@ -977,3 +977,38 @@ step1000 后压缩和 160 MiB bucket cap；本轮明确不实现 EF14，也不�
 边界消融。串行 CM035 controller 先对 dense 与 ARC 共同探测同一个 physical batch/GA，
 再按 dense→ARC 顺序正式运行。该实验只回答“AdamW 配方对齐后，当前 EF21M all-2D
 相对同配方 dense 的差距如何变化”；它仍不是官方 LLaMA/C4 逐项复现。
+
+## 2026-09-10：EF 正确性验证、EF14 hook 与 CM036 队列
+
+在不修改 CM035 已加载进程的前提下，补充了两类低成本正确性测试。第一类用固定
+gradient 与固定 support 做四步手算递推，独立比较生产 primitive：EF21M 检查
+`g_t = g_{t-1} + C(grad_t - g_{t-1})`，EF14 检查
+`u_t = grad_t + e_{t-1}`、`c_t = C(u_t)`、`e_t = u_t - c_t`，并逐步验证
+`sum(c) + e = sum(grad)` 守恒。第二类用两 rank Gloo 检查 EF14 的 averaged sparse
+输出、rank-local residual、共同 support，以及一步 AdamW 后参数、`exp_avg` 和
+`exp_avg_sq` 的跨 rank 一致性；DCP 测试还覆盖保存/恢复后的连续递推。结论仅限于：
+本地 EF21M 和 EF14 与各自声明的递推一致，并不声称 EF21M 等价于 EF14。
+
+生产配置新增 `arc_error_feedback: ef21m|ef14`，默认仍为 `ef21m`；EF14 只允许
+`arc_sync_mode=ddp_hook`，optimizer-side ARC 继续只支持 EF21M。EF14 hook 对每个
+被压缩的二维参数保存 rank-local residual，压缩 `gradient + residual`，将 all-reduce
+后的 sparse tensor 交给 AdamW；warmup/full-support 步走 dense 并清零 residual。
+checkpoint schema 升到 v2：EF21M 保存原 tracker/local/global estimate，EF14 只保存
+rank-local residual，跨模式恢复会 fail closed，因此旧 schema-v1 hook checkpoint 不会
+被静默解释为新状态。
+
+CM036 是单 cell EF14 实验，不重复 dense：它复用 CM035 的 dense/EF21M 基线和共同
+选出的 device batch/GA，其他配置与 CM035 ARC cell 相同，仅把 error feedback 改成
+EF14。临时队列绑定 CM035 controller PID `3369130` 及其进程启动标识；只有 CM035
+controller exit 0、ready 文件中的已测试 commit 与当前 HEAD 完全一致时才会启动
+CM036。CM036 自身先在相同 batch 做三步 EF14 probe，失败则不会进入 formal 训练。
+
+本轮受影响的 CPU/Gloo 回归为 `89 passed, 15 warnings in 159.60s`；GPU 2、3 上的
+真实 NCCL smoke 为 `1 passed, 14 warnings in 25.45s`，覆盖新增 EF14 AdamW hook
+入口。warning 均为既有 TorchScript deprecation，加一条既有 profiler cycle 提示。
+扩大后的 ARC/optimizer/training/launcher 相关集合为 `235 passed, 15 warnings in
+502.60s`。仓库全量 pytest 为 `668 passed, 16 skipped, 11 failed`；11 个失败由 3 个
+既有 profiler trace attribution 断言和 8 个 Dion2 Triton wrapper/torch.compile
+用例组成。将未修改的 `HEAD` 用 `git archive` 解压到独立临时目录后，单独运行这
+11 项仍为 `11 failed`，表明它们是本轮修改前即可复现的基线失败；本轮未扩大范围
+修复这些无关模块。

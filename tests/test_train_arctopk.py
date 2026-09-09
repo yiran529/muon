@@ -47,6 +47,7 @@ def test_arctopk_hyperparameter_defaults_select_ddp_arc_topk():
     assert hp.arc_eta == 0.1
     assert hp.arc_seed == 42
     assert hp.arc_start_compress_step == 300
+    assert hp.arc_error_feedback == "ef21m"
 
 
 @pytest.mark.parametrize(
@@ -133,6 +134,8 @@ def test_arctopk_parser_accepts_method_specific_arguments():
             "7",
             "--arc_start_compress_step",
             "250",
+            "--arc_error_feedback",
+            "ef14",
         ]
     )
 
@@ -141,6 +144,18 @@ def test_arctopk_parser_accepts_method_specific_arguments():
     assert args.arc_eta == 0.3
     assert args.arc_seed == 7
     assert args.arc_start_compress_step == 250
+    assert args.arc_error_feedback == "ef14"
+
+
+def test_ef14_is_rejected_for_optimizer_owned_sync():
+    module = _import_train_arctopk()
+    with pytest.raises(ValueError, match="ef14.*ddp_hook"):
+        module.validate_arc_topk_hyperparameters(
+            module.ArcTopKHyperparameters(
+                arc_sync_mode="optimizer",
+                arc_error_feedback="ef14",
+            )
+        )
 
 
 def test_arctopk_optimizer_rejects_fsdp_device_mesh():
