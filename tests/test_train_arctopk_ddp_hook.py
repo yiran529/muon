@@ -243,7 +243,7 @@ def _free_port():
         return sock.getsockname()[1]
 
 
-def _formal_loop_worker(rank, world_size, port, mode, output_dir):
+def _formal_loop_worker(rank, world_size, port, case_name, output_dir):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(
@@ -255,18 +255,41 @@ def _formal_loop_worker(rank, world_size, port, mode, output_dir):
         module = _module()
         torch.manual_seed(0)
         ddp = DDP(_FormalLoopModel())
-        optimizer, runtime = module.init_arc_topk_optimizer(
-            model=ddp.module,
-            device_mesh=None,
-            ddp_model=ddp,
-            hp=module.ArcTopKHyperparameters(
-                arc_sync_mode=mode,
-                arc_topk_ratio=1.0,
-                arc_eta=1.0,
-                scalar_opt="adamw",
-            ),
-            cli_args=_cli(),
-        )
+        if case_name == "dense_adamw":
+            optimizer = train.init_optimizer(
+                model=ddp.module,
+                device_mesh=None,
+                ddp_model=ddp,
+                hp=train.Hyperparameters(
+                    optimizer="adamw",
+                    scalar_opt="adamw",
+                    lr=0.01,
+                    weight_decay=0.1,
+                ),
+                cli_args=_cli(),
+            )
+            runtime = train.GradientSyncRuntime(optimizer_owns_gradient_sync=False)
+        else:
+            optimizer_name, sync_mode = {
+                "muon_optimizer": ("arc_topk_muon", "optimizer"),
+                "muon_ddp_hook": ("arc_topk_muon", "ddp_hook"),
+                "hook_adamw": ("arc_topk_adamw", "ddp_hook"),
+            }[case_name]
+            optimizer, runtime = module.init_arc_topk_optimizer(
+                model=ddp.module,
+                device_mesh=None,
+                ddp_model=ddp,
+                hp=module.ArcTopKHyperparameters(
+                    optimizer=optimizer_name,
+                    arc_sync_mode=sync_mode,
+                    arc_topk_ratio=1.0,
+                    arc_eta=1.0,
+                    scalar_opt="adamw",
+                    lr=0.01,
+                    weight_decay=0.1,
+                ),
+                cli_args=_cli(),
+            )
         inputs = (
             (torch.tensor([[1.0] + [0.0] * 7]), torch.tensor([[0.0, 2.0] + [0.0] * 6]))
             if rank == 0
@@ -295,12 +318,16 @@ def _formal_loop_worker(rank, world_size, port, mode, output_dir):
         optimizer.step()
         if runtime.commit_step is not None:
             runtime.commit_step()
-        Path(output_dir, f"{mode}-rank-{rank}.json").write_text(
+        Path(output_dir, f"{case_name}-rank-{rank}.json").write_text(
             json.dumps(
                 {
                     "gradient": gradient[0].tolist(),
                     "tracker": None if tracker is None else tracker[0].tolist(),
                     "hook_calls": hook_calls,
+                    "parameters": {
+                        name: parameter.detach().tolist()
+                        for name, parameter in ddp.module.named_parameters()
+                    },
                 }
             )
         )
@@ -309,19 +336,12 @@ def _formal_loop_worker(rank, world_size, port, mode, output_dir):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("mode", ["optimizer", "ddp_hook"])
-def test_real_two_rank_formal_loop_uses_the_selected_sync_owner(mode):
-    with tempfile.TemporaryDirectory(prefix="arc-formal-loop-") as output_dir:
-        mp.spawn(
-            _formal_loop_worker,
-            args=(2, _free_port(), mode, output_dir),
-            nprocs=2,
-            join=True,
-        )
-        results = [
-            json.loads(Path(output_dir, f"{mode}-rank-{rank}.json").read_text())
-            for rank in range(2)
-        ]
+@pytest.mark.parametrize(
+    "case_name, mode",
+    [("muon_optimizer", "optimizer"), ("muon_ddp_hook", "ddp_hook")],
+)
+def test_real_two_rank_formal_loop_uses_the_selected_sync_owner(case_name, mode):
+    results = _run_formal_loop_case(case_name)
 
     if mode == "optimizer":
         assert [result["hook_calls"] for result in results] == [0, 0]
@@ -339,6 +359,125 @@ def test_real_two_rank_formal_loop_uses_the_selected_sync_owner(mode):
             [0.5, 1.0],
             [1.5, 2.0],
         ]
+
+
+def _run_formal_loop_case(case_name):
+    with tempfile.TemporaryDirectory(prefix="arc-formal-loop-") as output_dir:
+        mp.spawn(
+            _formal_loop_worker,
+            args=(2, _free_port(), case_name, output_dir),
+            nprocs=2,
+            join=True,
+        )
+        return [
+            json.loads(Path(output_dir, f"{case_name}-rank-{rank}.json").read_text())
+            for rank in range(2)
+        ]
+
+
+def test_real_two_rank_full_support_adamw_hook_matches_dense_adamw():
+    dense_results = _run_formal_loop_case("dense_adamw")
+    hook_results = _run_formal_loop_case("hook_adamw")
+
+    for dense_result, hook_result in zip(dense_results, hook_results):
+        dense_parameters = dense_result["parameters"]
+        hook_parameters = hook_result["parameters"]
+        assert hook_parameters.keys() == dense_parameters.keys()
+        for name in dense_parameters:
+            torch.testing.assert_close(
+                torch.tensor(hook_parameters[name]),
+                torch.tensor(dense_parameters[name]),
+                rtol=1e-6,
+                atol=1e-7,
+            )
+
+
+def _sparse_adamw_worker(rank, world_size, port, output_dir):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    try:
+        import train
+
+        module = _module()
+        torch.manual_seed(0)
+        ddp = DDP(_FormalLoopModel())
+        optimizer, runtime = module.init_arc_topk_optimizer(
+            model=ddp.module,
+            device_mesh=None,
+            ddp_model=ddp,
+            hp=module.ArcTopKHyperparameters(
+                optimizer="arc_topk_adamw",
+                arc_sync_mode="ddp_hook",
+                arc_topk_ratio=0.5,
+                arc_eta=1.0,
+                arc_start_compress_step=0,
+                scalar_opt="adamw",
+                lr=0.01,
+                weight_decay=0.1,
+            ),
+            cli_args=_cli(),
+        )
+        state = runtime.checkpoint_state
+        for step in range(1, 4):
+            runtime.begin_step()
+            x = torch.tensor([[float(rank + step)] + [0.0] * 7])
+            train.forward_backward_micro_step(
+                ddp,
+                x,
+                None,
+                autocast_ctx=nullcontext(),
+                micro_step=1,
+                grad_accum_steps=1,
+                optimizer_owns_gradient_sync=False,
+            )
+            runtime.finish_step()
+            optimizer.step()
+            runtime.commit_step()
+            ddp.zero_grad(set_to_none=True)
+            for _name, parameter in ddp.module.named_parameters():
+                gathered = [torch.empty_like(parameter) for _ in range(world_size)]
+                dist.all_gather(gathered, parameter)
+                assert all(torch.equal(gathered[0], value) for value in gathered[1:])
+
+        embedding_tracker = state.parameter_state(
+            ddp.module.transformer.wte.weight
+        )
+        head_tracker = state.parameter_state(ddp.module.lm_head.weight)
+        Path(output_dir, f"sparse-adamw-rank-{rank}.json").write_text(
+            json.dumps(
+                {
+                    "committed_step": state.committed_step,
+                    "embedding_tracker_shape": list(embedding_tracker.h_local.shape),
+                    "head_tracker_shape": list(head_tracker.h_local.shape),
+                }
+            )
+        )
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_real_two_rank_sparse_adamw_hook_keeps_parameters_in_rank_agreement():
+    with tempfile.TemporaryDirectory(prefix="arc-sparse-adamw-") as output_dir:
+        mp.spawn(
+            _sparse_adamw_worker,
+            args=(2, _free_port(), output_dir),
+            nprocs=2,
+            join=True,
+        )
+        results = [
+            json.loads(
+                Path(output_dir, f"sparse-adamw-rank-{rank}.json").read_text()
+            )
+            for rank in range(2)
+        ]
+
+    assert [result["committed_step"] for result in results] == [3, 3]
+    assert [result["embedding_tracker_shape"] for result in results] == [[16, 8]] * 2
+    assert [result["head_tracker_shape"] for result in results] == [[16, 8]] * 2
 
 
 def _large_accumulation_worker(rank, world_size, port, output_dir):

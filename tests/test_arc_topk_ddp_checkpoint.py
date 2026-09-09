@@ -179,7 +179,7 @@ def _cli():
     )
 
 
-def _build_runtime(bucket_cap_mb):
+def _build_runtime(optimizer_name: str, bucket_cap_mb):
     import train_arctopk
 
     torch.manual_seed(123)
@@ -189,6 +189,7 @@ def _build_runtime(bucket_cap_mb):
         device_mesh=None,
         ddp_model=ddp,
         hp=train_arctopk.ArcTopKHyperparameters(
+            optimizer=optimizer_name,
             arc_sync_mode="ddp_hook",
             arc_topk_ratio=0.5,
             arc_projection_rank=2,
@@ -257,7 +258,9 @@ def _assert_snapshot_equal(actual, expected):
             )
 
 
-def _dcp_round_trip_worker(rank, world_size, port, checkpoint_dir, output_dir):
+def _dcp_round_trip_worker(
+    rank, world_size, port, checkpoint_dir, output_dir, optimizer_name
+):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(
@@ -266,7 +269,9 @@ def _dcp_round_trip_worker(rank, world_size, port, checkpoint_dir, output_dir):
     try:
         import train
 
-        ddp, optimizer, runtime = _build_runtime(bucket_cap_mb=25)
+        ddp, optimizer, runtime = _build_runtime(
+            optimizer_name, bucket_cap_mb=25
+        )
         state = runtime.checkpoint_state
         train_loader = _Loader()
         val_loader = _Loader()
@@ -287,7 +292,7 @@ def _dcp_round_trip_worker(rank, world_size, port, checkpoint_dir, output_dir):
         uninterrupted = _snapshot(ddp, state)
 
         rebuilt_ddp, rebuilt_optimizer, rebuilt_runtime = _build_runtime(
-            bucket_cap_mb=0.0001
+            optimizer_name, bucket_cap_mb=0.0001
         )
         rebuilt_state = rebuilt_runtime.checkpoint_state
         rebuilt_manager = train.CheckpointManager(
@@ -323,14 +328,14 @@ def _dcp_round_trip_worker(rank, world_size, port, checkpoint_dir, output_dir):
         dist.destroy_process_group()
 
 
-def test_real_dcp_two_rank_round_trip_preserves_local_state_and_continuation():
+def run_dcp_round_trip_case(optimizer_name: str) -> None:
     with tempfile.TemporaryDirectory(prefix="arc-dcp-") as root:
         checkpoint_dir = str(Path(root, "checkpoint-root"))
         output_dir = str(Path(root, "output"))
         Path(output_dir).mkdir()
         mp.spawn(
             _dcp_round_trip_worker,
-            args=(2, _free_port(), checkpoint_dir, output_dir),
+            args=(2, _free_port(), checkpoint_dir, output_dir, optimizer_name),
             nprocs=2,
             join=True,
         )
@@ -340,3 +345,10 @@ def test_real_dcp_two_rank_round_trip_preserves_local_state_and_continuation():
         ]
 
     assert results[0]["tracker_sum"] != results[1]["tracker_sum"]
+
+
+@pytest.mark.parametrize("optimizer_name", ["arc_topk_muon", "arc_topk_adamw"])
+def test_real_dcp_two_rank_round_trip_preserves_local_state_and_continuation(
+    optimizer_name,
+):
+    run_dcp_round_trip_case(optimizer_name)
