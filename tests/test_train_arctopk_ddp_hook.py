@@ -117,9 +117,31 @@ def test_hook_mode_builds_ordinary_muon_and_registers_exactly_one_hook():
     ]
     assert [spec.role for spec in state.parameter_specs] == [
         "arc_matrix",
-        "dense_aux",
-        "dense_aux",
+        "arc_matrix",
+        "arc_matrix",
     ]
+
+
+def test_hook_mode_keeps_non_matrix_parameters_dense():
+    module = _module()
+
+    model = _StubModel()
+    model.transformer.wte.scale = torch.nn.Parameter(torch.ones(8))
+    ddp = _DDPStub()
+    module.init_arc_topk_optimizer(
+        model=model,
+        device_mesh=None,
+        ddp_model=ddp,
+        hp=module.ArcTopKHyperparameters(arc_sync_mode="ddp_hook"),
+        cli_args=_cli(),
+    )
+
+    state, _hook = ddp.registrations[0]
+    roles = {spec.stable_name: spec.role for spec in state.parameter_specs}
+    assert roles["transformer.h.weight"] == "arc_matrix"
+    assert roles["transformer.wte.weight"] == "arc_matrix"
+    assert roles["lm_head.weight"] == "arc_matrix"
+    assert roles["transformer.wte.scale"] == "dense_aux"
 
 
 @pytest.mark.parametrize("mode, owns", [("optimizer", True), ("ddp_hook", False)])

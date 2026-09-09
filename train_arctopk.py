@@ -150,18 +150,13 @@ def init_arc_topk_optimizer(
         seed=hp.arc_seed,
         start_compress_step=hp.arc_start_compress_step,
     )
-    matrix_parameter_ids = {id(parameter) for parameter in matrix_params}
     named_parameters = list(model.named_parameters())
     specs = tuple(
         ArcTopKDDPParameterSpec(
             parameter=parameter,
             stable_name=name,
             stable_id=stable_id,
-            role=(
-                "arc_matrix"
-                if id(parameter) in matrix_parameter_ids
-                else "dense_aux"
-            ),
+            role="arc_matrix" if parameter.ndim == 2 else "dense_aux",
         )
         for stable_id, (name, parameter) in enumerate(named_parameters)
     )

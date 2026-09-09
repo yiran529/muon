@@ -791,3 +791,9 @@ controller 在 commit `f81ef95` 落盘；shell syntax、四个目标 cell、shar
 补充 launcher 和 contract test 在 commit `cad4211` 落盘；相关 profiler/parser tests 为 `10 passed`，shell syntax 与 plan JSON gate 通过。2026-09-09 11:19 CST 检查到 GPU 4–7 各有外部进程占用约 1.8 GiB、仍有约 22.2 GiB 空闲，未干扰这些进程；随后启动 tmux session `cm031_dense_supplement`，controller PID `1688332`，一次性检查确认已进入 60M dense cell，后续不主动轮询。
 
 dense supplement controller 和两个 cell 均 exit 0，每个 cell 生成 4 份 rank trace；合并后的六-cell严格 summary 通过完整 cell/rank set 和 unattributed NCCL fraction 0 gate。60M dense/optimizer/hook 的 profile window 为 `166.280/158.670/162.164 ms`，NCCL union 为 `87.510/78.095/71.929 ms`，exposed tail 为 `81.042/73.380/1.189 ms`。130M 对应为 `261.345/274.757/258.927 ms`、`79.545/70.398/58.918 ms` 和 `45.735/60.023/1.154 ms`。hook 相对 dense 的 tail 降低 `98.53%/97.48%`，profile window 低 `2.48%/0.93%`；但 shared-GPU、单 trace 和 profiler 扰动边界不变，不能据此声明稳定端到端加速。
+
+## 2026-09-09：DDP hook 扩展到全部二维参数
+
+根据 CM031 显示 embedding 与 lm_head 的二维梯度仍构成主要 dense payload，并参考官方 ARC-TopK 对全部二维参数应用矩阵压缩的边界，将 DDP-hook 的压缩资格从“仅 Transformer block 参数组”改为“所有 `ndim == 2` 参数”。这只改变梯度同步方式：Transformer block 仍由 Muon 更新，embedding/lm_head 仍由既有 AdamW/Lion 参数组更新；非二维 bias、scale 等参数继续走 dense all-reduce。optimizer-side ARC 的既有参数分组和行为不变，继续作为实验对照。
+
+TDD 先将 hook 入口契约改为要求 stub 模型的 block、embedding、lm_head 三个二维权重全部标记为 `arc_matrix`，并新增一维参数保持 `dense_aux` 的回归；旧实现按预期两项失败，生产代码改为按 `parameter.ndim` 分配角色后转绿。入口、hook、state、checkpoint 与训练回归为 `51 passed`，额外 Gloo distributed/Future 回归为 `8 passed`。该布局变化会使旧 hook checkpoint 的 canonical fingerprint 不匹配并 fail closed；本项目不提供跨两种 ownership/layout 的 checkpoint 迁移。
