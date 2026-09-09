@@ -811,3 +811,5 @@ CM032 controller 和 6 个 cell 均 exit 0；60M/130M 的 all-2D hook probe 都�
 按用户要求只运行一组完整 GPT-60M all-2D DDP-hook ARC 训练，用 CM027b 作为严格配置模板：4 卡 DDP、BF16、compile、FineWeb10B、seq256、global batch512/effective local batch128、8393 updates（`1,100,087,296` tokens）、seed42、ratio0.2、projection rank4、eta1、step1000 后开始压缩、每500步验证 `10,485,760` tokens、无 checkpoint。hook 特有参数固定为 CM032 已测速的 160 MiB bucket cap；W&B 保持正式训练默认启用。
 
 正式编号为 `CM033-m001-arc-ddp-hook-all2d-gpt60m-paperlike-train-ddp-ws4-s42`。controller 只包含该一个 formal cell，先对压缩路径按 device batch128/64/32/16 做三步 probe，明确 OOM 时依次对应 GA1/2/4/8，始终保持 global batch512；非 OOM 错误 fail closed。当前计划使用此前用户允许共享的 GPU 4–7，并要求每卡至少 16 GiB 空闲、记录外部进程快照；因此 loss 可与 CM027 参考，wall-clock 必须附带 shared-GPU 边界。
+
+配置与 controller 在 commit `252fbc3` 落盘；launcher/config contract、共享训练入口 YAML 解析、shell syntax、数据与 W&B preflight 和 `git diff --check` 通过。2026-09-09 14:56 CST 启动时 GPU 4–7 均仅占用 3 MiB、没有外部 compute process，但该 GPU 集合没有独占保证，controller 仍保留每卡至少 16 GiB 空闲和进程快照 gate。随后通过 tmux session `cm033_all2d_quality` 启动，controller PID `2175033`；一次性检查确认 pane 存活。后续不主动轮询。
