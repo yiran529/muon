@@ -112,13 +112,13 @@ Task 12 在 batching 后的最终 HEAD 上运行方案指定的完整 repository
 
 两个规模方向相反且差距约 2%，不支持稳定胜负，只支持“大 physical batch 下两条 ARC 路径基本持平”。hook 的额外峰值显存约为 421/517 MiB。
 
-## CM031：论文 batch 下 hook vs optimizer targeted profiler（2026-09-09）
+## CM031：论文 batch 下 dense vs optimizer vs hook targeted profiler（2026-09-09）
 
-保持 CM029/CM030 的 GPT-60M/130M、4 GPU、device batch 128/GA1、seq 256、ARC 参数和 160 MiB bucket cap；每个模型/模式只采集一个稳定 final-microstep + optimizer trace。4 个 cell 均 exit 0、各有 4 份 rank trace，unattributed NCCL fraction 为 0。GPU 4–7 与外部进程共享，以下数字只用于关键路径归因；profile window 也不能替代无 profiler 的稳定 wall-clock。
+保持 CM029/CM030 的 GPT-60M/130M、4 GPU、device batch 128/GA1、seq 256、ARC 参数和 160 MiB bucket cap；每个模型/模式只采集一个稳定 final-microstep + optimizer trace。先完成 optimizer/hook 四个 cell，随后在同一 CM031 artifact 中补充两个 dense cell。6 个 cell 均 exit 0、各有 4 份 rank trace，unattributed NCCL fraction 为 0。GPU 4–7 与外部进程共享，以下数字只用于关键路径归因；profile window 也不能替代无 profiler 的稳定 wall-clock。
 
-| 模型 | optimizer/hook profile window | optimizer/hook NCCL union | optimizer/hook exposed tail | hook ARC/backward overlap |
+| 模型 | dense / optimizer / hook profile window | dense / optimizer / hook NCCL union | dense / optimizer / hook exposed tail | hook ARC/backward overlap |
 |---|---:|---:|---:|---:|
-| GPT-60M | 158.670 / 162.164 ms | 78.095 / 71.929 ms | 73.380 / 1.189 ms | 0.000 ms |
-| GPT-130M | 274.757 / 258.927 ms | 70.398 / 58.918 ms | 60.023 / 1.154 ms | 18.888 ms |
+| GPT-60M | 166.280 / 158.670 / 162.164 ms | 87.510 / 78.095 / 71.929 ms | 81.042 / 73.380 / 1.189 ms | 0.000 ms |
+| GPT-130M | 261.345 / 274.757 / 258.927 ms | 79.545 / 70.398 / 58.918 ms | 45.735 / 60.023 / 1.154 ms | 18.888 ms |
 
-hook 在两个模型上都把 exposed gradient-sync tail 降低约 98%；130M 还把 18.888 ms ARC collective 与 genuine backward compute 重叠，profile window 比 optimizer 低 5.76%。60M 没有测得严格 overlap，尽管 NCCL union 和 tail 都降低，profile window 仍高 2.20%，说明固定的 hook 调度/本地压缩成本在较短 backward 上抵消了通信重排收益。其方向与 CM029/CM030 的短 wall-clock 一致，但 shared-GPU、单 trace 和 profiler 扰动意味着这里只能报告机制证据，不能报告稳定性能胜负。
+相对 dense，hook 将 exposed gradient-sync tail 降低 `98.53%/97.48%`，profile window 分别低 `2.48%/0.93%`；相对 optimizer ARC，hook tail 仍降低约 98%，130M 还把 18.888 ms ARC collective 与 genuine backward compute 重叠，profile window 低 5.76%。60M 没有测得严格 ARC overlap，hook profile window比 optimizer 高 2.20%，说明固定的 hook 调度/本地压缩成本在较短 backward 上仍会抵消部分通信重排收益。dense 补充 trace 进一步支持 hook 的关键路径机制有效，但 shared-GPU、单 trace 和 profiler 扰动意味着这里只能报告机制证据，不能报告稳定性能胜负。
