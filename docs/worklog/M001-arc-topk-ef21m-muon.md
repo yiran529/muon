@@ -817,3 +817,62 @@ CM032 controller 和 6 个 cell 均 exit 0；60M/130M 的 all-2D hook probe 都�
 CM033 probe、formal 与 controller 均 exit 0，device batch128/GA1 未触发 OOM 回退。8393 步最终 validation loss 为 `4.6718`，step average `100.43 ms`，训练计时窗口 `841881 ms`，峰值显存 `7844 MiB`。相对同配置 CM027a dense 的 `3.8904 / 101.60 ms / 6834 MiB`，all-2D hook 单步快 `1.15%`，但 loss 高 `0.7814`、显存多 `1010 MiB`；相对 CM027b optimizer ARC 的 `4.3355 / 111.13 ms / 6977 MiB`，单步快 `9.63%`，但 loss 仍高 `0.3363`、显存多 `867 MiB`。
 
 因此，在 1.1B-token GPT-60M 训练上，all-2D hook 证明了异步通信路径可以消除 optimizer-side ARC 的 wall-clock 劣势，并略微超过 dense；但 `ratio=0.2` 即使延迟到 step1000，压缩 embedding/lm_head 仍造成不可接受的质量下降。该配置未通过“性能不掉且 wall-clock 降低”的联合目标，下一步不应原样扩展到 130M；应先提高 embedding/head 的 ratio、分角色设置 ratio，或只将其中通信占比最大且质量敏感性可接受的二维矩阵纳入压缩。
+
+## 2026-09-09：AdamW all-2D ARC hook 实现记录（Task 7）
+
+本次仅完成实现回归与短 smoke，不启动 CM034 controller、论文规模训练或 W&B。普通 AdamW 现可通过 `optimizer=arc_topk_adamw`、`arc_sync_mode=ddp_hook` 使用共享 ARC DDP bucket hook；hook 按 `parameter.ndim == 2` 将全部二维参数归为 `arc_matrix`，其余参数保持 dense 同步。`ArcTopKAdamW` 的 optimizer-side 压缩实现仍保留为 benchmark/control 路径，没有被这个标准 AdamW hook 路径替换。dense AdamW 的 `train.init_optimizer` 和 ARC AdamW hook factory 都调用 `train.build_adamw_optimizer`，因此共享同一 AdamW 参数组更新构造。
+
+执行前及最终写入前的 `git diff --check` 均 exit 0 且无输出。完整相关 CPU/Gloo 回归使用：
+
+```bash
+PYTHONPATH=. /home/wyr/dion/.venv/bin/pytest -q \
+  tests/test_arc_topk.py \
+  tests/test_arc_topk_sync.py \
+  tests/test_adamw_arctopk.py \
+  tests/test_adamw_arctopk_distributed.py \
+  tests/test_muon_arctopk.py \
+  tests/test_muon_arctopk_distributed.py \
+  tests/test_arc_topk_ddp_hook.py \
+  tests/test_arc_topk_ddp_hook_state.py \
+  tests/test_arc_topk_ddp_hook_future.py \
+  tests/test_arc_topk_ddp_hook_distributed.py \
+  tests/test_arc_topk_ddp_hook_future_distributed.py \
+  tests/test_arc_topk_ddp_checkpoint.py \
+  tests/test_train_arctopk.py \
+  tests/test_train_arctopk_ddp_hook.py \
+  tests/test_train_adamw_builder.py \
+  tests/test_cm033_all2d_hook_quality_launcher.py \
+  tests/test_cm034_adamw_all2d_hook_quality_launcher.py
+```
+
+结果为 `157 passed, 15 warnings in 175.05s`；15 条 warning 为 14 条既有 TorchScript `script_method` deprecation warning 和 1 条 profiler cycle warning。相对于本任务开始时的 149-test baseline，增加的覆盖已包含在该完整集合中。
+
+在确认 GPU 2、3 均仅使用 3 MiB、各剩余 24,078 MiB，且 GPU 0、1 上的外部 PID `2994719` 未被触碰后，额外运行 AdamW hook 的两卡 NCCL smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. /home/wyr/dion/.venv/bin/pytest -q \
+  tests/test_train_arctopk_ddp_hook_nccl.py -m multi_gpu
+```
+
+结果为 `1 passed, 14 warnings in 15.36s`。该 smoke 覆盖 dense、optimizer-side ARC、Muon hook 与 AdamW hook 的真实 NCCL 路径；warning 均为 TorchScript deprecation warning。
+
+worktree 未包含被忽略的相对 `data/fineweb10B`，因此 debug 使用 `/home/wyr/dion/data/fineweb10B` 和临时 checkpoint 目录，并在同一空闲 GPU 2 上完成：
+
+```bash
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 /home/wyr/dion/.venv/bin/torchrun \
+  --standalone --nproc_per_node=1 train.py \
+  --config configs/compressed_muon/cm034a_dense_adamw_gpt60m_paperlike.yaml \
+  --data_dir /home/wyr/dion/data/fineweb10B --debug --no_wandb --no_compile \
+  --checkpoint_dir /tmp/arctopk-task7-smoke-FqTwTy/dense
+
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 /home/wyr/dion/.venv/bin/torchrun \
+  --standalone --nproc_per_node=1 train_arctopk.py \
+  --config configs/compressed_muon/cm034b_all2d_hook_adamw_gpt60m_paperlike.yaml \
+  --data_dir /home/wyr/dion/data/fineweb10B --debug --no_wandb --no_compile \
+  --arc_start_compress_step 0 \
+  --checkpoint_dir /tmp/arctopk-task7-smoke-FqTwTy/hook
+```
+
+两条命令均 exit 0，完成 20 个 debug iterations 与末次 validation：dense 的末次 `val_loss=8.0365`、`step_avg=27.29 ms`、峰值显存 `1738 MiB`；all-2D AdamW hook 的末次 `val_loss=8.1249`、`step_avg=37.46 ms`、峰值显存 `3846 MiB`。这些 debug 数字只证明入口、数据读取、训练循环和压缩路径可运行，不用于质量或性能比较。
+
+CM034a/CM034b 配置与 fail-closed launcher 已存在，但其 paper-scale controller 尚未启动；本记录不主张任何新的质量、收敛或性能结论。
