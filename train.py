@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -52,6 +53,8 @@ class Hyperparameters:
     num_iterations: int = 5000
     warmup_ratio: float = 0.01
     warmdown_ratio: float = 0.2
+    warmup_steps: Optional[int] = None
+    lr_schedule: str = "linear"
     timing_warmup_steps: int = 10
 
     # Model config
@@ -74,6 +77,10 @@ class Hyperparameters:
     lr: float = 0.02
     mu: float = 0.95
     weight_decay: float = 0.01
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
+    grad_clip_norm: Optional[float] = None
     ortho_fraction: float = 0.25
 
     # Optimizer specific hyperparameters
@@ -192,6 +199,47 @@ def completed_timed_steps(*, step: int, timing_warmup_steps: int) -> int:
     return max(0, step - timing_warmup_steps)
 
 
+def learning_rate_multiplier(it: float, hp: Hyperparameters) -> float:
+    """Return the configured LR multiplier at scheduler index ``it``."""
+
+    warmup_iters = (
+        round(hp.warmup_ratio * hp.num_iterations)
+        if hp.warmup_steps is None
+        else hp.warmup_steps
+    )
+    if warmup_iters < 0 or warmup_iters > hp.num_iterations:
+        raise ValueError("warmup_steps must be between 0 and num_iterations")
+    if it < warmup_iters:
+        return (it + 1) / warmup_iters
+    if hp.lr_schedule == "linear":
+        warmdown_iters = round(hp.warmdown_ratio * hp.num_iterations)
+        if warmdown_iters < 0 or warmdown_iters > hp.num_iterations:
+            raise ValueError("warmdown_ratio produces an invalid warmdown interval")
+        if it <= hp.num_iterations - warmdown_iters:
+            return 1.0
+        return max(0.0, (hp.num_iterations - it) / warmdown_iters)
+    if hp.lr_schedule == "cosine":
+        decay_iters = hp.num_iterations - warmup_iters
+        if decay_iters <= 0:
+            return 0.0
+        progress = min(1.0, max(0.0, (it - warmup_iters) / decay_iters))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    raise ValueError(f"Unrecognized lr_schedule: {hp.lr_schedule}")
+
+
+def compute_and_clip_grad_norm_(parameters, grad_clip_norm: Optional[float]):
+    """Return the pre-clip gradient norm and optionally clip gradients in place."""
+
+    parameters = list(parameters)
+    if grad_clip_norm is None:
+        return torch.nn.utils.get_total_norm(
+            [p.grad for p in parameters if p.grad is not None]
+        )
+    if not math.isfinite(grad_clip_norm) or grad_clip_norm <= 0:
+        raise ValueError("grad_clip_norm must be finite and positive")
+    return torch.nn.utils.clip_grad_norm_(parameters, grad_clip_norm)
+
+
 def parse_cli_args(configure_parser=None):
     # --- Command-line argument parsing ---
     parser = argparse.ArgumentParser()
@@ -245,6 +293,10 @@ def parse_cli_args(configure_parser=None):
     )
     parser.add_argument("--mu", type=float, default=None, help="Momentum coefficient")
     parser.add_argument("--weight_decay", type=float, default=None, help="Weight decay")
+    parser.add_argument("--adam_beta1", type=float, default=None)
+    parser.add_argument("--adam_beta2", type=float, default=None)
+    parser.add_argument("--adam_eps", type=float, default=None)
+    parser.add_argument("--grad_clip_norm", type=float, default=None)
     parser.add_argument(
         "--time_optimizer", action="store_true",
         help="Time fwd/bwd and optimizer step separately (adds cuda.synchronize between them)",
@@ -285,6 +337,8 @@ def parse_cli_args(configure_parser=None):
     parser.add_argument("--val_tokens", type=int, default=None)
     parser.add_argument("--warmup_ratio", type=float, default=None)
     parser.add_argument("--warmdown_ratio", type=float, default=None)
+    parser.add_argument("--warmup_steps", type=int, default=None)
+    parser.add_argument("--lr_schedule", choices=["linear", "cosine"], default=None)
     parser.add_argument("--timing-warmup-steps", type=int, default=None)
     parser.add_argument("--bucket-cap-mb", type=float, default=None)
 
@@ -457,11 +511,13 @@ def build_adamw_optimizer(
     print0("Setting all param groups to use unscaled base learning rate")
     for group in param_groups:
         group["lr"] = hp.lr
-        group["betas"] = (0.9, 0.95)
+        group["betas"] = (hp.adam_beta1, hp.adam_beta2)
+        group["eps"] = hp.adam_eps
     return torch.optim.AdamW(
         param_groups,
         lr=hp.lr,
-        betas=(0.9, 0.95),
+        betas=(hp.adam_beta1, hp.adam_beta2),
+        eps=hp.adam_eps,
         weight_decay=hp.weight_decay,
     )
 
@@ -1079,17 +1135,9 @@ def main(
     )
 
     # Learning rate scheduler
-    def get_lr(it):
-        warmup_iters = round(hp.warmup_ratio * hp.num_iterations)
-        warmdown_iters = round(hp.warmdown_ratio * hp.num_iterations)
-        if it < warmup_iters:
-            return (it + 1) / warmup_iters
-        elif it <= hp.num_iterations - warmdown_iters:
-            return 1.0
-        else:
-            return (hp.num_iterations - it) / warmdown_iters
-
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda it: learning_rate_multiplier(it, hp)
+    )
 
     print0("=" * 80)
 
@@ -1297,8 +1345,8 @@ def main(
 
         # Gradient norm + optimizer step
         with profile_capture.range("train/gradient_norm"):
-            grad_norm = torch.nn.utils.get_total_norm(
-                [p.grad for p in model.parameters() if p.grad is not None]
+            grad_norm = compute_and_clip_grad_norm_(
+                model.parameters(), hp.grad_clip_norm
             )
         profiled_optimizer_step(optimizer, profile_capture)
         if gradient_sync_runtime.commit_step is not None:
