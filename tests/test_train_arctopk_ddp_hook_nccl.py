@@ -76,6 +76,24 @@ def _build(mode, device):
             factory_result,
             optimizer_owns_gradient_sync=False,
         )
+    if mode == "adamw_ddp_hook":
+        optimizer, runtime = train_arctopk.init_arc_topk_optimizer(
+            model=ddp.module,
+            device_mesh=None,
+            ddp_model=ddp,
+            hp=train_arctopk.ArcTopKHyperparameters(
+                optimizer="arc_topk_adamw",
+                arc_sync_mode="ddp_hook",
+                arc_topk_ratio=0.5,
+                arc_projection_rank=2,
+                arc_eta=0.25,
+                arc_start_compress_step=0,
+                model_dim=16,
+                lr=0.01,
+            ),
+            cli_args=_cli(),
+        )
+        return ddp, optimizer, runtime
     optimizer, runtime = train_arctopk.init_arc_topk_optimizer(
         model=ddp.module,
         device_mesh=None,
@@ -107,7 +125,7 @@ def _worker(rank, world_size, port, output_dir):
 
         results = {}
         device = torch.device("cuda", rank)
-        for mode in ("dense", "optimizer", "ddp_hook"):
+        for mode in ("dense", "optimizer", "ddp_hook", "adamw_ddp_hook"):
             ddp, optimizer, runtime = _build(mode, device)
             observer = CollectiveObserver()
             set_active_observer(observer)
@@ -145,7 +163,7 @@ def _worker(rank, world_size, port, output_dir):
             if mode == "optimizer":
                 assert "arc/sketch" in categories
                 assert not any(category.startswith("arc_hook/") for category in categories)
-            elif mode == "ddp_hook":
+            elif mode in ("ddp_hook", "adamw_ddp_hook"):
                 assert "arc_hook/sketch" in categories
                 assert "arc/sketch" not in categories
             results[mode] = {"categories": categories}
