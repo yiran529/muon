@@ -178,7 +178,7 @@ def _worker(rank, world_size, port, output_dir):
 
 
 @pytest.mark.multi_gpu
-def test_three_mode_formal_loop_nccl_smoke():
+def test_arc_sync_modes_formal_loop_nccl_smoke():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two visible CUDA devices")
     with tempfile.TemporaryDirectory(prefix="arc-formal-nccl-") as output_dir:

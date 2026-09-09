@@ -26,8 +26,11 @@ mode=run
 
 if [[ "${1:-}" == "--print-plan" && $# -eq 1 ]]; then
     mode=print
+elif [[ "${1:-}" == "--summarize" && $# -eq 2 ]]; then
+    mode=summarize
+    artifact_root="$2"
 elif (($#)); then
-    printf 'usage: %s [--print-plan]\n' "$0" >&2
+    printf 'usage: %s [--print-plan | --summarize ARTIFACT_ROOT]\n' "$0" >&2
     exit 64
 fi
 
@@ -196,23 +199,26 @@ run_probe() {
     return 1
 }
 
-select_batch() {
-    local cell="$1" cell_mode="$2" entry="$3" config="$4" candidate rc
+select_common_batch() {
+    local candidate dense_rc arc_rc
     for candidate in 128 64 32 16; do
-        preflight "$config" || return 78
-        run_probe "$cell" "$cell_mode" "$entry" "$config" "$candidate"
-        rc=$?
-        if [[ "$rc" == 0 ]]; then
+        preflight "$dense_config" "$arc_config" || return 78
+        run_probe dense_adamw_gpt60m-s42 dense "$repo_dir/train.py" "$dense_config" "$candidate"
+        dense_rc=$?
+        [[ "$dense_rc" == 0 || "$dense_rc" == 42 ]] || return "$dense_rc"
+        run_probe arc_ddp_hook_adamw_gpt60m-s42 arc "$repo_dir/train_arctopk.py" "$arc_config" "$candidate"
+        arc_rc=$?
+        [[ "$arc_rc" == 0 || "$arc_rc" == 42 ]] || return "$arc_rc"
+        if [[ "$dense_rc" == 0 && "$arc_rc" == 0 ]]; then
             SELECTED_DEVICE_BATCH="$candidate"
             SELECTED_GA=$((global_batch / (world_size * candidate)))
-            printf '%s\n' "$candidate" > "$artifact_root/${cell}_selected_device_batch.txt"
-            printf '%s\n' "$SELECTED_GA" > "$artifact_root/${cell}_selected_ga.txt"
-            log "SELECTED cell=$cell device_batch=$SELECTED_DEVICE_BATCH ga=$SELECTED_GA effective_local_batch=128"
+            printf '%s\n' "$candidate" > "$artifact_root/selected_device_batch.txt"
+            printf '%s\n' "$SELECTED_GA" > "$artifact_root/selected_ga.txt"
+            log "SELECTED common_device_batch=$SELECTED_DEVICE_BATCH ga=$SELECTED_GA effective_local_batch=128"
             return 0
         fi
-        [[ "$rc" == 42 ]] || return "$rc"
     done
-    log "BLOCKED cell=$cell OOM through device_batch=16/GA8"
+    log "BLOCKED no common device batch; OOM through device_batch=16/GA8"
     return 42
 }
 
@@ -278,31 +284,51 @@ run_cell() {
 }
 
 summarize() {
-    ROOT="$artifact_root" "$python_bin" - <<'PY'
+    "$python_bin" - "$artifact_root" <<'PY'
 import json
 import math
-import os
 import re
+import sys
 from pathlib import Path
 
-root = Path(os.environ["ROOT"])
+root = Path(sys.argv[1])
 plan = json.loads((root / "plan.json").read_text())
 summary = {"experiment_id": plan["experiment_id"], "cells": {}}
 for cell in plan["cells"]:
     result = (root / cell / "result.txt").read_text()
-    loss = re.search(r"val_loss:([0-9.eE+-]+)", result)
+    final_step = plan["num_iterations"]
+    final_lines = re.findall(
+        rf"step:{final_step}/{final_step} val_loss:[^\r\n]*", result
+    )
+    final_line = final_lines[-1] if final_lines else ""
+    loss = re.search(r"val_loss:([0-9.eE+-]+)", final_line)
     memory = re.search(r"Peak memory consumption: ([0-9]+) MiB", result)
     if not (loss and memory):
         raise SystemExit(f"failed to parse final validation or memory metric for {cell}")
+    timing = re.search(r"step_avg:([^\s]+)ms\b", final_line)
+    try:
+        step_avg_ms = float(timing.group(1)) if timing else float("nan")
+    except ValueError:
+        step_avg_ms = float("nan")
+    if not math.isfinite(step_avg_ms) or step_avg_ms <= 0:
+        raise SystemExit(f"invalid final step_avg for {cell}: expected finite positive milliseconds")
     final_loss = float(loss.group(1))
     summary["cells"][cell] = {
         "final_validation_loss": final_loss,
         "perplexity": math.exp(final_loss),
         "peak_memory_mib": int(memory.group(1)),
+        "step_avg_ms": step_avg_ms,
+        "tokens_per_second": plan["global_batch"] * plan["sequence_length"] * 1000 / step_avg_ms,
     }
-(root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+print(json.dumps(summary, indent=2, allow_nan=False))
 PY
 }
+
+# Read-only result inspection bypasses controller artifacts, GPUs, data and W&B.
+if [[ "$mode" == summarize ]]; then
+    summarize
+    exit $?
+fi
 
 cd "$repo_dir" || exit 2
 [[ -e "$artifact_root" || -L "$artifact_root" ]] && {
@@ -319,11 +345,10 @@ git rev-parse HEAD > "$artifact_root/git_commit.txt"
 git status --short > "$artifact_root/git_status.txt"
 log "BEGIN $experiment_id shared_gpu=true gpu_list=$gpu_list"
 
-select_batch dense_adamw_gpt60m-s42 dense "$repo_dir/train.py" "$dense_config" || exit $?
+select_common_batch || exit $?
 run_cell dense_adamw_gpt60m-s42 dense "$repo_dir/train.py" "$dense_config" || exit $?
-select_batch arc_ddp_hook_adamw_gpt60m-s42 arc "$repo_dir/train_arctopk.py" "$arc_config" || exit $?
 run_cell arc_ddp_hook_adamw_gpt60m-s42 arc "$repo_dir/train_arctopk.py" "$arc_config" || exit $?
 
-summarize || exit $?
+summarize > "$artifact_root/summary.json" || exit $?
 capture_gpu_state "$artifact_root/nvidia_smi_end.txt"
 log "COMPLETE $experiment_id summary=$artifact_root/summary.json"

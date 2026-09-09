@@ -62,6 +62,16 @@ def arc_optimizer_owns_gradient_sync(arc_sync_mode: ArcSyncMode) -> bool:
     raise ValueError(f"unsupported ARC sync mode: {arc_sync_mode!r}")
 
 
+def validate_arc_topk_hyperparameters(hp: ArcTopKHyperparameters) -> None:
+    """Reject unsupported ARC configurations before training initialization."""
+
+    if hp.optimizer not in ("arc_topk_muon", "arc_topk_adamw"):
+        raise ValueError(f"Unsupported ARC optimizer: {hp.optimizer}")
+    if hp.optimizer == "arc_topk_adamw" and hp.arc_sync_mode != "ddp_hook":
+        raise ValueError("arc_topk_adamw requires arc_sync_mode=ddp_hook")
+    arc_optimizer_owns_gradient_sync(hp.arc_sync_mode)
+
+
 def install_arc_topk_ddp_hook(
     model,
     ddp_model: DDP,
@@ -147,10 +157,7 @@ def init_arc_topk_optimizer(
         raise ValueError("ARC-TopK-EF21M-Muon first version is DDP only")
     if ddp_model is None:
         raise ValueError("ARC-TopK-EF21M-Muon requires a DDP model")
-    if hp.optimizer not in ("arc_topk_muon", "arc_topk_adamw"):
-        raise ValueError(f"Unsupported ARC optimizer: {hp.optimizer}")
-    if hp.optimizer == "arc_topk_adamw" and hp.arc_sync_mode != "ddp_hook":
-        raise ValueError("arc_topk_adamw requires arc_sync_mode=ddp_hook")
+    validate_arc_topk_hyperparameters(hp)
     if hp.scalar_opt not in ("adamw", "lion"):
         raise ValueError(f"Unrecognized scalar optimizer: {hp.scalar_opt}")
     if getattr(cli_args, "_explicit_replicate_mesh_grad_sync", False):
@@ -158,7 +165,6 @@ def init_arc_topk_optimizer(
             "replicate_mesh_grad_sync is no longer accepted by train_arctopk.py; "
             "select --arc_sync_mode optimizer or ddp_hook"
         )
-    arc_optimizer_owns_gradient_sync(hp.arc_sync_mode)
 
     matrix_params = list(model.transformer.h.parameters())
     embedding_params = list(model.transformer.wte.parameters())
@@ -230,4 +236,5 @@ if __name__ == "__main__":
         hyperparameters_factory=ArcTopKHyperparameters,
         optimizer_factory=init_arc_topk_optimizer,
         configure_parser=configure_arc_topk_parser,
+        validate_hyperparameters=validate_arc_topk_hyperparameters,
     )

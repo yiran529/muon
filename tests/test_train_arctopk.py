@@ -2,6 +2,7 @@
 
 import argparse
 import importlib
+import runpy
 import sys
 
 from pathlib import Path
@@ -46,6 +47,53 @@ def test_arctopk_hyperparameter_defaults_select_ddp_arc_topk():
     assert hp.arc_eta == 0.1
     assert hp.arc_seed == 42
     assert hp.arc_start_compress_step == 300
+
+
+@pytest.mark.parametrize(
+    ("config", "cli_overrides", "message"),
+    [
+        (
+            {"optimizer": "arc_topk_adamw", "arc_sync_mode": "optimizer"},
+            [],
+            "arc_topk_adamw.*ddp_hook",
+        ),
+        (
+            {"optimizer": "arc_topk_muon", "arc_sync_mode": "optimizer"},
+            ["--optimizer", "arc_topk_adamw"],
+            "arc_topk_adamw.*ddp_hook",
+        ),
+        (
+            {"optimizer": "arc_topk_adamw", "arc_sync_mode": "ddp_hook"},
+            ["--arc_sync_mode", "optimizer"],
+            "arc_topk_adamw.*ddp_hook",
+        ),
+        (
+            {"optimizer": "adamw", "arc_sync_mode": "ddp_hook"},
+            [],
+            "Unsupported ARC optimizer",
+        ),
+    ],
+)
+def test_arctopk_main_rejects_final_config_before_training_setup(
+    monkeypatch, tmp_path, config, cli_overrides, message
+):
+    module = _import_train_arctopk()
+    config_path = tmp_path / "invalid.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+
+    def unexpected_setup(*args, **kwargs):
+        pytest.fail("training initialization ran before configuration validation")
+
+    # Any distributed/data/model setup is forbidden for an invalid final config.
+    for name in ("init_distributed", "DistributedDataLoader", "GPT"):
+        monkeypatch.setattr(module.train, name, unexpected_setup)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_arctopk.py", "--config", str(config_path), *cli_overrides],
+    )
+    with pytest.raises(ValueError, match=message):
+        runpy.run_path(module.__file__, run_name="__main__")
 
 
 @pytest.mark.parametrize("optimizer", ["adamw", "muon", "unsupported"])

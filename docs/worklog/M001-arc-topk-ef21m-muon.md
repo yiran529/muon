@@ -876,3 +876,58 @@ PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 /home/wyr/dion/.venv/bin/torchrun \
 两条命令均 exit 0，完成 20 个 debug iterations 与末次 validation：dense 的末次 `val_loss=8.0365`、`step_avg=27.29 ms`、峰值显存 `1738 MiB`；all-2D AdamW hook 的末次 `val_loss=8.1249`、`step_avg=37.46 ms`、峰值显存 `3846 MiB`。这些 debug 数字只证明入口、数据读取、训练循环和压缩路径可运行，不用于质量或性能比较。
 
 CM034a/CM034b 配置与 fail-closed launcher 已存在，但其 paper-scale controller 尚未启动；本记录不主张任何新的质量、收敛或性能结论。
+
+## 2026-09-09：AdamW all-2D ARC hook 最终审查修复
+
+本次补充并修正 Task 7 对实现完整性的记录：原 launcher 会独立选择两种模式的物理 batch，可能先用 DB128/GA1 完成 dense，再为 ARC 选择 DB64/GA2。现改为按 DB128、64、32、16 的顺序，在每个候选值先探测 dense、再探测 ARC；只有两者共同通过后，才统一写入 `selected_device_batch.txt` 和 `selected_ga.txt`，并以相同 DB/GA 依次运行 dense 与 ARC formal cell。任一非 OOM 探测错误立即退出，两者共同选定 batch 前不会启动 formal cell。
+
+`train.main` 新增默认关闭的 `validate_hyperparameters` 回调，在 YAML 与 CLI 覆盖完成后、随机种子及 distributed/data/model/compile 初始化前执行。ARC 入口和直接 optimizer factory 复用同一个 validator，提前拒绝非 ARC optimizer 以及 `arc_topk_adamw + optimizer`。普通 `train.py` 默认行为、既有 Muon 模式、AdamW 参数组语义、all-2D 规则和 compressor checkpoint schema 均保留。
+
+launcher summary 现在从末次 `step:8393/8393 val_loss:` 记录提取有限且正的 `step_avg`，输出数值字段 `step_avg_ms` 和 `tokens_per_second = 512 * 256 * 1000 / step_avg_ms`，同时保留 loss、PPL 与峰值显存。新增只读 `--summarize ARTIFACT_ROOT`，以临时目录中的合成结果测试吞吐计算与无效 timing 拒绝；原 `--print-plan` 仍在 controller、GPU、数据和 W&B 操作前退出。NCCL test 更名为 `test_arc_sync_modes_formal_loop_nccl_smoke`，不再使用已过时的 three-mode 名称。
+
+TDD 证据：新增早期配置验证测试首先触发 setup sentinel；共同 batch 探测测试首先复现 formal dense 先于 ARC probe 的顺序错误，后续明确的 launcher RED 为 `11 failed, 1 passed`。summary 的 8 个合成输入测试首先因缺少只读 summary 入口而失败。实现后运行：
+
+```bash
+PYTHONPATH=. /home/wyr/dion/.venv/bin/pytest -q \
+  tests/test_cm034_adamw_all2d_hook_quality_launcher.py \
+  tests/test_train_arctopk.py \
+  tests/test_train_factories.py \
+  tests/test_train_adamw_builder.py
+bash -n benchmark/compressed_muon/run_cm034_adamw_all2d_hook_quality.sh
+git diff --check
+benchmark/compressed_muon/run_cm034_adamw_all2d_hook_quality.sh --print-plan
+```
+
+focused 结果为 `37 passed in 5.38s`；其余三项均 exit 0。随后完整相关 CPU/Gloo 回归：
+
+```bash
+PYTHONPATH=. /home/wyr/dion/.venv/bin/pytest -q \
+  tests/test_arc_topk.py \
+  tests/test_arc_topk_sync.py \
+  tests/test_adamw_arctopk.py \
+  tests/test_adamw_arctopk_distributed.py \
+  tests/test_muon_arctopk.py \
+  tests/test_muon_arctopk_distributed.py \
+  tests/test_arc_topk_ddp_hook.py \
+  tests/test_arc_topk_ddp_hook_state.py \
+  tests/test_arc_topk_ddp_hook_future.py \
+  tests/test_arc_topk_ddp_hook_distributed.py \
+  tests/test_arc_topk_ddp_hook_future_distributed.py \
+  tests/test_arc_topk_ddp_checkpoint.py \
+  tests/test_train_arctopk.py \
+  tests/test_train_arctopk_ddp_hook.py \
+  tests/test_train_adamw_builder.py \
+  tests/test_train_factories.py \
+  tests/test_train_ddp_sync.py \
+  tests/test_cm033_all2d_hook_quality_launcher.py \
+  tests/test_cm034_adamw_all2d_hook_quality_launcher.py
+```
+
+结果为 `187 passed, 15 warnings in 186.91s`；warning 为既有的 14 条 TorchScript deprecation 和 1 条 profiler cycle 提示。重新检查 GPU 状态，确认 GPU 2、3 各使用 3 MiB、剩余 24,078 MiB 且无 compute process 后，运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. /home/wyr/dion/.venv/bin/pytest -q \
+  tests/test_train_arctopk_ddp_hook_nccl.py -m multi_gpu
+```
+
+结果为 `1 passed, 14 warnings in 15.40s`，覆盖全部四种同步模式；未触碰 GPU 0、1 上外部 PID `2994719`。本次仅做最终修复与回归，未启动 CM034 formal controller、训练探测、W&B 或新的 GPT-60M debug run，也不补充质量或性能结论。launcher 保留既有 `/home/wyr/dion` 注册路径，正式运行前需先完成分支集成。完整修复报告保存在 `.superpowers/sdd/2026-09-09-arctopk-adamw-all2d-hook/final-fix-report.md`。

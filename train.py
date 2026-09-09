@@ -901,12 +901,16 @@ def main(
     hyperparameters_factory=Hyperparameters,
     optimizer_factory=init_optimizer,
     configure_parser=None,
+    validate_hyperparameters=None,
 ):
     torch._dynamo.config.cache_size_limit = 100
     # --- Parse command line arguments and set hyperparams ---
     cli_args = parse_cli_args(configure_parser=configure_parser)
     hp = hyperparameters_factory()
     hp = override_args_from_cli(hp, cli_args)
+    # Validate entry-specific constraints before any training resources are set up.
+    if validate_hyperparameters is not None:
+        validate_hyperparameters(hp)
 
     if cli_args.training_seed is not None:
         torch.manual_seed(cli_args.training_seed)
