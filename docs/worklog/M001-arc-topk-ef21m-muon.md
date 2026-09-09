@@ -805,3 +805,9 @@ TDD 先将 hook 入口契约改为要求 stub 模型的 block、embedding、lm_h
 CM032 controller 和 6 个 cell 均 exit 0；60M/130M 的 all-2D hook probe 都在 device batch128/GA1 通过，未触发 OOM 回退。60M 的 dense/optimizer/all-2D hook step average 为 `143.37/143.77/130.22 ms`，hook 相对同期 dense 快 `9.17%`、相对 optimizer 快 `9.42%`；130M 为 `298.78/291.97/274.13 ms`，对应快 `8.25%/6.11%`。hook 峰值显存为 `7844/15115 MiB`，相对 dense 增加 `979/2067 MiB`，相对 optimizer 增加 `835/1406 MiB`。
 
 220 步短程 validation loss 则显示明显风险：60M dense/optimizer/hook 为 `5.2222/5.5972/6.2157`，130M 为 `5.2599/5.6035/6.5219`。该短测从 step 0 开始有损压缩且只服务于稳定段 wall-clock，不足以作最终质量判断；但扩大到 embedding/lm_head 后早期 loss 进一步恶化，不能把当前速度收益直接外推为 time-to-quality 收益。由于 GPU 4–7 与外部进程共享、每 cell 仅一次且执行顺序只做跨模型反转，`6%–9%` 仅是有明确方向的探索性同期结果，仍需在质量可接受的 ratio/start-step 配置下复测。
+
+## 2026-09-09：CM033 all-2D hook GPT-60M 1.1B-token 质量实验设计
+
+按用户要求只运行一组完整 GPT-60M all-2D DDP-hook ARC 训练，用 CM027b 作为严格配置模板：4 卡 DDP、BF16、compile、FineWeb10B、seq256、global batch512/effective local batch128、8393 updates（`1,100,087,296` tokens）、seed42、ratio0.2、projection rank4、eta1、step1000 后开始压缩、每500步验证 `10,485,760` tokens、无 checkpoint。hook 特有参数固定为 CM032 已测速的 160 MiB bucket cap；W&B 保持正式训练默认启用。
+
+正式编号为 `CM033-m001-arc-ddp-hook-all2d-gpt60m-paperlike-train-ddp-ws4-s42`。controller 只包含该一个 formal cell，先对压缩路径按 device batch128/64/32/16 做三步 probe，明确 OOM 时依次对应 GA1/2/4/8，始终保持 global batch512；非 OOM 错误 fail closed。当前计划使用此前用户允许共享的 GPU 4–7，并要求每卡至少 16 GiB 空闲、记录外部进程快照；因此 loss 可与 CM027 参考，wall-clock 必须附带 shared-GPU 边界。
