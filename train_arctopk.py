@@ -62,6 +62,78 @@ def arc_optimizer_owns_gradient_sync(arc_sync_mode: ArcSyncMode) -> bool:
     raise ValueError(f"unsupported ARC sync mode: {arc_sync_mode!r}")
 
 
+def install_arc_topk_ddp_hook(
+    model,
+    ddp_model: DDP,
+    optimizer: torch.optim.Optimizer,
+    hp: ArcTopKHyperparameters,
+) -> train.GradientSyncRuntime:
+    config = ArcTopKSyncConfig(
+        ratio=hp.arc_topk_ratio,
+        projection_rank=hp.arc_projection_rank,
+        eta=hp.arc_eta,
+        seed=hp.arc_seed,
+        start_compress_step=hp.arc_start_compress_step,
+    )
+    named_parameters = list(model.named_parameters())
+    specs = tuple(
+        ArcTopKDDPParameterSpec(
+            parameter=parameter,
+            stable_name=name,
+            stable_id=stable_id,
+            role="arc_matrix" if parameter.ndim == 2 else "dense_aux",
+        )
+        for stable_id, (name, parameter) in enumerate(named_parameters)
+    )
+    group_ranks = (
+        tuple(dist.get_process_group_ranks(ddp_model.process_group))
+        if ddp_model.process_group is not None
+        else (0,)
+    )
+    fingerprint = canonical_arc_fingerprint(
+        base_seed=config.seed,
+        config=config,
+        group_ranks=group_ranks,
+        parameters=tuple(
+            ArcParameterDescriptor(
+                stable_name=spec.stable_name,
+                stable_id=spec.stable_id,
+                shape=tuple(spec.parameter.shape),
+                dtype=str(spec.parameter.dtype).removeprefix("torch."),
+                role=spec.role,
+            )
+            for spec in specs
+        ),
+    )
+    if ddp_model.process_group is not None:
+        validate_arc_fingerprint_across_ranks(
+            fingerprint,
+            ddp_model.process_group,
+        )
+    state = ArcTopKDDPState(
+        process_group=ddp_model.process_group,
+        fingerprint=fingerprint,
+        parameter_specs=specs,
+        optimizer_parameters=[
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        ],
+        config=config,
+        find_unused_parameters=getattr(
+            ddp_model, "find_unused_parameters", False
+        ),
+    )
+    ddp_model.register_comm_hook(state, arc_topk_ddp_hook)
+    return train.GradientSyncRuntime(
+        optimizer_owns_gradient_sync=False,
+        begin_step=state.begin_step,
+        finish_step=state.finish_step,
+        commit_step=state.commit_step,
+        checkpoint_state=state,
+    )
+
+
 def init_arc_topk_optimizer(
     model,
     device_mesh: Optional[DeviceMesh],
@@ -75,6 +147,10 @@ def init_arc_topk_optimizer(
         raise ValueError("ARC-TopK-EF21M-Muon first version is DDP only")
     if ddp_model is None:
         raise ValueError("ARC-TopK-EF21M-Muon requires a DDP model")
+    if hp.optimizer not in ("arc_topk_muon", "arc_topk_adamw"):
+        raise ValueError(f"Unsupported ARC optimizer: {hp.optimizer}")
+    if hp.optimizer == "arc_topk_adamw" and hp.arc_sync_mode != "ddp_hook":
+        raise ValueError("arc_topk_adamw requires arc_sync_mode=ddp_hook")
     if hp.scalar_opt not in ("adamw", "lion"):
         raise ValueError(f"Unrecognized scalar optimizer: {hp.scalar_opt}")
     if getattr(cli_args, "_explicit_replicate_mesh_grad_sync", False):
@@ -142,73 +218,11 @@ def init_arc_topk_optimizer(
             optimizer_owns_gradient_sync=True
         )
 
-    optimizer = Muon(param_groups, **optimizer_kwargs)
-    config = ArcTopKSyncConfig(
-        ratio=hp.arc_topk_ratio,
-        projection_rank=hp.arc_projection_rank,
-        eta=hp.arc_eta,
-        seed=hp.arc_seed,
-        start_compress_step=hp.arc_start_compress_step,
-    )
-    named_parameters = list(model.named_parameters())
-    specs = tuple(
-        ArcTopKDDPParameterSpec(
-            parameter=parameter,
-            stable_name=name,
-            stable_id=stable_id,
-            role="arc_matrix" if parameter.ndim == 2 else "dense_aux",
-        )
-        for stable_id, (name, parameter) in enumerate(named_parameters)
-    )
-    group_ranks = (
-        tuple(dist.get_process_group_ranks(ddp_model.process_group))
-        if ddp_model.process_group is not None
-        else (0,)
-    )
-    fingerprint = canonical_arc_fingerprint(
-        base_seed=config.seed,
-        config=config,
-        group_ranks=group_ranks,
-        parameters=tuple(
-            ArcParameterDescriptor(
-                stable_name=spec.stable_name,
-                stable_id=spec.stable_id,
-                shape=tuple(spec.parameter.shape),
-                dtype=str(spec.parameter.dtype).removeprefix("torch."),
-                role=spec.role,
-            )
-            for spec in specs
-        ),
-    )
-    if ddp_model.process_group is not None:
-        validate_arc_fingerprint_across_ranks(
-            fingerprint,
-            ddp_model.process_group,
-        )
-    state = ArcTopKDDPState(
-        process_group=ddp_model.process_group,
-        fingerprint=fingerprint,
-        parameter_specs=specs,
-        optimizer_parameters=[
-            parameter
-            for group in optimizer.param_groups
-            for parameter in group["params"]
-        ],
-        config=config,
-        find_unused_parameters=getattr(
-            ddp_model,
-            "find_unused_parameters",
-            False,
-        ),
-    )
-    ddp_model.register_comm_hook(state, arc_topk_ddp_hook)
-    return optimizer, train.GradientSyncRuntime(
-        optimizer_owns_gradient_sync=False,
-        begin_step=state.begin_step,
-        finish_step=state.finish_step,
-        commit_step=state.commit_step,
-        checkpoint_state=state,
-    )
+    if hp.optimizer == "arc_topk_adamw":
+        optimizer = train.build_adamw_optimizer(param_groups, hp)
+    else:
+        optimizer = Muon(param_groups, **optimizer_kwargs)
+    return optimizer, install_arc_topk_ddp_hook(model, ddp_model, optimizer, hp)
 
 
 if __name__ == "__main__":

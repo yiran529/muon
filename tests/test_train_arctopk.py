@@ -48,6 +48,26 @@ def test_arctopk_hyperparameter_defaults_select_ddp_arc_topk():
     assert hp.arc_start_compress_step == 300
 
 
+@pytest.mark.parametrize("optimizer", ["adamw", "muon", "unsupported"])
+def test_arctopk_optimizer_rejects_unsupported_optimizer_names(optimizer):
+    module = _import_train_arctopk()
+    cli_args = argparse.Namespace(
+        use_gram_newton_schulz=False,
+        no_triton=True,
+        use_polar_express=False,
+        _explicit_replicate_mesh_grad_sync=False,
+    )
+
+    with pytest.raises(ValueError, match="Unsupported ARC optimizer"):
+        module.init_arc_topk_optimizer(
+            model=_StubModel(),
+            device_mesh=None,
+            ddp_model=argparse.Namespace(process_group=None),
+            hp=module.ArcTopKHyperparameters(optimizer=optimizer),
+            cli_args=cli_args,
+        )
+
+
 def test_arctopk_parser_accepts_method_specific_arguments():
     module = _import_train_arctopk()
     parser = argparse.ArgumentParser()

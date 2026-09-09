@@ -88,6 +88,21 @@ def test_optimizer_mode_builds_only_arctopk_muon_and_owns_gradient_sync():
     assert ddp.registrations == []
 
 
+def test_adamw_optimizer_side_mode_is_rejected():
+    module = _module()
+    with pytest.raises(ValueError, match="arc_topk_adamw.*ddp_hook"):
+        module.init_arc_topk_optimizer(
+            model=_StubModel(),
+            device_mesh=None,
+            ddp_model=_DDPStub(),
+            hp=module.ArcTopKHyperparameters(
+                optimizer="arc_topk_adamw",
+                arc_sync_mode="optimizer",
+            ),
+            cli_args=_cli(),
+        )
+
+
 def test_hook_mode_builds_ordinary_muon_and_registers_exactly_one_hook():
     module = _module()
     from dion import ArcTopKDDPState, Muon
@@ -137,6 +152,36 @@ def test_hook_mode_keeps_non_matrix_parameters_dense():
     )
 
     state, _hook = ddp.registrations[0]
+    roles = {spec.stable_name: spec.role for spec in state.parameter_specs}
+    assert roles["transformer.h.weight"] == "arc_matrix"
+    assert roles["transformer.wte.weight"] == "arc_matrix"
+    assert roles["lm_head.weight"] == "arc_matrix"
+    assert roles["transformer.wte.scale"] == "dense_aux"
+
+
+def test_adamw_hook_mode_builds_standard_adamw_and_compresses_all_2d():
+    module = _module()
+    model = _StubModel()
+    model.transformer.wte.scale = torch.nn.Parameter(torch.ones(8))
+    ddp = _DDPStub()
+    optimizer, runtime = module.init_arc_topk_optimizer(
+        model=model,
+        device_mesh=None,
+        ddp_model=ddp,
+        hp=module.ArcTopKHyperparameters(
+            optimizer="arc_topk_adamw",
+            arc_sync_mode="ddp_hook",
+            lr=3e-4,
+            weight_decay=0.1,
+        ),
+        cli_args=_cli(),
+    )
+
+    assert type(optimizer) is torch.optim.AdamW
+    assert runtime.optimizer_owns_gradient_sync is False
+    assert len(ddp.registrations) == 1
+    state, hook = ddp.registrations[0]
+    assert hook is module.arc_topk_ddp_hook
     roles = {spec.stable_name: spec.role for spec in state.parameter_specs}
     assert roles["transformer.h.weight"] == "arc_matrix"
     assert roles["transformer.wte.weight"] == "arc_matrix"
