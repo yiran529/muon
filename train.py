@@ -450,6 +450,22 @@ def init_distributed(dp_size, fs_size, tp_size) -> Optional[DeviceMesh]:
     return device_mesh
 
 
+def build_adamw_optimizer(
+    param_groups: list[dict], hp: Hyperparameters
+) -> torch.optim.AdamW:
+    print0("Using AdamW for all params, scalar optimizer will be ignored")
+    print0("Setting all param groups to use unscaled base learning rate")
+    for group in param_groups:
+        group["lr"] = hp.lr
+        group["betas"] = (0.9, 0.95)
+    return torch.optim.AdamW(
+        param_groups,
+        lr=hp.lr,
+        betas=(0.9, 0.95),
+        weight_decay=hp.weight_decay,
+    )
+
+
 def init_optimizer(
     model: GPT,
     device_mesh: Optional[DeviceMesh],
@@ -696,17 +712,7 @@ def init_optimizer(
         )
 
     elif hp.optimizer == "adamw":
-        print0("Using AdamW for all params, scalar optimizer will be ignored")
-        print0("Setting all param groups to use unscaled base learning rate")
-        for group in param_groups:
-            group["lr"] = hp.lr
-            group["betas"] = (0.9, 0.95)  # AdamW default betas
-        opt = torch.optim.AdamW(
-            param_groups,
-            lr=hp.lr,
-            betas=(0.9, 0.95),
-            weight_decay=hp.weight_decay,
-        )
+        opt = build_adamw_optimizer(param_groups, hp)
 
     else:
         raise ValueError(f"Unsupported optimizer: {hp.optimizer}")
