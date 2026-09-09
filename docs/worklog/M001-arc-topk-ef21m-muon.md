@@ -813,3 +813,7 @@ CM032 controller 和 6 个 cell 均 exit 0；60M/130M 的 all-2D hook probe 都�
 正式编号为 `CM033-m001-arc-ddp-hook-all2d-gpt60m-paperlike-train-ddp-ws4-s42`。controller 只包含该一个 formal cell，先对压缩路径按 device batch128/64/32/16 做三步 probe，明确 OOM 时依次对应 GA1/2/4/8，始终保持 global batch512；非 OOM 错误 fail closed。当前计划使用此前用户允许共享的 GPU 4–7，并要求每卡至少 16 GiB 空闲、记录外部进程快照；因此 loss 可与 CM027 参考，wall-clock 必须附带 shared-GPU 边界。
 
 配置与 controller 在 commit `252fbc3` 落盘；launcher/config contract、共享训练入口 YAML 解析、shell syntax、数据与 W&B preflight 和 `git diff --check` 通过。2026-09-09 14:56 CST 启动时 GPU 4–7 均仅占用 3 MiB、没有外部 compute process，但该 GPU 集合没有独占保证，controller 仍保留每卡至少 16 GiB 空闲和进程快照 gate。随后通过 tmux session `cm033_all2d_quality` 启动，controller PID `2175033`；一次性检查确认 pane 存活。后续不主动轮询。
+
+CM033 probe、formal 与 controller 均 exit 0，device batch128/GA1 未触发 OOM 回退。8393 步最终 validation loss 为 `4.6718`，step average `100.43 ms`，训练计时窗口 `841881 ms`，峰值显存 `7844 MiB`。相对同配置 CM027a dense 的 `3.8904 / 101.60 ms / 6834 MiB`，all-2D hook 单步快 `1.15%`，但 loss 高 `0.7814`、显存多 `1010 MiB`；相对 CM027b optimizer ARC 的 `4.3355 / 111.13 ms / 6977 MiB`，单步快 `9.63%`，但 loss 仍高 `0.3363`、显存多 `867 MiB`。
+
+因此，在 1.1B-token GPT-60M 训练上，all-2D hook 证明了异步通信路径可以消除 optimizer-side ARC 的 wall-clock 劣势，并略微超过 dense；但 `ratio=0.2` 即使延迟到 step1000，压缩 embedding/lm_head 仍造成不可接受的质量下降。该配置未通过“性能不掉且 wall-clock 降低”的联合目标，下一步不应原样扩展到 130M；应先提高 embedding/head 的 ratio、分角色设置 ratio，或只将其中通信占比最大且质量敏感性可接受的二维矩阵纳入压缩。

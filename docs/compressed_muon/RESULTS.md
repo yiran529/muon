@@ -162,3 +162,15 @@ DDP-hook ARC 把梯度同步移入 backward，代价是 backward CPU range 相�
 相对同期 dense，all-2D hook 的峰值显存增加 `979/2067 MiB`；相对 optimizer ARC 增加 `835/1406 MiB`。与 CM029/CM030 的旧 hook 数字跨运行比较时，60M 从 `133.29` 降至 `130.22 ms`、130M 从 `284.64` 降至 `274.13 ms`，方向与“减少未压缩 dense payload”一致，但 shared-GPU 负载不同，不能把这两个跨运行差值当作干净的 all-2D A/B 因果估计。本轮可信度更高的是同一队列内 hook 相对两个同期基线均快 `6%–9%`。
 
 速度收益伴随明显的短程质量风险。220 步最终 validation loss 在 60M 上为 dense/optimizer/hook `5.2222/5.5972/6.2157`，130M 为 `5.2599/5.6035/6.5219`。该实验从 step 0 压缩、步数很短且目标是 wall-clock，不足以判断最终收敛；但结果明确禁止把吞吐收益直接表述成 time-to-quality 收益。下一步应先调高 ratio 或恢复延迟压缩，并用较短质量筛选找出 loss 可接受点，再对候选配置做更长训练。
+
+## CM033：all-2D hook GPT-60M 1.1B-token 训练（2026-09-09）
+
+在 CM027 的 GPT-60M 规模与训练设置下，只运行 all-2D DDP hook：4 GPU、FineWeb10B、seq256、global batch512、device batch128/GA1、8393 updates（约 1.1B tokens）、ratio0.2/rank4/eta1、step1000 后压缩、160 MiB bucket cap、seed42。probe、formal 和 controller 均 exit 0。
+
+| 模式 | final validation loss | step average | peak memory |
+|---|---:|---:|---:|
+| CM027 dense | **3.8904** | 101.60 ms | 6834 MiB |
+| CM027 optimizer ARC | 4.3355 | 111.13 ms | 6977 MiB |
+| CM033 all-2D hook | 4.6718 | **100.43 ms** | 7844 MiB |
+
+all-2D hook 相对 dense 单步快 `1.15%`，相对 optimizer ARC 快 `9.63%`，说明完整异步 hook 加上更大压缩覆盖范围已经消除 optimizer-side 串行路径的 wall-clock 劣势。但它相对 dense 的 validation loss 高 `0.7814`，相对 optimizer ARC 也高 `0.3363`；峰值显存分别多 `1010/867 MiB`。因此该配置只通过速度目标，没有通过质量目标，不能声称 time-to-quality 改善，也不值得原样追加 130M。后续质量筛选应优先降低 embedding/lm_head 的压缩强度或采用分角色 ratio。
