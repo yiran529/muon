@@ -787,3 +787,5 @@ controller 在 commit `f81ef95` 落盘；shell syntax、四个目标 cell、shar
 因此 trace 明确支持 hook 把 ARC 同步从 optimizer 后置串行路径移出、几乎消除 gradient-sync tail；130M 的较长 backward 还能实际覆盖约 18.9 ms ARC collective。60M 虽然 tail 同样下降，但没有形成严格定义的 compute overlap，profile window 反而略高，说明较小模型下 hook 调度、本地压缩与后续 Muon 路径开销足以抵消尾部收益。该方向与 CM029/CM030 的单次 wall-clock 观察一致，但所有 GPU 均与外部任务共享、每模式只有一份 targeted trace，绝对时长受竞争和 profiler 扰动，不能据此声明稳定加速或显著性。
 
 用户随后要求将 dense targeted profile 直接补入 CM031，而不是新建 CM032。补充队列保持相同的 GPT-60M/130M、GPU 4–7、device batch 128/GA1、global batch 512、seq 256、160 MiB bucket cap、step 20 profile 和 shared-GPU 解释边界；每个模型只新增一个 dense cell。launcher 会先校验原四个 ARC cell 完整且 plan 未变化，拒绝覆盖任何已有 dense cell，备份原 plan/summary，两个 dense cell 都成功后才扩展 plan 并生成六-cell严格 summary。
+
+补充 launcher 和 contract test 在 commit `cad4211` 落盘；相关 profiler/parser tests 为 `10 passed`，shell syntax 与 plan JSON gate 通过。2026-09-09 11:19 CST 检查到 GPU 4–7 各有外部进程占用约 1.8 GiB、仍有约 22.2 GiB 空闲，未干扰这些进程；随后启动 tmux session `cm031_dense_supplement`，controller PID `1688332`，一次性检查确认已进入 60M dense cell，后续不主动轮询。
