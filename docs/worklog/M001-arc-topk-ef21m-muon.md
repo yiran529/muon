@@ -962,3 +962,18 @@ ARC-TopK 的 C4/T5-base tokenizer 数字直接横向比较。
 原始产物与汇总位于
 `artifacts/compressed_muon/CM034-m001-adamw-all2d-hook-gpt60m-paperlike-train-ddp-ws4-s42/`；
 其中 `summary.json` 保存 loss、PPL、step time、tokens/s 和峰值显存。
+
+## 2026-09-10：CM035 论文公开 AdamW 配方配对实验设计
+
+为将 CM034 的压缩损失与未对齐的 AdamW 配方分离，本轮不调参、不改变 EF
+算法和压缩边界，直接使用公开 C4 示例的 AdamW 配方运行一组 GPT-60M 配对实验。
+dense 与 ARC 两侧统一使用 LR `0.001`、betas `(0.9, 0.999)`、epsilon `1e-8`、
+global grad-norm clipping `1.0`、exact 1000-step linear warmup、随后 cosine decay，
+所有参数 weight decay `0.0`。模型、FineWeb10B 数据、seq256、global batch512、
+8393 updates、validation 和 seed42 均保持 CM034 不变。
+
+ARC cell 仍使用当前 EF21M 实现、all-2D scope、ratio0.2、projection rank4、eta1、
+step1000 后压缩和 160 MiB bucket cap；本轮明确不实现 EF14，也不做 embedding/head
+边界消融。串行 CM035 controller 先对 dense 与 ARC 共同探测同一个 physical batch/GA，
+再按 dense→ARC 顺序正式运行。该实验只回答“AdamW 配方对齐后，当前 EF21M all-2D
+相对同配方 dense 的差距如何变化”；它仍不是官方 LLaMA/C4 逐项复现。

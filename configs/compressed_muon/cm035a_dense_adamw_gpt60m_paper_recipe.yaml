@@ -1,0 +1,37 @@
+# CM035a: GPT-60M dense AdamW with the public ARC C4 recipe on FineWeb10B.
+model_dim: 512
+n_layer: 4
+n_head: 8
+sequence_length: 256
+
+batch_size: 512
+device_batch_size: 128
+num_iterations: 8393
+warmup_ratio: 0.0
+warmdown_ratio: 0.0
+warmup_steps: 1000
+lr_schedule: cosine
+timing_warmup_steps: 10
+
+val_loss_every: 500
+val_tokens: 10485760
+checkpoint_freq: 0
+wandb_project_name: gpt-train
+wandb_job_name: CM035a-dense-adamw-paper-recipe-gpt60m-ddp-ws4-s42
+no_wandb: false
+
+dp_size: null
+fs_size: null
+tp_size: null
+debug: false
+no_compile: false
+no_triton: false
+
+optimizer: adamw
+scalar_opt: adamw
+lr: 0.001
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_eps: 1.0e-8
+grad_clip_norm: 1.0
+weight_decay: 0.0

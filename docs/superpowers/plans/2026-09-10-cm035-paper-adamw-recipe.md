@@ -33,11 +33,11 @@
 - Produces: `Hyperparameters.adam_beta1`, `adam_beta2`, `adam_eps`, `warmup_steps`, `lr_schedule`, and `grad_clip_norm`.
 - Produces: shared LR multiplier and gradient-norm/clipping helpers used by the training loop.
 
-- [ ] Write failing tests for configurable AdamW groups, exact 1000-step cosine warmup/decay, old linear defaults, and clipping disabled/enabled behavior.
-- [ ] Run focused tests and confirm failures are caused by missing configuration behavior.
-- [ ] Implement the minimal shared configuration and helpers, preserving old defaults.
-- [ ] Run focused and existing training factory/config tests.
-- [ ] Commit the production and test changes.
+- [x] Write failing tests for configurable AdamW groups, exact 1000-step cosine warmup/decay, old linear defaults, and clipping disabled/enabled behavior.
+- [x] Run focused tests and confirm failures are caused by missing configuration behavior.
+- [x] Implement the minimal shared configuration and helpers, preserving old defaults.
+- [x] Run focused and existing training factory/config tests.
+- [x] Commit the production and test changes.
 
 ### Task 2: Add CM035 paired configs and serial launcher
 
@@ -52,11 +52,11 @@
 - Consumes: Task 1 hyperparameter fields.
 - Produces: a two-cell dense-then-ARC controller with common OOM fallback and recorded summary.
 
-- [ ] Write failing config/launcher contract tests proving the exact recipe, unchanged ARC fields, paired batch selection, token budget, and side-effect-free `--print-plan`.
-- [ ] Run the tests and confirm the CM035 files are absent.
-- [ ] Add configs and adapt the CM034 controller with a new experiment ID and explicit recipe fields.
-- [ ] Run launcher tests, YAML/config parsing, `bash -n`, `--print-plan`, and `git diff --check`.
-- [ ] Record the launch design and commit.
+- [x] Write failing config/launcher contract tests proving the exact recipe, unchanged ARC fields, paired batch selection, token budget, and side-effect-free `--print-plan`.
+- [x] Run the tests and confirm the CM035 files are absent.
+- [x] Add configs and adapt the CM034 controller with a new experiment ID and explicit recipe fields.
+- [x] Run launcher tests, YAML/config parsing, `bash -n`, `--print-plan`, and `git diff --check`.
+- [x] Record the launch design and commit.
 
 ### Task 3: Integrate and launch, then pause
 
@@ -68,8 +68,8 @@
 - Consumes: Task 2 launcher.
 - Produces: one detached background serial controller.
 
-- [ ] Run the relevant CPU regression suite on the feature branch.
-- [ ] Fast-forward merge the feature branch into `main` and verify static checks on the merged tree.
+- [x] Run the relevant CPU regression suite directly on `main`, per the user's no-worktree instruction.
+- [x] Verify static checks on the direct `main` implementation.
 - [ ] Confirm the registered artifact root is absent, W&B authentication is available, data/venv paths exist, and the selected four GPUs satisfy the launcher's free-memory gate.
 - [ ] Start the serial launcher using `nohup setsid`, verify only that the controller process initially exists, and report PID/artifact path.
 - [ ] Stop work immediately; do not poll, summarize, implement EF14, or launch another experiment.
