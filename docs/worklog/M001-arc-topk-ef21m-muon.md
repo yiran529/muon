@@ -931,3 +931,34 @@ CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. /home/wyr/dion/.venv/bin/pytest -q \
 ```
 
 结果为 `1 passed, 14 warnings in 15.40s`，覆盖全部四种同步模式；未触碰 GPU 0、1 上外部 PID `2994719`。本次仅做最终修复与回归，未启动 CM034 formal controller、训练探测、W&B 或新的 GPT-60M debug run，也不补充质量或性能结论。launcher 保留既有 `/home/wyr/dion` 注册路径，正式运行前需先完成分支集成。完整修复报告保存在 `.superpowers/sdd/2026-09-09-arctopk-adamw-all2d-hook/final-fix-report.md`。
+
+## 2026-09-09：CM034 AdamW all-2D ARC hook GPT-60M 质量结果
+
+功能分支快进合并到 `main`（最终实现 commit `b00cba5`）后，启动
+`CM034-m001-adamw-all2d-hook-gpt60m-paperlike-train-ddp-ws4-s42`。实验在
+GPU 4–7 上串行运行 dense AdamW 和 all-2D ARC DDP-hook AdamW；两种模式的
+三步 probe 均在 device batch 128/GA1 通过，因此共同使用 global batch 512、
+seq256、8393 updates（`1,100,087,296` training tokens）和 seed42。ARC 配置为
+ratio0.2、projection rank4、eta1、step1000 后开始压缩，bucket cap 为 160 MiB。
+controller 与两个 formal cell 均 exit 0。
+
+| 模式 | final validation loss | PPL | step average | tokens/s | 峰值显存 |
+|---|---:|---:|---:|---:|---:|
+| dense AdamW | 4.0959 | 60.09 | 100.15 ms | 1,308,756.86 | 6882 MiB |
+| all-2D ARC-hook AdamW | 4.7810 | 119.22 | 101.97 ms | 1,285,397.67 | 7893 MiB |
+
+相对 dense AdamW，all-2D ARC-hook AdamW 的 validation loss 高 `0.6851`，
+PPL 高约 `98.40%`；step average 慢约 `1.82%`，tokens/s 低约 `1.78%`，峰值
+显存多 `1011 MiB`（约 `14.69%`）。这里的 PPL 为 `exp(loss)`，使用本仓库
+FineWeb10B/GPT-2 tokenizer validation 口径，只用于本实验内部比较，不能与官方
+ARC-TopK 的 C4/T5-base tokenizer 数字直接横向比较。
+
+因此 CM034 没有通过质量或 wall-clock 联合目标：AdamW all-2D hook 在本次负载下
+没有获得速度收益，同时复现了压缩 embedding/lm_head 后的显著质量退化。结合 CM033
+的 Muon all-2D 结果，当前证据支持问题主要位于 `ratio=0.2` 对质量敏感二维参数的
+统一压缩策略，而非仅由 Muon 更新规则导致。后续若继续，应优先实验分角色 ratio、
+提高 embedding/lm_head ratio，或将这些参数恢复为 dense，而不应原样扩大当前配置。
+
+原始产物与汇总位于
+`artifacts/compressed_muon/CM034-m001-adamw-all2d-hook-gpt60m-paperlike-train-ddp-ws4-s42/`；
+其中 `summary.json` 保存 loss、PPL、step time、tokens/s 和峰值显存。
