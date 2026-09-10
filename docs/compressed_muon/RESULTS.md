@@ -187,3 +187,43 @@ all-2D hook 相对 dense 单步快 `1.15%`，相对 optimizer ARC 快 `9.63%`，
 all-2D ARC-hook AdamW 相对 dense 的 validation loss 高 `0.6851`，PPL 高约 `98.40%`，step average 慢 `1.82%`，吞吐低 `1.78%`，峰值显存多 `1011 MiB`（`14.69%`）。PPL 为 `exp(loss)`，采用当前 FineWeb10B/GPT-2 tokenizer validation 口径，只用于仓库内部对比，不能与官方 ARC-TopK 的 C4/T5-base tokenizer 数字直接比较。
 
 因此 CM034 同时未通过质量和 wall-clock 目标。它说明 CM033 的严重质量退化并非只与 Muon 更新规则有关：标准 AdamW 使用同一 all-2D、ratio0.2 压缩边界时也出现接近翻倍的 PPL，而且没有速度收益。当前配置不应原样扩展；后续应优先让 embedding/lm_head 恢复 dense，或采用更高、分角色的 ratio，再做短质量筛选。
+
+## CM035/CM036：论文 AdamW 配方下的 EF21M 与 EF14 对照（2026-09-10）
+
+保持 GPT-60M、4 GPU、FineWeb10B、seq256、global batch512、device
+batch128/GA1、8393 updates（约 1.1B tokens）、seed42、all-2D、ratio0.2、
+projection rank4、step1000 后压缩和 160 MiB bucket cap 不变。AdamW 两侧统一
+使用 LR `0.001`、betas `(0.9, 0.999)`、epsilon `1e-8`、global grad-norm clip
+`1.0`、1000-step linear warmup 后 cosine decay，以及所有参数 weight decay `0`。
+CM035 串行运行 dense 与 EF21M；CM036 只补充 EF14 cell，并复用 CM035 选出的
+device batch/GA。三个 formal cell 和两个 controller 均 exit 0。
+
+| 模式 | final validation loss | PPL | step average | tokens/s | peak memory |
+|---|---:|---:|---:|---:|---:|
+| dense AdamW | **4.1903** | **66.04** | 127.64 ms | 1,026,888 | **6882 MiB** |
+| EF21M all-2D hook AdamW | 4.7176 | 111.90 | 127.80 ms | 1,025,603 | 7893 MiB |
+| EF14 all-2D hook AdamW | **4.3159** | **74.88** | **123.25 ms** | **1,063,465** | 7404 MiB |
+
+EF21M 相对 dense 的 loss 高 `0.5273`、PPL 高 `69.44%`；EF14 相对 dense 的
+loss 只高 `0.1256`、PPL 高 `13.38%`。在压缩开启前，step1000 的
+dense/EF21M/EF14 validation loss 分别为 `5.2528/5.2566/5.2559`。到 step1500，
+三者分别为 `4.8878/5.7735/5.2531`：EF21M 开启压缩后出现明显 loss 反弹，EF14
+没有出现同类跳升。最终 EF14 相对 EF21M 将 loss 降低 `0.4017`，PPL 降低
+`33.08%`。
+
+该对照把 AdamW 配方、压缩范围和 ARC 参数固定，仅改变 error-feedback 语义，因此
+强烈支持“此前大部分质量退化来自 EF21M 与 AdamW 的交互，而不是仅由 all-2D
+embedding/lm_head 压缩造成”。EF14 剩余 `0.1256` loss gap 与论文 Table IV 的约
+`0.1004` 已处于接近量级，但本实验仍使用 GPT/FineWeb/GPT-2 tokenizer，不能视为
+LLaMA/C4/T5-base 的逐项复现，也不能据此断言剩余差距的唯一来源。
+
+EF14 的 step average 相对 dense 低 `3.44%`、吞吐高 `3.56%`，相对 EF21M 的
+吞吐高 `3.69%`；峰值显存相对 dense 多 `522 MiB`，相对 EF21M 少 `489 MiB`。
+CM035 与 CM036 是先后运行的独立 controller，且 GPU 4–7 存在共享负载，因此这些
+约 3% 的跨 controller 性能差异只作参考；同 seed、完整 token 预算下的质量改善是
+本轮更有诊断价值的证据。
+
+原始产物位于：
+
+- `artifacts/compressed_muon/CM035-m001-adamw-paper-recipe-all2d-hook-gpt60m-train-ddp-ws4-s42/`
+- `artifacts/compressed_muon/CM036-m001-ef14-all2d-hook-adamw-paper-recipe-gpt60m-ddp-ws4-s42/`
