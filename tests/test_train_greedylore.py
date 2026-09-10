@@ -104,6 +104,12 @@ def test_factory_builds_ordinary_muon_with_one_greedylore_hook_and_muon_group_ro
     assert runtime.commit_step == state.commit_step
     assert runtime.checkpoint_state is state
     assert runtime.checkpoint_state_name == "greedy_lore_compressor"
+    assert state.checkpoint_metadata()["tensor_schema"]["rank_0"].keys() == {
+        "transformer.h.0.weight",
+        "transformer.h.1.weight",
+    }
+    assert callable(state.validate_checkpoint_metadata)
+    assert callable(state.load_state_dict)
 
     assert [spec.stable_name for spec in state.parameter_specs] == [
         name for name, _parameter in model.named_parameters()

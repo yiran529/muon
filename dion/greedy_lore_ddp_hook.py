@@ -1,7 +1,7 @@
 """Stable state and lifecycle for the GreedyLore DDP communication hook."""
 
 import threading
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Literal, Sequence
 
 import torch
@@ -28,6 +28,8 @@ from .greedy_lore import (
     unorient_matrix,
 )
 from .collective_observer import observe_collective
+
+GREEDY_LORE_COMPRESSOR_SCHEMA_VERSION = 1
 
 
 class GreedyLoreStateError(RuntimeError):
@@ -217,12 +219,135 @@ class GreedyLoreDDPState:
         self._next_context_id = 0
         self._context_lock = threading.Lock()
         self._execution_streams: dict[torch.device, torch.cuda.Stream] = {}
+        self._validated_checkpoint_committed_step: int | None = None
+
+    def _ordered_parameter_table(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "stable_name": spec.stable_name,
+                "stable_id": spec.stable_id,
+                "shape": list(spec.parameter.shape),
+                "dtype": str(spec.parameter.dtype).removeprefix("torch."),
+                "role": spec.role,
+            }
+            for spec in self.parameter_specs
+        ]
+
+    def _rank_local_tensor_schema(self) -> dict[str, dict[str, Any]]:
+        matrix_states = sorted(
+            self._parameter_states.values(),
+            key=lambda parameter_state: parameter_state.spec.stable_name,
+        )
+        return {
+            state.spec.stable_name: {
+                "error": {
+                    "shape": list(state.error.shape),
+                    "dtype": str(state.error.dtype).removeprefix("torch."),
+                },
+                "basis": {
+                    "shape": list(state.basis.shape),
+                    "dtype": str(state.basis.dtype).removeprefix("torch."),
+                },
+                "last_support": {
+                    "shape": list(state.last_support.shape),
+                    "dtype": str(state.last_support.dtype).removeprefix("torch."),
+                },
+            }
+            for state in matrix_states
+        }
+
+    def _tensor_schema(self) -> dict[str, Any]:
+        rank_local = self._rank_local_tensor_schema()
+        return {
+            "shared": {
+                "schema_version": {"shape": [], "dtype": "int64"},
+                "committed_step": {"shape": [], "dtype": "int64"},
+            },
+            **{f"rank_{rank}": rank_local for rank in self.group_ranks},
+        }
 
     def _require_committed_boundary(self, operation: str) -> None:
         if self._active_step is not None or not self.tail_future.done():
             raise GreedyLoreStateError(
                 f"GreedyLore compressor {operation} requires a committed step boundary"
             )
+
+    def checkpoint_metadata(self) -> dict[str, Any]:
+        """Return value-only metadata suitable for validation before DCP load."""
+
+        self._require_committed_boundary("checkpoint")
+        return {
+            "schema_version": GREEDY_LORE_COMPRESSOR_SCHEMA_VERSION,
+            "dp_world_size": self.world_size,
+            "group_ranks": list(self.group_ranks),
+            "config_fingerprint": self.fingerprint,
+            "config": asdict(self.config),
+            "seed_scheme_version": self.config.seed_scheme_version,
+            "committed_step": self.committed_step,
+            "ordered_parameter_table": self._ordered_parameter_table(),
+            "tensor_schema": self._tensor_schema(),
+        }
+
+    def validate_checkpoint_metadata(self, metadata: dict[str, Any]) -> None:
+        """Fail closed before tensor payloads are loaded into this runtime."""
+
+        self._require_committed_boundary("load")
+        if metadata.get("schema_version") != GREEDY_LORE_COMPRESSOR_SCHEMA_VERSION:
+            raise ValueError("GreedyLore compressor checkpoint schema version mismatch")
+        if metadata.get("dp_world_size") != self.world_size:
+            raise ValueError("GreedyLore compressor checkpoint world size mismatch")
+        if metadata.get("group_ranks") != list(self.group_ranks):
+            raise ValueError(
+                "GreedyLore compressor checkpoint rank membership mismatch"
+            )
+        if metadata.get("config_fingerprint") != self.fingerprint:
+            raise ValueError("GreedyLore compressor checkpoint fingerprint mismatch")
+        if metadata.get("seed_scheme_version") != self.config.seed_scheme_version:
+            raise ValueError("GreedyLore compressor checkpoint seed scheme mismatch")
+        if metadata.get("config") != asdict(self.config):
+            raise ValueError("GreedyLore compressor checkpoint config mismatch")
+        if metadata.get("ordered_parameter_table") != self._ordered_parameter_table():
+            raise ValueError(
+                "GreedyLore compressor checkpoint parameter table mismatch"
+            )
+        committed_step = metadata.get("committed_step")
+        if not isinstance(committed_step, int) or committed_step < 0:
+            raise ValueError(
+                "GreedyLore compressor checkpoint committed step is invalid"
+            )
+        self._validate_metadata_tensor_schema(metadata.get("tensor_schema"))
+        self._validated_checkpoint_committed_step = committed_step
+
+    def _validate_metadata_tensor_schema(self, tensor_schema: Any) -> None:
+        expected = self._tensor_schema()
+        if not isinstance(tensor_schema, dict):
+            raise ValueError("GreedyLore compressor checkpoint tensor schema mismatch")
+        missing_ranks = sorted(set(expected) - set(tensor_schema))
+        extra_ranks = sorted(set(tensor_schema) - set(expected))
+        if missing_ranks or extra_ranks:
+            missing_text = ", ".join(missing_ranks)
+            extra_text = ", ".join(extra_ranks)
+            raise ValueError(
+                "GreedyLore compressor checkpoint tensor schema mismatch; "
+                f"missing={missing_text}, extra={extra_text}"
+            )
+        for root, expected_entry in expected.items():
+            actual_entry = tensor_schema[root]
+            if actual_entry != expected_entry:
+                if root.startswith("rank_"):
+                    expected_names = set(expected_entry)
+                    actual_names = (
+                        set(actual_entry) if isinstance(actual_entry, dict) else set()
+                    )
+                    missing_names = sorted(expected_names - actual_names)
+                    if missing_names:
+                        raise ValueError(
+                            "GreedyLore compressor checkpoint tensor schema "
+                            f"is missing parameter {missing_names[0]!r}"
+                        )
+                raise ValueError(
+                    "GreedyLore compressor checkpoint tensor schema mismatch"
+                )
 
     def execution_stream(self, device: torch.device) -> torch.cuda.Stream:
         if device.type != "cuda":
@@ -420,12 +545,24 @@ class GreedyLoreDDPState:
         """Expose preallocated state at a safe compressor boundary."""
 
         self._require_committed_boundary("checkpoint")
+        self.validate_replicated_basis_across_ranks()
         matrix_states = sorted(
             self._parameter_states.values(),
             key=lambda parameter_state: parameter_state.spec.stable_name,
         )
         return {
-            "shared": {"committed_step": self.committed_step},
+            "shared": {
+                "schema_version": torch.tensor(
+                    GREEDY_LORE_COMPRESSOR_SCHEMA_VERSION,
+                    dtype=torch.int64,
+                    device=self.parameter_specs[0].parameter.device,
+                ),
+                "committed_step": torch.tensor(
+                    self.committed_step,
+                    dtype=torch.int64,
+                    device=self.parameter_specs[0].parameter.device,
+                ),
+            },
             f"rank_{self.global_rank}": {
                 state.spec.stable_name: {
                     "error": state.error,
@@ -435,6 +572,98 @@ class GreedyLoreDDPState:
                 for state in matrix_states
             },
         }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore a validated checkpoint into preallocated compressor tensors."""
+
+        self._require_committed_boundary("load")
+        try:
+            shared = state_dict["shared"]
+        except KeyError as exc:
+            raise ValueError(
+                "GreedyLore compressor checkpoint is missing shared state"
+            ) from exc
+        self._validate_shared_state(shared)
+        rank_key = f"rank_{self.global_rank}"
+        try:
+            rank_state = state_dict[rank_key]
+        except KeyError as exc:
+            raise ValueError(
+                f"GreedyLore compressor checkpoint is missing state for {rank_key}"
+            ) from exc
+        expected_names = {
+            parameter_state.spec.stable_name
+            for parameter_state in self._parameter_states.values()
+        }
+        actual_names = set(rank_state) if isinstance(rank_state, dict) else set()
+        if actual_names != expected_names:
+            missing = sorted(expected_names - actual_names)
+            extra = sorted(actual_names - expected_names)
+            raise ValueError(
+                "GreedyLore compressor rank-local state mismatch; "
+                f"missing={missing}, extra={extra}"
+            )
+        for parameter_state in self._parameter_states.values():
+            name = parameter_state.spec.stable_name
+            local_entry = rank_state[name]
+            if not isinstance(local_entry, dict) or set(local_entry) != {
+                "error",
+                "basis",
+                "last_support",
+            }:
+                raise ValueError(
+                    "GreedyLore compressor state fields mismatch for "
+                    f"parameter {name!r}"
+                )
+            for field_name in ("error", "basis", "last_support"):
+                source = local_entry[field_name]
+                destination = getattr(parameter_state, field_name)
+                if (
+                    not torch.is_tensor(source)
+                    or source.shape != destination.shape
+                    or source.dtype != destination.dtype
+                ):
+                    raise ValueError(
+                        "GreedyLore compressor tensor schema mismatch for "
+                        f"{name!r}/{field_name}"
+                    )
+                destination.copy_(source)
+        checkpoint_step = int(shared["committed_step"].item())
+        if (
+            self._validated_checkpoint_committed_step is not None
+            and checkpoint_step != self._validated_checkpoint_committed_step
+        ):
+            raise ValueError(
+                "GreedyLore compressor checkpoint committed step payload "
+                "does not match metadata"
+            )
+        self.committed_step = checkpoint_step
+        self._validated_checkpoint_committed_step = None
+        self.validate_replicated_basis_across_ranks()
+
+    def _validate_shared_state(self, shared: Any) -> None:
+        if not isinstance(shared, dict):
+            raise ValueError("GreedyLore compressor checkpoint shared state mismatch")
+        if set(shared) != {"schema_version", "committed_step"}:
+            raise ValueError("GreedyLore compressor checkpoint shared state mismatch")
+        schema_version = shared["schema_version"]
+        committed_step = shared["committed_step"]
+        for name, tensor in shared.items():
+            if (
+                not torch.is_tensor(tensor)
+                or tensor.shape != torch.Size([])
+                or tensor.dtype != torch.int64
+            ):
+                raise ValueError(
+                    "GreedyLore compressor shared tensor schema mismatch for "
+                    f"{name!r}"
+                )
+        if int(schema_version.item()) != GREEDY_LORE_COMPRESSOR_SCHEMA_VERSION:
+            raise ValueError("GreedyLore compressor checkpoint schema version mismatch")
+        if int(committed_step.item()) < 0:
+            raise ValueError(
+                "GreedyLore compressor checkpoint committed step is invalid"
+            )
 
 
 def bridge_future(
