@@ -137,3 +137,57 @@ def canonicalize_svd_basis(basis: Tensor) -> Tensor:
     pivots = basis[pivot_indices, columns]
     signs = torch.where(pivots < 0, -torch.ones_like(pivots), torch.ones_like(pivots))
     return basis * signs.unsqueeze(0)
+
+
+def corrected_gradient(
+    gradient: Tensor, error: Tensor, orientation: MatrixOrientation
+) -> Tensor:
+    """Return the canonical FP32 gradient corrected by the local error."""
+
+    return orient_matrix(gradient, orientation).to(dtype=torch.float32) + error
+
+
+def refresh_basis(global_corrected: Tensor, rank: int) -> tuple[Tensor, Tensor, Tensor]:
+    """Refresh the SVD basis and select the leading rank columns."""
+
+    basis, _, _ = torch.linalg.svd(
+        global_corrected.to(dtype=torch.float32), full_matrices=False
+    )
+    basis = canonicalize_svd_basis(basis)
+    support = torch.arange(rank, device=basis.device, dtype=torch.int64)
+    projector = basis.index_select(1, support)
+    return basis, projector, support
+
+
+def approximate_signed_lambda(
+    corrected: Tensor, basis: Tensor, random_vectors: Tensor
+) -> Tensor:
+    """Approximate signed subspace scores with Gaussian random vectors."""
+
+    projected_rows = basis.mT @ corrected
+    return (projected_rows * random_vectors).sum(dim=1)
+
+
+def select_projector(
+    basis: Tensor, averaged_lambda: Tensor, rank: int
+) -> tuple[Tensor, Tensor]:
+    """Select the Top-r basis columns using squared averaged signed scores."""
+
+    scores = averaged_lambda.square()
+    support = torch.argsort(scores, descending=True, stable=True)[:rank]
+    projector = basis.index_select(1, support)
+    return projector, support
+
+
+def compress_local(corrected: Tensor, projector: Tensor) -> tuple[Tensor, Tensor]:
+    """Compress a corrected local gradient and return its next local error."""
+
+    local_factor = projector.mT @ corrected
+    next_error = corrected - projector @ local_factor
+    return local_factor, next_error
+
+
+def reconstruct_global(projector: Tensor, averaged_factor: Tensor) -> Tensor:
+    """Reconstruct the averaged compressed gradient."""
+
+    return projector @ averaged_factor

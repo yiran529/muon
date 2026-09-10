@@ -5,13 +5,19 @@ import torch
 
 from dion.greedy_lore import (
     GreedyLoreConfig,
+    approximate_signed_lambda,
     canonicalize_svd_basis,
+    compress_local,
     compressed_phase,
+    corrected_gradient,
     derive_greedy_lore_seed,
     is_refresh_step,
     make_random_vectors,
     matrix_orientation,
     orient_matrix,
+    reconstruct_global,
+    refresh_basis,
+    select_projector,
     unorient_matrix,
 )
 
@@ -78,6 +84,18 @@ def test_first_compressed_step_is_refresh_independent_of_absolute_step():
     ]
 
 
+def test_update_interval_one_refreshes_every_compressed_step():
+    config = GreedyLoreConfig(start_compress_step=2, update_interval=1)
+
+    assert [is_refresh_step(step, config) for step in range(2, 7)] == [
+        False,
+        True,
+        True,
+        True,
+        True,
+    ]
+
+
 @pytest.mark.parametrize(
     "shape,expected,transposed",
     [
@@ -112,6 +130,35 @@ def test_transposed_orientation_uses_storage_aliasing_views():
 
     assert oriented.data_ptr() == tensor.data_ptr()
     assert restored.data_ptr() == tensor.data_ptr()
+
+
+def test_corrected_gradient_handles_square_and_transposed_matrices():
+    square_gradient = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
+    square_error = torch.tensor([[0.5, -0.5], [1.5, -1.0]], dtype=torch.float32)
+    square_orientation = matrix_orientation(square_gradient.shape)
+
+    square_corrected = corrected_gradient(
+        square_gradient, square_error, square_orientation
+    )
+
+    assert square_orientation.transposed is False
+    assert square_corrected.dtype == torch.float32
+    assert torch.allclose(
+        square_corrected,
+        torch.tensor([[1.5, 1.5], [4.5, 3.0]], dtype=torch.float32),
+    )
+
+    tall_gradient = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32
+    )
+    tall_error = torch.tensor([[0.25, -0.5, 0.75], [1.0, -1.25, 1.5]])
+    tall_orientation = matrix_orientation(tall_gradient.shape)
+
+    tall_corrected = corrected_gradient(tall_gradient, tall_error, tall_orientation)
+
+    assert tall_orientation.transposed is True
+    assert tall_corrected.shape == (2, 3)
+    assert torch.allclose(tall_corrected, tall_gradient.mT + tall_error)
 
 
 def test_rows_less_than_columns_matches_selecting_columns_from_u():
@@ -181,6 +228,15 @@ def test_random_vectors_are_local_and_reproducible():
     assert torch.equal(torch.random.get_rng_state(), before)
 
 
+def test_random_vectors_include_negative_standard_normal_values():
+    vectors = make_random_vectors(
+        rows=8, columns=8, seed=42, device=torch.device("cpu")
+    )
+
+    assert (vectors < 0).any()
+    assert (vectors > 0).any()
+
+
 def test_canonicalize_svd_basis_uses_smallest_maximum_index_as_positive_pivot():
     basis = torch.tensor([[-0.5, 0.0], [-0.5, -1.0]])
 
@@ -190,3 +246,68 @@ def test_canonicalize_svd_basis_uses_smallest_maximum_index_as_positive_pivot():
     assert result[1, 1] > 0
     assert torch.allclose(result[:, 0], torch.tensor([0.5, 0.5]))
     assert torch.allclose(result.T @ result, basis.T @ basis)
+
+
+def test_zero_corrected_gradient_stays_zero_through_recurrence_primitives():
+    corrected = torch.zeros(2, 3)
+    basis = torch.eye(2)
+    random_vectors = torch.tensor([[1.0, -2.0, 3.0], [4.0, -5.0, 6.0]])
+
+    signed_lambda = approximate_signed_lambda(corrected, basis, random_vectors)
+    projector, support = select_projector(basis, signed_lambda, rank=1)
+    local_factor, next_error = compress_local(corrected, projector)
+    reconstructed = reconstruct_global(projector, local_factor)
+
+    assert torch.equal(signed_lambda, torch.zeros(2))
+    assert torch.equal(support, torch.tensor([0]))
+    assert torch.equal(local_factor, torch.zeros(1, 3))
+    assert torch.equal(next_error, torch.zeros(2, 3))
+    assert torch.equal(reconstructed, torch.zeros(2, 3))
+
+
+def test_select_projector_uses_stable_score_ties():
+    basis = torch.eye(3)
+    averaged_lambda = torch.tensor([2.0, -2.0, 1.0])
+
+    projector, support = select_projector(basis, averaged_lambda, rank=2)
+
+    assert torch.equal(support, torch.tensor([0, 1]))
+    assert torch.equal(projector, torch.eye(3)[:, :2])
+
+
+def test_full_rank_recurrence_round_trip_uses_projector_path():
+    global_corrected = torch.tensor([[2.0, 1.0, 0.5], [0.25, 3.0, 4.0]])
+    basis, _, _ = refresh_basis(global_corrected, rank=2)
+    averaged_lambda = torch.tensor([0.25, -0.75])
+    projector, support = select_projector(basis, averaged_lambda, rank=2)
+    corrected = torch.tensor([[1.0, -2.0, 0.5], [3.0, 1.5, -4.0]])
+
+    local_factor, next_error = compress_local(corrected, projector)
+    reconstructed = reconstruct_global(projector, local_factor)
+
+    assert torch.equal(support, torch.tensor([1, 0]))
+    assert local_factor.shape == (2, 3)
+    assert torch.allclose(next_error, torch.zeros_like(corrected), atol=1e-5, rtol=1e-5)
+    assert torch.allclose(reconstructed, corrected, atol=1e-5, rtol=1e-5)
+
+
+def test_recurrence_primitives_keep_fp32_state_after_bfloat16_gradient():
+    gradient = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
+    error = torch.tensor([[0.125, -0.25], [0.5, -1.0]], dtype=torch.float32)
+    orientation = matrix_orientation(gradient.shape)
+
+    corrected = corrected_gradient(gradient, error, orientation)
+    basis, projector, _ = refresh_basis(corrected, rank=1)
+    signed_lambda = approximate_signed_lambda(
+        corrected, basis, torch.ones_like(corrected)
+    )
+    local_factor, next_error = compress_local(corrected, projector)
+    reconstructed = reconstruct_global(projector, local_factor)
+
+    assert corrected.dtype == torch.float32
+    assert basis.dtype == torch.float32
+    assert projector.dtype == torch.float32
+    assert signed_lambda.dtype == torch.float32
+    assert local_factor.dtype == torch.float32
+    assert next_error.dtype == torch.float32
+    assert reconstructed.dtype == torch.float32
