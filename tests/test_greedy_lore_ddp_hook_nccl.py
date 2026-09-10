@@ -9,7 +9,9 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 
+from dion.collective_observer import CollectiveObserver, set_active_observer
 from dion.greedy_lore import GreedyLoreConfig
 import dion.greedy_lore_ddp_hook as hook_module
 from dion.greedy_lore_ddp_hook import GreedyLoreDDPParameterSpec, GreedyLoreDDPState
@@ -222,6 +224,162 @@ def test_broadcast_refresh_future_exports_final_compressor_stream_write():
     )
     try:
         assert _join_with_timeout(process_context, timeout=60)
+    finally:
+        for process in process_context.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+
+
+class _BucketedCudaModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            [torch.nn.Linear(16, 16, bias=False) for _ in range(8)]
+        )
+        self.dense = torch.nn.Parameter(torch.zeros(16))
+
+    def forward(self, value):
+        for layer in self.layers:
+            value = torch.tanh(layer(value))
+        return value.sum() + (self.dense * value.sum(dim=0)).sum()
+
+
+def _compressed_stress_worker(rank, world_size, port):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    observer = CollectiveObserver()
+    set_active_observer(observer)
+    original_all_reduce = hook_module._all_reduce_future
+    try:
+        device = torch.device("cuda", rank)
+        torch.manual_seed(1234)
+        model = _BucketedCudaModel().to(device)
+        ddp = DDP(
+            model,
+            device_ids=[rank],
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=0.0005,
+        )
+        parameters = list(model.parameters())
+        state = GreedyLoreDDPState(
+            process_group=dist.group.WORLD,
+            fingerprint="7" * 64,
+            parameter_specs=[
+                GreedyLoreDDPParameterSpec(
+                    parameter,
+                    name,
+                    index,
+                    "matrix" if parameter.ndim == 2 else "dense_aux",
+                )
+                for index, (name, parameter) in enumerate(model.named_parameters())
+            ],
+            optimizer_parameters=parameters,
+            config=GreedyLoreConfig(
+                rank=1,
+                start_compress_step=0,
+                update_interval=3,
+                seed=29,
+            ),
+        )
+        delayed_calls = 0
+
+        def delayed_all_reduce(current_state, tensor, category):
+            nonlocal delayed_calls
+            delayed_calls += 1
+            if (
+                category == "greedylore_hook/factor_allreduce"
+                and delayed_calls % world_size == rank
+            ):
+                torch.cuda._sleep(500_000)
+            return original_all_reduce(current_state, tensor, category)
+
+        hook_module._all_reduce_future = delayed_all_reduce
+        ddp.register_comm_hook(state, hook_module.greedy_lore_ddp_hook)
+        optimizer = torch.optim.SGD(parameters, lr=0.01)
+        consumer = torch.cuda.Stream(device=device)
+        for iteration in range(6):
+            if iteration == 2:
+                with ddp.no_sync():
+                    ddp(
+                        torch.full(
+                            (8, 16),
+                            0.125 * (rank + 1),
+                            device=device,
+                        )
+                    ).backward()
+            state.begin_step()
+            inputs = torch.full(
+                (8, 16),
+                float(rank + iteration + 1) / 10,
+                device=device,
+            )
+            if iteration == 3:
+                inputs.zero_()
+            ddp(inputs).backward()
+            state.finish_step()
+            consumer.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(consumer):
+                consumed = [parameter.grad.detach().clone() for parameter in parameters]
+            consumer.synchronize()
+            gathered = [None] * world_size
+            dist.all_gather_object(
+                gathered,
+                [gradient.cpu() for gradient in consumed],
+            )
+            for parameter_index in range(len(parameters)):
+                torch.testing.assert_close(
+                    gathered[0][parameter_index],
+                    gathered[1][parameter_index],
+                    msg=lambda message: (
+                        f"iteration={iteration}, parameter={parameter_index}: {message}"
+                    ),
+                )
+            optimizer.step()
+            state.commit_step()
+            optimizer.zero_grad(set_to_none=True)
+            assert not state._active_contexts
+            churn = [torch.empty(256 * 1024, device=device) for _ in range(16)]
+            del churn
+
+        signature = observer.signature()
+        signatures = [None] * world_size
+        dist.all_gather_object(signatures, signature)
+        assert signatures == [signatures[0]] * world_size
+        assert any(
+            event.category == "greedylore_hook/score_plus_aux_allreduce"
+            for event in observer.events
+        )
+        assert any(
+            event.category == "greedylore_hook/factor_allreduce"
+            for event in observer.events
+        )
+        assert all(event.category != "greedylore_hook/seed" for event in observer.events)
+    finally:
+        hook_module._all_reduce_future = original_all_reduce
+        set_active_observer(None)
+        dist.destroy_process_group()
+
+
+@pytest.mark.multi_gpu
+def test_compressed_nccl_hook_survives_rebuild_accumulation_delay_and_allocator_churn():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    process_context = mp.spawn(
+        _compressed_stress_worker,
+        args=(2, _free_port()),
+        nprocs=2,
+        join=False,
+    )
+    try:
+        assert _join_with_timeout(process_context, timeout=75)
     finally:
         for process in process_context.processes:
             if process.is_alive():

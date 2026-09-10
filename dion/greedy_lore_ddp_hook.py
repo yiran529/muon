@@ -13,12 +13,18 @@ from torch.nn import Parameter
 from .greedy_lore import (
     GreedyLoreConfig,
     MatrixOrientation,
+    approximate_signed_lambda,
+    compress_local,
     compressed_phase,
     corrected_gradient,
+    derive_greedy_lore_seed,
     is_refresh_step,
+    make_random_vectors,
     matrix_orientation,
     orient_matrix,
+    reconstruct_global,
     refresh_basis,
+    select_projector,
     unorient_matrix,
 )
 from .collective_observer import observe_collective
@@ -64,6 +70,19 @@ class BucketContext:
     previous_tail: torch.futures.Future
     completion_future: torch.futures.Future
     retained: list[Any] = field(default_factory=list)
+
+
+@dataclass
+class CompressedMatrixWork:
+    gradient: Tensor
+    parameter_state: GreedyLoreParameterState
+    corrected: Tensor
+    signed_lambda: Tensor
+    score_offset: int
+    factor_offset: int | None = None
+    projector: Tensor | None = None
+    support: Tensor | None = None
+    local_factor: Tensor | None = None
 
 
 def _future_devices(device: torch.device) -> list[torch.device]:
@@ -694,6 +713,220 @@ def _launch_refresh_bucket(
     return completion
 
 
+def _parameter_spec_for_dense(
+    state: GreedyLoreDDPState,
+    parameter: Parameter,
+) -> GreedyLoreDDPParameterSpec:
+    spec = state._specs_by_parameter[id(parameter)]
+    if spec.role != "dense_aux":
+        raise GreedyLoreStateError(
+            f"expected dense auxiliary parameter {spec.stable_name!r}"
+        )
+    return spec
+
+
+def _ordered_compressed_entries(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+) -> list[tuple[Tensor, GreedyLoreParameterState | None, Parameter, int]]:
+    entries = []
+    for gradient, parameter_state, parameter in zip(
+        context.gradients,
+        context.parameter_states,
+        context.parameters,
+    ):
+        stable_id = (
+            parameter_state.spec.stable_id
+            if parameter_state is not None
+            else _parameter_spec_for_dense(state, parameter).stable_id
+        )
+        entries.append((gradient, parameter_state, parameter, stable_id))
+    return sorted(entries, key=lambda item: item[3])
+
+
+def _prepare_score_plus_aux_buffer(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+) -> tuple[Tensor, list[CompressedMatrixWork], list[tuple[Tensor, int, int]]]:
+    chunks = []
+    matrix_work = []
+    dense_ranges = []
+    offset = 0
+    if context.phase is None:
+        raise GreedyLoreStateError("compressed score packing requires a phase")
+    for gradient, parameter_state, _parameter, _stable_id in _ordered_compressed_entries(
+        state,
+        context,
+    ):
+        if parameter_state is None:
+            flat_dense = gradient.reshape(-1).to(dtype=torch.float32)
+            chunks.append(flat_dense)
+            dense_ranges.append((gradient, offset, flat_dense.numel()))
+            offset += flat_dense.numel()
+            continue
+        corrected = corrected_gradient(
+            gradient,
+            parameter_state.error,
+            parameter_state.orientation,
+        )
+        rows, columns = corrected.shape
+        random_vectors = make_random_vectors(
+            rows=rows,
+            columns=columns,
+            seed=derive_greedy_lore_seed(
+                base_seed=state.config.seed,
+                phase=context.phase,
+                stable_parameter_id=parameter_state.spec.stable_id,
+            ),
+            device=corrected.device,
+        )
+        signed_lambda = approximate_signed_lambda(
+            corrected,
+            parameter_state.basis,
+            random_vectors,
+        )
+        chunks.append(signed_lambda)
+        matrix_work.append(
+            CompressedMatrixWork(
+                gradient=gradient,
+                parameter_state=parameter_state,
+                corrected=corrected,
+                signed_lambda=signed_lambda,
+                score_offset=offset,
+            )
+        )
+        offset += signed_lambda.numel()
+    if not chunks:
+        return (
+            torch.empty(0, dtype=torch.float32, device=context.buffer.device),
+            matrix_work,
+            dense_ranges,
+        )
+    score_plus_aux = torch.cat([chunk.reshape(-1) for chunk in chunks])
+    context.retained.extend([score_plus_aux, matrix_work, dense_ranges])
+    return score_plus_aux, matrix_work, dense_ranges
+
+
+def _copy_averaged_dense_aux(
+    score_plus_aux: Tensor,
+    dense_ranges: list[tuple[Tensor, int, int]],
+) -> None:
+    for gradient, offset, numel in dense_ranges:
+        averaged = score_plus_aux[offset : offset + numel].view_as(gradient)
+        gradient.copy_(averaged.to(dtype=gradient.dtype))
+
+
+def _prepare_factor_buffer(
+    state: GreedyLoreDDPState,
+    score_plus_aux: Tensor,
+    matrix_work: list[CompressedMatrixWork],
+) -> Tensor:
+    chunks = []
+    offset = 0
+    for work in matrix_work:
+        averaged_lambda = score_plus_aux[
+            work.score_offset : work.score_offset + work.signed_lambda.numel()
+        ]
+        projector, support = select_projector(
+            work.parameter_state.basis,
+            averaged_lambda,
+            state.config.rank,
+        )
+        local_factor, next_error = compress_local(work.corrected, projector)
+        work.parameter_state.error.copy_(next_error)
+        work.parameter_state.last_support.copy_(support)
+        work.projector = projector
+        work.support = support
+        work.local_factor = local_factor
+        work.factor_offset = offset
+        chunks.append(local_factor.reshape(-1).clone())
+        offset += local_factor.numel()
+    factor_buffer = torch.cat(chunks)
+    return factor_buffer
+
+
+def _reconstruct_compressed_matrices(
+    state: GreedyLoreDDPState,
+    factor_buffer: Tensor,
+    matrix_work: list[CompressedMatrixWork],
+) -> Tensor:
+    if state.world_size > 1:
+        factor_buffer.div_(state.world_size)
+    for work in matrix_work:
+        assert work.projector is not None
+        assert work.local_factor is not None
+        assert work.factor_offset is not None
+        offset = work.factor_offset
+        averaged_factor = factor_buffer[
+            offset : offset + work.local_factor.numel()
+        ].view_as(work.local_factor)
+        reconstructed = reconstruct_global(work.projector, averaged_factor)
+        work.gradient.copy_(
+            unorient_matrix(reconstructed, work.parameter_state.orientation).to(
+                dtype=work.gradient.dtype
+            )
+        )
+    return matrix_work[0].gradient.new_empty(0)
+
+
+def _launch_compressed_bucket(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+) -> torch.futures.Future:
+    if not _matrix_entries(context):
+        return _launch_dense_bucket(state, context)
+
+    score_plus_aux, matrix_work, dense_ranges = _prepare_score_plus_aux_buffer(
+        state,
+        context,
+    )
+    score_source = _all_reduce_future(
+        state,
+        score_plus_aux,
+        "greedylore_hook/score_plus_aux_allreduce",
+    )
+    completion = torch.futures.Future(devices=_future_devices(context.buffer.device))
+
+    def fail(exc: BaseException) -> None:
+        if not completion.done():
+            completion.set_exception(exc)
+
+    def after_score(completed: torch.futures.Future) -> None:
+        try:
+            reduced_score_plus_aux = _future_tensor(completed.value())
+            if state.world_size > 1:
+                reduced_score_plus_aux.div_(state.world_size)
+            _copy_averaged_dense_aux(reduced_score_plus_aux, dense_ranges)
+            factor_buffer = _prepare_factor_buffer(
+                state,
+                reduced_score_plus_aux,
+                matrix_work,
+            )
+            context.retained.append(factor_buffer)
+            factor_source = _all_reduce_future(
+                state,
+                factor_buffer,
+                "greedylore_hook/factor_allreduce",
+            )
+
+            def after_factor(factor_completed: torch.futures.Future) -> Tensor:
+                reduced_factor = _future_tensor(factor_completed.value())
+                _reconstruct_compressed_matrices(state, reduced_factor, matrix_work)
+                return context.buffer
+
+            factor_completion = factor_source.then(
+                _on_bucket_execution_stream_result(state, context, after_factor)
+            )
+            bridge_future(factor_completion, completion, lambda value: value)
+        except BaseException as exc:
+            fail(exc)
+
+    score_source.add_done_callback(
+        _on_bucket_execution_stream(state, context, after_score)
+    )
+    return completion
+
+
 def greedy_lore_ddp_hook(
     state: GreedyLoreDDPState,
     bucket: dist.GradBucket,
@@ -716,11 +949,5 @@ def greedy_lore_ddp_hook(
     return enqueue_bucket_chain(
         state,
         context,
-        lambda _current: _raise_compressed_non_refresh_not_implemented(),
-    )
-
-
-def _raise_compressed_non_refresh_not_implemented() -> torch.futures.Future:
-    raise NotImplementedError(
-        "GreedyLore compressed non-refresh hook path is not implemented yet"
+        lambda current: _launch_compressed_bucket(state, current),
     )

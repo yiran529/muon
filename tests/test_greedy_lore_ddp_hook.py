@@ -3,7 +3,19 @@
 import torch
 import pytest
 
-from dion.greedy_lore import GreedyLoreConfig, canonicalize_svd_basis, orient_matrix
+from dion.greedy_lore import (
+    GreedyLoreConfig,
+    approximate_signed_lambda,
+    canonicalize_svd_basis,
+    compress_local,
+    corrected_gradient,
+    derive_greedy_lore_seed,
+    make_random_vectors,
+    orient_matrix,
+    reconstruct_global,
+    select_projector,
+)
+import dion.greedy_lore_ddp_hook as hook_module
 from dion.greedy_lore_ddp_hook import (
     GreedyLoreDDPParameterSpec,
     GreedyLoreDDPState,
@@ -156,22 +168,112 @@ def test_dense_only_warmup_bucket_retains_native_dtype():
     torch.testing.assert_close(result, gradient)
 
 
-def test_non_refresh_compressed_step_is_not_silently_densified():
+def test_compressed_step_reduces_signed_scores_before_square_and_updates_local_error_before_factor_average():
     matrix = torch.nn.Parameter(torch.zeros(2, 3))
-    bucket = FakeGradBucket([matrix], [torch.ones_like(matrix)])
-    state = _state([(matrix, "matrix", "matrix")], start_compress_step=0)
-
-    state.begin_step()
-    greedy_lore_ddp_hook(state, bucket).wait()
-    state.finish_step()
-    state.commit_step()
-
-    state.begin_step()
-    future = greedy_lore_ddp_hook(
-        state,
-        FakeGradBucket([matrix], [torch.ones_like(matrix)]),
+    dense = torch.nn.Parameter(torch.zeros(2))
+    matrix_gradient = torch.tensor([[1.0, 0.0, 0.0], [0.0, 2.0, 3.0]])
+    dense_gradient = torch.tensor([5.0, 7.0])
+    bucket = FakeGradBucket([matrix, dense], [matrix_gradient, dense_gradient])
+    state = _state(
+        [(matrix, "matrix", "matrix"), (dense, "dense", "dense_aux")],
+        start_compress_step=0,
+        update_interval=100,
     )
+    state.committed_step = 1
+    state.world_size = 2
+    parameter_state = state.parameter_state(matrix)
+    parameter_state.basis.copy_(torch.eye(2))
 
-    with pytest.raises(NotImplementedError, match="compressed non-refresh"):
-        future.wait()
-    assert future.done()
+    corrected = corrected_gradient(
+        matrix_gradient,
+        parameter_state.error,
+        parameter_state.orientation,
+    )
+    local_lambda = approximate_signed_lambda(
+        corrected,
+        parameter_state.basis,
+        make_random_vectors(
+            rows=2,
+            columns=3,
+            seed=derive_greedy_lore_seed(
+                base_seed=state.config.seed,
+                phase=1,
+                stable_parameter_id=0,
+            ),
+            device=torch.device("cpu"),
+        ),
+    )
+    averaged_lambda = torch.tensor([0.0, 4.0])
+    projector, support = select_projector(parameter_state.basis, averaged_lambda, 1)
+    local_factor, expected_error = compress_local(corrected, projector)
+    other_factor = torch.tensor([[4.0, 6.0, 8.0]])
+    averaged_factor = (local_factor + other_factor) / 2
+    expected_reconstructed = reconstruct_global(projector, averaged_factor)
+    expected_dense = torch.tensor([11.0, 13.0])
+
+    original_all_reduce = hook_module._all_reduce_future
+    calls = []
+
+    def fake_all_reduce(current_state, tensor, category):
+        calls.append((category, tensor.clone()))
+        future = torch.futures.Future()
+        if category == "greedylore_hook/score_plus_aux_allreduce":
+            torch.testing.assert_close(tensor[:2], local_lambda)
+            torch.testing.assert_close(tensor[2:], dense_gradient)
+            score_and_dense_sum = torch.cat(
+                [averaged_lambda * 2, expected_dense * 2]
+            )
+            tensor.copy_(score_and_dense_sum)
+        elif category == "greedylore_hook/factor_allreduce":
+            torch.testing.assert_close(parameter_state.error, expected_error)
+            torch.testing.assert_close(tensor, local_factor.flatten())
+            tensor.copy_((local_factor + other_factor).flatten())
+        else:
+            raise AssertionError(f"unexpected collective category {category!r}")
+        future.set_result(tensor)
+        return future
+
+    hook_module._all_reduce_future = fake_all_reduce
+    try:
+        state.begin_step()
+        result = greedy_lore_ddp_hook(state, bucket).wait()
+        state.finish_step()
+    finally:
+        hook_module._all_reduce_future = original_all_reduce
+
+    assert result is bucket.buffer()
+    assert [category for category, _ in calls] == [
+        "greedylore_hook/score_plus_aux_allreduce",
+        "greedylore_hook/factor_allreduce",
+    ]
+    assert torch.equal(support, torch.tensor([1]))
+    assert torch.equal(parameter_state.last_support, torch.tensor([1]))
+    torch.testing.assert_close(parameter_state.error, expected_error)
+    torch.testing.assert_close(bucket.gradients()[0], expected_reconstructed)
+    torch.testing.assert_close(bucket.gradients()[1], expected_dense)
+
+
+def test_dense_only_compressed_bucket_launches_one_dense_reduction_and_stops():
+    dense = torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16))
+    gradient = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
+    bucket = FakeGradBucket([dense], [gradient])
+    state = _state([(dense, "dense", "dense_aux")], start_compress_step=0)
+    state.committed_step = 1
+
+    state.begin_step()
+    result = greedy_lore_ddp_hook(state, bucket).wait()
+    state.finish_step()
+
+    assert result.dtype == torch.bfloat16
+    torch.testing.assert_close(result, gradient)
+
+
+def test_registered_hook_callback_path_avoids_forbidden_synchronization():
+    source = hook_module.__loader__.get_source(hook_module.__name__)
+
+    assert "Work.wait" not in source
+    assert "torch.cuda.synchronize" not in source
+    assert ".item(" not in source
+    assert ".cpu(" not in source
+    assert ".to(\"cpu\"" not in source
+    assert ".to('cpu'" not in source
