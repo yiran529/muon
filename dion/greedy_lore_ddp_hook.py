@@ -14,8 +14,14 @@ from .greedy_lore import (
     GreedyLoreConfig,
     MatrixOrientation,
     compressed_phase,
+    corrected_gradient,
+    is_refresh_step,
     matrix_orientation,
+    orient_matrix,
+    refresh_basis,
+    unorient_matrix,
 )
+from .collective_observer import observe_collective
 
 
 class GreedyLoreStateError(RuntimeError):
@@ -470,3 +476,250 @@ def enqueue_bucket_chain(
 
     context.previous_tail.add_done_callback(after_previous)
     return destination
+
+
+def _all_reduce_future(
+    state: GreedyLoreDDPState,
+    tensor: Tensor,
+    category: str,
+) -> torch.futures.Future:
+    if state.process_group is not None and state.world_size > 1:
+        observe_collective(category, "all_reduce", tensor)
+        return dist.all_reduce(
+            tensor,
+            op=dist.ReduceOp.SUM,
+            group=state.process_group,
+            async_op=True,
+        ).get_future()
+    future = torch.futures.Future(devices=_future_devices(tensor.device))
+    future.set_result(tensor)
+    return future
+
+
+def _broadcast_future(
+    state: GreedyLoreDDPState,
+    tensor: Tensor,
+    category: str,
+) -> torch.futures.Future:
+    if state.process_group is not None and state.world_size > 1:
+        observe_collective(category, "broadcast", tensor)
+        return dist.broadcast(
+            tensor,
+            src=state.group_ranks[0],
+            group=state.process_group,
+            async_op=True,
+        ).get_future()
+    future = torch.futures.Future(devices=_future_devices(tensor.device))
+    future.set_result(tensor)
+    return future
+
+
+def _on_bucket_execution_stream(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+    callback: Callable[[torch.futures.Future], None],
+) -> Callable[[torch.futures.Future], None]:
+    def run(completed: torch.futures.Future) -> None:
+        if context.buffer.device.type != "cuda":
+            callback(completed)
+            return
+        device = context.buffer.device
+        callback_stream = torch.cuda.current_stream(device)
+        execution_stream = state.execution_stream(device)
+        execution_stream.wait_stream(callback_stream)
+        with torch.cuda.stream(execution_stream):
+            callback(completed)
+
+    return run
+
+
+def _on_bucket_execution_stream_result(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+    callback: Callable[[torch.futures.Future], Tensor],
+) -> Callable[[torch.futures.Future], Tensor]:
+    def run(completed: torch.futures.Future) -> Tensor:
+        if context.buffer.device.type != "cuda":
+            return callback(completed)
+        device = context.buffer.device
+        callback_stream = torch.cuda.current_stream(device)
+        execution_stream = state.execution_stream(device)
+        execution_stream.wait_stream(callback_stream)
+        with torch.cuda.stream(execution_stream):
+            result = callback(completed)
+        callback_stream.wait_stream(execution_stream)
+        return result
+
+    return run
+
+
+def _matrix_entries(
+    context: BucketContext,
+) -> list[tuple[Tensor, GreedyLoreParameterState]]:
+    return [
+        (gradient, parameter_state)
+        for gradient, parameter_state in zip(
+            context.gradients,
+            context.parameter_states,
+        )
+        if parameter_state is not None
+    ]
+
+
+def _stable_matrix_entries(
+    context: BucketContext,
+) -> list[tuple[Tensor, GreedyLoreParameterState]]:
+    return sorted(
+        _matrix_entries(context),
+        key=lambda item: item[1].spec.stable_name,
+    )
+
+
+def _prepare_refresh_buffer(context: BucketContext) -> None:
+    for gradient, parameter_state in _matrix_entries(context):
+        corrected = corrected_gradient(
+            gradient,
+            parameter_state.error,
+            parameter_state.orientation,
+        )
+        gradient.copy_(unorient_matrix(corrected, parameter_state.orientation))
+
+
+def _divide_completed_buffer(state: GreedyLoreDDPState, value: Any) -> Tensor:
+    buffer = _future_tensor(value)
+    if state.world_size > 1:
+        buffer.div_(state.world_size)
+    return buffer
+
+
+def _refresh_local_svd(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+    completed: torch.futures.Future,
+) -> Tensor:
+    _divide_completed_buffer(state, completed.value())
+    for gradient, parameter_state in _matrix_entries(context):
+        global_corrected = orient_matrix(gradient, parameter_state.orientation)
+        basis, _, support = refresh_basis(global_corrected, state.config.rank)
+        parameter_state.basis.copy_(basis)
+        parameter_state.last_support.copy_(support)
+        parameter_state.error.zero_()
+    return context.buffer
+
+
+def _launch_dense_bucket(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+) -> torch.futures.Future:
+    source = _all_reduce_future(state, context.buffer, "greedylore_hook/dense")
+
+    def finish(completed: torch.futures.Future) -> Tensor:
+        _divide_completed_buffer(state, completed.value())
+        return context.buffer
+
+    return source.then(_on_bucket_execution_stream_result(state, context, finish))
+
+
+def _launch_refresh_bucket(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+) -> torch.futures.Future:
+    _prepare_refresh_buffer(context)
+    source = _all_reduce_future(state, context.buffer, "greedylore_hook/dense")
+    if state.config.basis_sync == "local_svd":
+        return source.then(
+            _on_bucket_execution_stream_result(
+                state,
+                context,
+                lambda completed: _refresh_local_svd(state, context, completed),
+            )
+        )
+
+    final = context.completion_future
+
+    def fail(exc: BaseException) -> None:
+        if not final.done():
+            final.set_exception(exc)
+
+    def complete_after_broadcasts(completed: torch.futures.Future) -> None:
+        try:
+            completed.value()
+            if not final.done():
+                final.set_result(context.buffer)
+        except BaseException as exc:
+            fail(exc)
+
+    def after_dense(completed: torch.futures.Future) -> None:
+        try:
+            _divide_completed_buffer(state, completed.value())
+            futures = []
+            for gradient, parameter_state in _stable_matrix_entries(context):
+                if state.global_rank == state.group_ranks[0]:
+                    global_corrected = orient_matrix(
+                        gradient,
+                        parameter_state.orientation,
+                    )
+                    basis, _, _ = refresh_basis(global_corrected, state.config.rank)
+                    parameter_state.basis.copy_(basis)
+                parameter_state.last_support.copy_(
+                    torch.arange(
+                        state.config.rank,
+                        dtype=torch.int64,
+                        device=parameter_state.last_support.device,
+                    )
+                )
+                parameter_state.error.zero_()
+                futures.append(
+                    _broadcast_future(
+                        state,
+                        parameter_state.basis,
+                        "greedylore_hook/basis_broadcast",
+                    )
+                )
+            if futures:
+                torch.futures.collect_all(futures).add_done_callback(
+                    _on_bucket_execution_stream(
+                        state,
+                        context,
+                        complete_after_broadcasts,
+                    )
+                )
+            else:
+                final.set_result(context.buffer)
+        except BaseException as exc:
+            fail(exc)
+
+    source.add_done_callback(_on_bucket_execution_stream(state, context, after_dense))
+    return final
+
+
+def greedy_lore_ddp_hook(
+    state: GreedyLoreDDPState,
+    bucket: dist.GradBucket,
+) -> torch.futures.Future[Tensor]:
+    """Synchronize one DDP bucket through the globally sequenced GreedyLore chain."""
+
+    context = state.note_bucket(bucket)
+    if context.phase is None:
+        return enqueue_bucket_chain(
+            state,
+            context,
+            lambda current: _launch_dense_bucket(state, current),
+        )
+    if is_refresh_step(context.step, state.config):
+        return enqueue_bucket_chain(
+            state,
+            context,
+            lambda current: _launch_refresh_bucket(state, current),
+        )
+    return enqueue_bucket_chain(
+        state,
+        context,
+        lambda _current: _raise_compressed_non_refresh_not_implemented(),
+    )
+
+
+def _raise_compressed_non_refresh_not_implemented() -> torch.futures.Future:
+    raise NotImplementedError(
+        "GreedyLore compressed non-refresh hook path is not implemented yet"
+    )
