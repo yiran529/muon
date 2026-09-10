@@ -1,5 +1,10 @@
 # GreedyLore-Muon DDP Gradient Compression Design
 
+> Revised 2026-09-10 against repository commit `b81849a`. The revision adopts
+> the shared Muon parameter-group builder and compressor-owned step lifecycle
+> added after the original design; it does not expand M002 to ARC's newer
+> all-two-dimensional-parameter compression scope.
+
 ## Goal
 
 Implement the GreedyLore method from arXiv:2507.08784v4 as an optional DDP
@@ -52,6 +57,14 @@ changing resume, three-dimensional matrix batches, AMP GradScaler skip/retry,
 and heterogeneous accelerator stacks are out of scope and must fail early
 where they can otherwise produce silent errors.
 
+Current ARC hook mode classifies every two-dimensional parameter as
+compressible so that it can also support AdamW experiments. M002 intentionally
+does not inherit that later scope expansion: membership in the first parameter
+group returned by `train.build_muon_param_groups()` defines a GreedyLore matrix;
+two-dimensional embedding and output-head parameters remain `dense_aux`. An
+all-two-dimensional GreedyLore variant would be a separate ablation because it
+changes communication volume, SVD cost, optimizer coverage, and method meaning.
+
 ## Per-parameter representation
 
 For an original matrix gradient with shape `m x n`, define:
@@ -103,7 +116,8 @@ class GreedyLoreConfig:
 `seed_scheme_version` must equal `1`; `start_compress_step` is a non-negative
 integer. Each matrix requires `rank <= min(m, n)`.
 
-The lifecycle uses one-based optimizer steps, matching the existing ARC hook:
+The lifecycle uses one-based compressor steps, driven exactly once for each
+successful training-loop update and matching the current ARC hook lifecycle:
 
 ```text
 step <= start_compress_step        -> dense warmup
@@ -114,7 +128,11 @@ otherwise                          -> compressed
 
 Consequently, the first compressed step is always a refresh, independent of
 the absolute training-step number. The committed step and this derived phase
-are validated during resume.
+are validated during resume. Compressor state does not inspect or depend on an
+optimizer-internal step counter: current Muon and AdamW parameter groups do not
+share one portable counter contract. The shared training loop owns the ordering
+`begin_step -> backward/hook -> finish_step -> gradient clipping -> optimizer
+step -> commit_step`.
 
 ## Refresh step
 
@@ -241,10 +259,18 @@ The hook path must not call `Work.wait()`, `torch.cuda.synchronize()`, tensor
 ## Training integration and checkpointing
 
 `train_greedylore.py` mirrors the narrow factory structure of
-`train_arctopk.py`. It constructs the existing Muon parameter groups, creates
-ordinary `Muon`, validates one canonical GreedyLore layout fingerprint,
-registers exactly one communication hook, and returns the existing
-`GradientSyncRuntime` callbacks.
+`train_arctopk.py`. It calls the shared `train.build_muon_param_groups()` helper
+instead of duplicating matrix/embedding/output-head grouping or scalar AdamW
+defaults, creates ordinary `Muon`, validates one canonical GreedyLore layout
+fingerprint, registers exactly one communication hook, and returns the existing
+`GradientSyncRuntime` callbacks. The inherited scalar learning rate, Adam
+betas/epsilon/weight decay, warmup, learning-rate schedule, and gradient-clipping
+options therefore retain dense-training semantics.
+
+If `grad_clip_norm` is enabled, the common loop clips the fully reconstructed
+global gradients after `finish_step()` and before ordinary Muon runs. GreedyLore
+error feedback remains defined on the pre-clipping corrected gradient; the hook
+must not duplicate clipping or feed the post-clipping value back into `error`.
 
 `GradientSyncRuntime` gains an optional `checkpoint_state_name`. The shared
 training loop continues to use `"arc_compressor"` when the field is absent, so
@@ -259,7 +285,9 @@ are stored under the global rank. Replicated bases and last supports are stored
 with validation. JSON metadata incompatibility fails before `dcp.load` mutates
 preallocated tensors. A storage payload that contradicts already validated
 metadata is allowed to fail inside DCP and is not promised to roll back partial
-destination writes.
+destination writes. Checkpoint restore validates the compressor's own committed
+step and deterministic continuation, but does not compare it with private or
+optimizer-specific step counters.
 
 ## Profiling and communication accounting
 
@@ -322,7 +350,7 @@ Correctness requires:
 - gradients, bases, Muon momentum, and parameters agree across ranks within
   their declared numerical tolerances, while supports and collective
   signatures agree exactly;
-- exactly one compressor advance per optimizer step under large gradient
+- exactly one compressor advance per successful training-loop update under large gradient
   accumulation;
 - deterministic DCP continuation across a refresh boundary.
 

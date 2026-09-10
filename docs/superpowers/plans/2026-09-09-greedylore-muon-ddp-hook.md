@@ -2,6 +2,10 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Repository baseline:** Revised 2026-09-10 against commit `b81849a` after
+> ARC all-2D, shared Muon parameter-group, scalar AdamW, scheduler/clipping, and
+> compressor-step lifecycle changes.
+
 **Goal:** Add a paper-faithful GreedyLore low-rank DDP gradient synchronization path that feeds reconstructed gradients into the unchanged Muon optimizer, with deterministic state, checkpointing, and end-to-end profiling.
 
 **Architecture:** Keep dense Muon and ARC-TopK unchanged. Add pure GreedyLore tensor primitives, a dedicated stateful asynchronous DDP bucket hook, and a narrow training entry that constructs ordinary Muon; reuse the existing gradient-sync lifecycle, no-sync accumulation policy, observer, profiler capture, and checkpoint manager contracts. The default basis path performs identical local SVD on homogeneous ranks with deterministic sign canonicalization, while an explicit full-basis broadcast mode remains available for strong-consistency diagnosis.
@@ -15,10 +19,13 @@
 - Compression owns only data-parallel gradient synchronization; do not modify dion/muon.py, Muon momentum, orthogonalization, result communication, or parameter updates.
 - Preserve dion/arc_topk_ddp_hook.py, all ARC behavior, and existing arc_compressor checkpoint names.
 - The first implementation supports DDP, find_unused_parameters=False, a static participating parameter set, fixed world size, and two-dimensional Muon matrix parameters.
+- Define matrix membership from the first group returned by train.build_muon_param_groups(), not from ndim alone. Unlike current ARC all-2D mode, embedding and lm-head parameters remain dense_aux in M002; expanding that scope is a separate ablation.
+- Reuse train.build_muon_param_groups() and inherited scalar optimizer, warmup, learning-rate schedule, and gradient-clipping configuration; do not duplicate their defaults in train_greedylore.py.
 - local_svd is an experimental assumption validated only for a specific homogeneous PyTorch/CUDA/linear-algebra environment; broadcast is the strong-consistency reference.
 - Muon matrix buckets, compression state, low-rank arithmetic, and matrix communication are FP32 in the first implementation; fail at factory construction for a non-FP32 Muon matrix parameter.
 - Reduce signed lambda values before squaring the average; update local error from the untouched local factor before factor All-Reduce.
 - The first compressed step is a refresh: phase = step - start_compress_step - 1, and refresh occurs when phase % update_interval == 0.
+- Compressor committed_step is owned by the begin/finish/commit lifecycle and must not inspect or compare optimizer-internal step counters.
 - Use stable parameter names and IDs for state, seeds, and checkpoints; never persist a bucket index or callback arrival position.
 - Keep one global cross-bucket tail Future in the first version; every rank must launch the same collective sequence.
 - The hook path must not call Work.wait(), torch.cuda.synchronize(), tensor .item(), perform device-to-host copies, or poll completion.
@@ -263,7 +270,7 @@ git commit -m "feat: implement GreedyLore recurrence primitives"
 - Create: tests/test_greedy_lore_ddp_state.py
 
 **Interfaces:**
-- Consumes: GreedyLoreConfig, MatrixOrientation, model parameters, optimizer parameters, and a DDP process group.
+- Consumes: GreedyLoreConfig, MatrixOrientation, model parameters, the frozen optimizer-owned parameter identity set, and a DDP process group. The state does not retain the optimizer or inspect its step counters.
 - Produces:
 
 ~~~python
@@ -352,11 +359,11 @@ Also reject missing/duplicate ownership, matrix rank larger than min(shape), non
 
 - [ ] **Step 5: Write failing lifecycle and bucket-coverage tests**
 
-Require one active step, exact once-only parameter coverage, no next step while the tail is in flight, no commit before finish, no checkpoint inside a step, optimizer/compressor committed-step agreement, and stable identity lookup after simulated bucket reorder.
+Require one active step, exact once-only parameter coverage, no next step while the tail is in flight, no commit before finish, no checkpoint inside a step, compressor-owned committed-step progression, and stable identity lookup after simulated bucket reorder. Add a regression proving construction and checkpointing work with an optimizer whose parameter groups expose no shared step field.
 
 - [ ] **Step 6: Implement state without compression launches**
 
-Initialize a completed CUDA-aware tail Future, preallocate all matrix tensors for DCP, record a bucket-ready CUDA event at callback entry, and retain active contexts until their DDP-facing Futures complete. Implement committed-boundary basis validation by gathering bases in stable-name order, checking supports exactly and bases with the interface tolerances, and rejecting disagreement; this diagnostic is called by correctness gates, never by the timed hook path. Use the same one-based committed-step contract as ARC, but keep all class names and errors GreedyLore-specific.
+Initialize a completed CUDA-aware tail Future, preallocate all matrix tensors for DCP, record a bucket-ready CUDA event at callback entry, and retain active contexts until their DDP-facing Futures complete. Implement committed-boundary basis validation by gathering bases in stable-name order, checking supports exactly and bases with the interface tolerances, and rejecting disagreement; this diagnostic is called by correctness gates, never by the timed hook path. Use the current ARC compressor-owned, one-based begin/finish/commit contract without retaining an optimizer reference, but keep all class names and errors GreedyLore-specific.
 
 - [ ] **Step 7: Run GREEN and commit**
 
@@ -552,8 +559,8 @@ git commit -m "feat: implement compressed GreedyLore DDP synchronization"
 **Files:**
 - Create: train_greedylore.py
 - Create: tests/test_train_greedylore.py
-- Modify: train.py:92
-- Modify: train.py:1100
+- Modify: train.py:104-112
+- Modify: train.py:1187-1192
 - Modify: dion/__init__.py
 - Create: configs/compressed_muon/m002_greedy_lore_muon_ddp.yaml
 - Modify: tests/test_train_arctopk_ddp_hook.py
@@ -588,7 +595,7 @@ class GradientSyncRuntime:
 
 - [ ] **Step 1: Write failing factory-boundary tests**
 
-Assert DDP-only construction, exact ordinary Muon type, exactly one registered GreedyLore hook, matrix roles derived from the Muon parameter group rather than merely ndim, exact dense auxiliary roles, stable names/IDs, and rejection of FSDP, missing DDP, find_unused_parameters=True, unsupported scalar optimizer, and explicit legacy optimizer-owned sync.
+Assert DDP-only construction, exact ordinary Muon type, exactly one registered GreedyLore hook, matrix roles derived from the first group returned by train.build_muon_param_groups() rather than merely ndim, exact dense auxiliary roles (including two-dimensional embedding/lm-head parameters), stable names/IDs, and rejection of FSDP, missing DDP, find_unused_parameters=True, unsupported scalar optimizer, and explicit legacy optimizer-owned sync. Assert independent scalar AdamW settings are preserved in the ordinary Muon parameter groups.
 
 - [ ] **Step 2: Write a failing backward-compatible checkpoint-name test**
 
@@ -607,11 +614,13 @@ Do not rename the ARC checkpoint or require changes in train_arctopk.py.
 
 - [ ] **Step 4: Implement the dedicated factory and exports**
 
-Mirror the existing matrix/embedding/lm-head grouping in train_arctopk.py, construct ordinary Muon, build and validate the GreedyLore layout once, register the hook, and return runtime callbacks with checkpoint_state_name="greedy_lore_compressor". Export only configuration, spec, state, and hook types needed by callers.
+Call train.build_muon_param_groups(model, hp), use its first group's parameter identities to assign matrix roles, construct ordinary Muon from all returned groups, build and validate the GreedyLore layout once, register the hook, and return runtime callbacks with checkpoint_state_name="greedy_lore_compressor". Do not copy train_arctopk.py's current ndim-based all-2D role rule. Export only configuration, spec, state, and hook types needed by callers.
 
 - [ ] **Step 5: Write a real CPU factory/helper integration test**
 
-Construct the real factory on two Gloo CPU ranks and drive forward_backward_micro_step plus the begin/finish/commit lifecycle directly through two accumulation microbatches, matching the existing ARC test boundary. Assert hooks run only on the final microbatch, the first compressed step is refresh, each compressor state advances once per optimizer step, gradients, Muon momentum, and parameters agree within the declared tolerances, supports and collective signatures agree exactly, and ordinary Muon records result communication separately. Do not describe this as executing train.main: that entry requires CUDA/NCCL and is exercised by the Task 10 smoke test.
+Construct the real factory on two Gloo CPU ranks and drive forward_backward_micro_step plus the begin/finish/commit lifecycle directly through two accumulation microbatches, matching the existing ARC test boundary. Assert hooks run only on the final microbatch, the first compressed step is refresh, each compressor state advances once per completed training update without consulting optimizer counters, gradients, Muon momentum, and parameters agree within the declared tolerances, supports and collective signatures agree exactly, and ordinary Muon records result communication separately. Do not describe this as executing train.main: that entry requires CUDA/NCCL and is exercised by the Task 10 smoke test.
+
+Add a focused ordering test for the current common loop contract: finish the hook before compute_and_clip_grad_norm_, then run ordinary Muon, then commit the compressor. With clipping enabled, assert clipping sees reconstructed gradients and the stored GreedyLore error is unchanged by clipping.
 
 - [ ] **Step 6: Add r=a dense equivalence through Muon**
 
@@ -619,7 +628,7 @@ Run refresh and compressed steps for dense Muon and GreedyLore-Muon from identic
 
 - [ ] **Step 7: Add the formal M002 configuration**
 
-Base it on the current GPT-350M ARC/dense profiling geometry, set rank=32, update_interval=200, seed=42, start_compress_step=1000, and basis_sync=local_svd. Keep optimizer, batch, Muon, and model settings explicit.
+Keep this as a method default/smoke configuration rather than an experiment result. Base its model and batching geometry on the current GPT-350M ARC/dense profiling pair, set rank=32, update_interval=200, seed=42, start_compress_step=1000, and basis_sync=local_svd. Keep optimizer, batch, Muon, scalar optimizer settings, warmup/schedule/clipping policy, and model settings explicit. Task 10 must create separately numbered CM configs by pairing GreedyLore with the selected current dense baseline; do not reuse an older run name as new evidence.
 
 - [ ] **Step 8: Run GREEN and commit**
 
@@ -659,7 +668,7 @@ class GreedyLoreDDPState:
 
 - [ ] **Step 1: Write a failing real two-rank DCP round trip**
 
-Run through a refresh and compressed step, create deliberately different local errors, save, destroy every old model/optimizer/hook object, rebuild with a different bucket cap, load into fresh preallocated state, and compare errors, bases, supports, committed step, and optimizer step by stable name.
+Run through a refresh and compressed step, create deliberately different local errors, save, destroy every old model/optimizer/hook object, rebuild with a different bucket cap, load into fresh preallocated state, and compare errors, bases, supports, and compressor committed step by stable name. Verify optimizer state through its public state_dict round trip and subsequent parameter updates, not by assuming a shared optimizer group step field.
 
 - [ ] **Step 2: Continue across the next refresh boundary**
 
@@ -667,7 +676,7 @@ Run fixed gradients through both uninterrupted and restored instances until afte
 
 - [ ] **Step 3: Write metadata and payload incompatibility tests**
 
-The JSON metadata contains the exact stable-name schema for every error, basis, and support tensor. Before dcp.load, reject schema, world size, group ranks, fingerprint, seed scheme, rank, interval, start step, basis mode, parameter name/order/shape/dtype/role, declared tensor schema, or internally inconsistent checkpoint step metadata. Do not compare the saved step with the freshly constructed optimizer's pre-load step zero. After DCP restores optimizer and compressor tensors, require the restored optimizer step to equal compressor committed_step. Saving or loading with an active step or unfinished tail also fails before DCP mutation. Separately corrupt a real DCP payload and assert DCP reports failure; do not claim rollback or untouched destination tensors for corruption that contradicts already validated JSON metadata.
+The JSON metadata contains the exact stable-name schema for every error, basis, and support tensor. Before dcp.load, reject schema, world size, group ranks, fingerprint, seed scheme, rank, interval, start step, basis mode, parameter name/order/shape/dtype/role, declared tensor schema, or an invalid compressor committed step. Do not inspect or compare optimizer-internal step counters before or after DCP: the current shared lifecycle deliberately decouples compressor progress from optimizer-specific state layouts. Instead require the restored compressor committed step to equal the saved compressor metadata, then prove alignment by deterministic continuation through the next refresh and matching optimizer public state/parameters. Saving or loading with an active step or unfinished tail also fails before DCP mutation. Separately corrupt a real DCP payload and assert DCP reports failure; do not claim rollback or untouched destination tensors for corruption that contradicts already validated JSON metadata.
 
 - [ ] **Step 4: Implement metadata and stable-name tensor state**
 
@@ -789,7 +798,7 @@ Record the exact pass/skip counts in the M002 worklog. A skip in a GreedyLore or
 
 - [ ] **Step 3: Run the multi-GPU correctness gate**
 
-On at least two exclusive idle GPUs, run the NCCL stress test and execute the real train.main entry in a tiny training smoke for dense Muon, local-SVD GreedyLore, and broadcast GreedyLore. Immediately after a local-SVD refresh in the preflight, call validate_replicated_basis_across_ranks() outside the timed path. Require basis agreement at atol=1e-6 and rtol=1e-5, exact support equality, reconstructed-gradient agreement at atol=1e-5 and rtol=1e-4, exact collective-signature equality, and Muon momentum/parameter agreement at the dtype-appropriate tolerance. A mismatch blocks local-SVD performance claims and makes broadcast mode the correctness baseline; passing validates only the recorded homogeneous environment.
+On at least two exclusive idle GPUs, run the NCCL stress test and execute the real train.main entry in a tiny training smoke for dense Muon, local-SVD GreedyLore, and broadcast GreedyLore. Cover both unclipped execution and one grad_clip_norm-enabled case; the latter must preserve finish-hook -> clip reconstructed gradient -> Muon step -> compressor commit ordering. Immediately after a local-SVD refresh in the preflight, call validate_replicated_basis_across_ranks() outside the timed path. Require basis agreement at atol=1e-6 and rtol=1e-5, exact support equality, reconstructed-gradient agreement at atol=1e-5 and rtol=1e-4, exact collective-signature equality, and Muon momentum/parameter agreement at the dtype-appropriate tolerance. A mismatch blocks local-SVD performance claims and makes broadcast mode the correctness baseline; passing validates only the recorded homogeneous environment.
 
 - [ ] **Step 4: Profile refresh and compressed critical paths**
 
