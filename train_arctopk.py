@@ -20,7 +20,6 @@ from dion.arc_topk_layout import (
     validate_arc_fingerprint_across_ranks,
 )
 from dion.arc_topk_sync import ArcTopKSyncConfig
-from dion.opt_utils import lm_head_lr_scale
 
 
 ArcSyncMode = Literal["optimizer", "ddp_hook"]
@@ -166,36 +165,13 @@ def init_arc_topk_optimizer(
     if ddp_model is None:
         raise ValueError("ARC-TopK-EF21M-Muon requires a DDP model")
     validate_arc_topk_hyperparameters(hp)
-    if hp.scalar_opt not in ("adamw", "lion"):
-        raise ValueError(f"Unrecognized scalar optimizer: {hp.scalar_opt}")
     if getattr(cli_args, "_explicit_replicate_mesh_grad_sync", False):
         raise ValueError(
             "replicate_mesh_grad_sync is no longer accepted by train_arctopk.py; "
             "select --arc_sync_mode optimizer or ddp_hook"
         )
 
-    matrix_params = list(model.transformer.h.parameters())
-    embedding_params = list(model.transformer.wte.parameters())
-    lm_head_params = list(model.lm_head.parameters())
-    lm_head_lr = hp.lr * lm_head_lr_scale(hp.scalar_opt, hp.model_dim)
-
-    param_groups = [
-        dict(params=matrix_params),
-        dict(
-            params=embedding_params,
-            algorithm=hp.scalar_opt,
-            lr=hp.lr,
-            betas=(0.95, 0.98),
-            weight_decay=0,
-        ),
-        dict(
-            params=lm_head_params,
-            algorithm=hp.scalar_opt,
-            lr=lm_head_lr,
-            betas=(0.95, 0.98),
-            weight_decay=0,
-        ),
-    ]
+    param_groups = train.build_muon_param_groups(model, hp)
 
     train.print0(f"ARC-TopK ratio: {hp.arc_topk_ratio}")
     train.print0(f"ARC projection rank: {hp.arc_projection_rank}")

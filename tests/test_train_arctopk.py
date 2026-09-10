@@ -181,7 +181,16 @@ def test_arctopk_optimizer_builds_matrix_and_scalar_groups():
     module = _import_train_arctopk()
     from dion import ArcTopKMuon
 
-    hp = module.ArcTopKHyperparameters(scalar_opt="adamw")
+    hp = module.ArcTopKHyperparameters(
+        scalar_opt="adamw",
+        lr=0.02,
+        weight_decay=0.01,
+        scalar_lr=0.001,
+        scalar_adam_beta1=0.9,
+        scalar_adam_beta2=0.999,
+        scalar_adam_eps=1e-8,
+        scalar_weight_decay=0.0,
+    )
     cli_args = argparse.Namespace(
         use_gram_newton_schulz=False,
         no_triton=True,
@@ -206,6 +215,15 @@ def test_arctopk_optimizer_builds_matrix_and_scalar_groups():
         "adamw",
         "adamw",
     ]
+    assert float(opt.param_groups[0]["lr"]) == pytest.approx(0.02)
+    assert opt.param_groups[0]["weight_decay"] == pytest.approx(0.01)
+    for group in opt.param_groups[1:]:
+        assert float(group["lr"]) == pytest.approx(0.001)
+        assert group["beta1"] == pytest.approx(0.9)
+        assert group["beta2"] == pytest.approx(0.999)
+        assert group["epsilon"] == pytest.approx(1e-8)
+        assert group["weight_decay"] == pytest.approx(0.0)
+        assert "betas" not in group
     assert opt.param_groups[0]["arc_topk_ratio"] == hp.arc_topk_ratio
     assert opt.param_groups[0]["arc_projection_rank"] == hp.arc_projection_rank
     assert opt.param_groups[0]["arc_eta"] == hp.arc_eta

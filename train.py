@@ -80,6 +80,11 @@ class Hyperparameters:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
+    scalar_lr: Optional[float] = None
+    scalar_adam_beta1: Optional[float] = None
+    scalar_adam_beta2: Optional[float] = None
+    scalar_adam_eps: Optional[float] = None
+    scalar_weight_decay: float = 0.0
     grad_clip_norm: Optional[float] = None
     ortho_fraction: float = 0.25
 
@@ -296,6 +301,11 @@ def parse_cli_args(configure_parser=None):
     parser.add_argument("--adam_beta1", type=float, default=None)
     parser.add_argument("--adam_beta2", type=float, default=None)
     parser.add_argument("--adam_eps", type=float, default=None)
+    parser.add_argument("--scalar_lr", type=float, default=None)
+    parser.add_argument("--scalar_adam_beta1", type=float, default=None)
+    parser.add_argument("--scalar_adam_beta2", type=float, default=None)
+    parser.add_argument("--scalar_adam_eps", type=float, default=None)
+    parser.add_argument("--scalar_weight_decay", type=float, default=None)
     parser.add_argument("--grad_clip_norm", type=float, default=None)
     parser.add_argument(
         "--time_optimizer", action="store_true",
@@ -522,6 +532,48 @@ def build_adamw_optimizer(
     )
 
 
+def build_muon_param_groups(model: GPT, hp: Hyperparameters) -> list[dict]:
+    """Build Muon's matrix group and independently configured scalar groups."""
+
+    if hp.scalar_opt not in ("adamw", "lion"):
+        raise ValueError(f"Unrecognized scalar optimizer: {hp.scalar_opt}")
+
+    scalar_lr = hp.lr if hp.scalar_lr is None else hp.scalar_lr
+    scalar_beta1 = 0.9 if hp.scalar_adam_beta1 is None else hp.scalar_adam_beta1
+    scalar_beta2 = 0.95 if hp.scalar_adam_beta2 is None else hp.scalar_adam_beta2
+    scalar_epsilon = 1e-8 if hp.scalar_adam_eps is None else hp.scalar_adam_eps
+
+    if not math.isfinite(scalar_lr) or scalar_lr <= 0:
+        raise ValueError("scalar_lr must be finite and positive")
+    for name, value in (
+        ("scalar_adam_beta1", scalar_beta1),
+        ("scalar_adam_beta2", scalar_beta2),
+    ):
+        if not math.isfinite(value) or not 0 <= value < 1:
+            raise ValueError(f"{name} must be finite and in [0, 1)")
+    if not math.isfinite(scalar_epsilon) or scalar_epsilon <= 0:
+        raise ValueError("scalar_adam_eps must be finite and positive")
+    if not math.isfinite(hp.scalar_weight_decay) or hp.scalar_weight_decay < 0:
+        raise ValueError("scalar_weight_decay must be finite and non-negative")
+
+    scalar_settings = dict(
+        algorithm=hp.scalar_opt,
+        beta1=scalar_beta1,
+        beta2=scalar_beta2,
+        epsilon=scalar_epsilon,
+        weight_decay=hp.scalar_weight_decay,
+    )
+    matrix_params = list(model.transformer.h.parameters())
+    embedding_params = list(model.transformer.wte.parameters())
+    lm_head_params = list(model.lm_head.parameters())
+    lm_head_lr = scalar_lr * lm_head_lr_scale(hp.scalar_opt, hp.model_dim)
+    return [
+        dict(params=matrix_params),
+        dict(params=embedding_params, lr=scalar_lr, **scalar_settings),
+        dict(params=lm_head_params, lr=lm_head_lr, **scalar_settings),
+    ]
+
+
 def init_optimizer(
     model: GPT,
     device_mesh: Optional[DeviceMesh],
@@ -529,38 +581,7 @@ def init_optimizer(
     hp: Hyperparameters,
     cli_args: argparse.Namespace,
 ):
-    # Check that we have a valid scalar optimizer
-    if hp.scalar_opt not in ["adamw", "lion"]:
-        raise ValueError(f"Unrecognized scalar optimizer: {hp.scalar_opt}")
-
-    # Separate the model's parameters based on their types
-    matrix_params = list(model.transformer.h.parameters())
-    embedding_params = list(model.transformer.wte.parameters())
-    lm_head_params = list(model.lm_head.parameters())
-
-    # Matrix params use optimizer default settings
-    param_groups = [dict(params=matrix_params)]
-
-    # Add additional param groups with the necessary configurations for scalar params
-    param_groups.append(
-        dict(
-            params=embedding_params,
-            algorithm=hp.scalar_opt,
-            lr=hp.lr,  # no LR adjustment for embedding parameters
-            betas=(0.95, 0.98),
-            weight_decay=0,  # no weight decay for embedding parameters
-        )
-    )
-    lm_head_lr = hp.lr * lm_head_lr_scale(hp.scalar_opt, hp.model_dim)
-    param_groups.append(
-        dict(
-            params=lm_head_params,
-            algorithm=hp.scalar_opt,
-            lr=lm_head_lr,
-            betas=(0.95, 0.98),
-            weight_decay=0,  # no weight decay for lm_head parameters
-        )
-    )
+    param_groups = build_muon_param_groups(model, hp)
 
     # Create the main optimizer
     if device_mesh is not None:
