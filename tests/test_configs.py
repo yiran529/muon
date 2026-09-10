@@ -119,3 +119,38 @@ def test_config_values_survive_the_merge(config_path):
             assert (
                 getattr(hp, key) == value
             ), f"{config_path.name}: {key} did not survive the merge"
+
+
+def test_m002_greedylore_config_is_recognized_by_dedicated_entry():
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    import train
+    import train_greedylore
+
+    config_path = CONFIG_DIR / "compressed_muon" / "m002_greedy_lore_muon_ddp.yaml"
+    with patch.object(sys, "argv", ["train_greedylore.py", "--config", str(config_path)]):
+        cli_args = train.parse_cli_args(
+            configure_parser=train_greedylore.configure_greedy_lore_parser
+        )
+    hp = train.override_args_from_cli(
+        train_greedylore.GreedyLoreHyperparameters(),
+        cli_args,
+    )
+
+    assert hp.optimizer == "greedy_lore_muon"
+    assert hp.model_dim == 1024
+    assert hp.n_layer == 20
+    assert hp.n_head == 16
+    assert hp.sequence_length == 1024
+    assert hp.batch_size == 1024
+    assert hp.device_batch_size == 1
+    assert hp.num_iterations == 120
+    assert hp.timing_warmup_steps == 20
+    assert hp.lr_schedule == "linear"
+    assert hp.grad_clip_norm is None
+    assert hp.scalar_opt == "adamw"
+    assert hp.greedy_lore_rank == 32
+    assert hp.greedy_lore_update_interval == 200
+    assert hp.greedy_lore_seed == 42
+    assert hp.greedy_lore_start_compress_step == 1000
+    assert hp.greedy_lore_basis_sync == "local_svd"

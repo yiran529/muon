@@ -1,0 +1,191 @@
+"""Dedicated DDP training entry point for GreedyLore gradient sync with Muon."""
+
+import argparse
+
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+import torch
+import torch.distributed as dist
+
+from torch.distributed.device_mesh import DeviceMesh
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+import train
+from dion import GreedyLoreConfig, GreedyLoreDDPParameterSpec, GreedyLoreDDPState, Muon
+from dion.greedy_lore_ddp_hook import greedy_lore_ddp_hook
+from dion.greedy_lore_layout import (
+    GreedyLoreParameterDescriptor,
+    canonical_greedy_lore_fingerprint,
+    validate_greedy_lore_fingerprint_across_ranks,
+)
+
+
+@dataclass
+class GreedyLoreHyperparameters(train.Hyperparameters):
+    optimizer: str = "greedy_lore_muon"
+    greedy_lore_rank: int = 32
+    greedy_lore_update_interval: int = 200
+    greedy_lore_seed: int = 42
+    greedy_lore_start_compress_step: int = 1000
+    greedy_lore_basis_sync: Literal["local_svd", "broadcast"] = "local_svd"
+
+
+def configure_greedy_lore_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--greedy_lore_rank", type=int, default=None)
+    parser.add_argument("--greedy_lore_update_interval", type=int, default=None)
+    parser.add_argument("--greedy_lore_seed", type=int, default=None)
+    parser.add_argument("--greedy_lore_start_compress_step", type=int, default=None)
+    parser.add_argument(
+        "--greedy_lore_basis_sync",
+        choices=("local_svd", "broadcast"),
+        default=None,
+    )
+
+
+def validate_greedy_lore_hyperparameters(hp: GreedyLoreHyperparameters) -> None:
+    if hp.optimizer != "greedy_lore_muon":
+        raise ValueError(f"Unsupported GreedyLore optimizer: {hp.optimizer}")
+    GreedyLoreConfig(
+        rank=hp.greedy_lore_rank,
+        update_interval=hp.greedy_lore_update_interval,
+        seed=hp.greedy_lore_seed,
+        start_compress_step=hp.greedy_lore_start_compress_step,
+        basis_sync=hp.greedy_lore_basis_sync,
+    )
+
+
+def _install_greedy_lore_ddp_hook(
+    model,
+    ddp_model: DDP,
+    optimizer: torch.optim.Optimizer,
+    hp: GreedyLoreHyperparameters,
+    matrix_parameters: set[int],
+) -> train.GradientSyncRuntime:
+    config = GreedyLoreConfig(
+        rank=hp.greedy_lore_rank,
+        update_interval=hp.greedy_lore_update_interval,
+        seed=hp.greedy_lore_seed,
+        start_compress_step=hp.greedy_lore_start_compress_step,
+        basis_sync=hp.greedy_lore_basis_sync,
+    )
+    specs = tuple(
+        GreedyLoreDDPParameterSpec(
+            parameter=parameter,
+            stable_name=name,
+            stable_id=stable_id,
+            role="matrix" if id(parameter) in matrix_parameters else "dense_aux",
+        )
+        for stable_id, (name, parameter) in enumerate(model.named_parameters())
+    )
+    group_ranks = (
+        tuple(dist.get_process_group_ranks(ddp_model.process_group))
+        if ddp_model.process_group is not None
+        else (0,)
+    )
+    fingerprint = canonical_greedy_lore_fingerprint(
+        config=config,
+        group_ranks=group_ranks,
+        parameters=tuple(
+            GreedyLoreParameterDescriptor(
+                stable_name=spec.stable_name,
+                stable_id=spec.stable_id,
+                shape=tuple(spec.parameter.shape),
+                dtype=str(spec.parameter.dtype).removeprefix("torch."),
+                role=spec.role,
+            )
+            for spec in specs
+        ),
+    )
+    if ddp_model.process_group is not None:
+        validate_greedy_lore_fingerprint_across_ranks(
+            fingerprint,
+            ddp_model.process_group,
+        )
+    state = GreedyLoreDDPState(
+        process_group=ddp_model.process_group,
+        fingerprint=fingerprint,
+        parameter_specs=specs,
+        optimizer_parameters=[
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        ],
+        config=config,
+        find_unused_parameters=getattr(
+            ddp_model,
+            "find_unused_parameters",
+            False,
+        ),
+    )
+    ddp_model.register_comm_hook(state, greedy_lore_ddp_hook)
+    return train.GradientSyncRuntime(
+        optimizer_owns_gradient_sync=False,
+        begin_step=state.begin_step,
+        finish_step=state.finish_step,
+        commit_step=state.commit_step,
+        checkpoint_state=state,
+        checkpoint_state_name="greedy_lore_compressor",
+    )
+
+
+def init_greedy_lore_optimizer(
+    model,
+    device_mesh: Optional[DeviceMesh],
+    ddp_model: Optional[DDP],
+    hp: GreedyLoreHyperparameters,
+    cli_args: argparse.Namespace,
+) -> tuple[torch.optim.Optimizer, train.GradientSyncRuntime]:
+    if device_mesh is not None:
+        raise ValueError("GreedyLore-Muon first version is DDP only")
+    if ddp_model is None:
+        raise ValueError("GreedyLore-Muon requires a DDP model")
+    validate_greedy_lore_hyperparameters(hp)
+    if getattr(cli_args, "_explicit_replicate_mesh_grad_sync", False):
+        raise ValueError(
+            "replicate_mesh_grad_sync is not accepted by train_greedylore.py; "
+            "GreedyLore sync is owned by the DDP hook"
+        )
+
+    param_groups = train.build_muon_param_groups(model, hp)
+    matrix_parameters = {id(parameter) for parameter in param_groups[0]["params"]}
+
+    train.print0(f"GreedyLore rank: {hp.greedy_lore_rank}")
+    train.print0(f"GreedyLore update interval: {hp.greedy_lore_update_interval}")
+    train.print0(
+        f"GreedyLore compression starts after step: "
+        f"{hp.greedy_lore_start_compress_step}"
+    )
+    train.print0(f"GreedyLore basis sync: {hp.greedy_lore_basis_sync}")
+    train.print0(f"Muon LR adjust method: {hp.adjust_lr}")
+    train.print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+
+    optimizer = Muon(
+        param_groups,
+        distributed_mesh=ddp_model.process_group,
+        lr=hp.lr,
+        mu=hp.mu,
+        weight_decay=hp.weight_decay,
+        nesterov=True,
+        adjust_lr=hp.adjust_lr,
+        use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
+        use_triton=not cli_args.no_triton,
+        use_polar_express=cli_args.use_polar_express,
+    )
+    runtime = _install_greedy_lore_ddp_hook(
+        model,
+        ddp_model,
+        optimizer,
+        hp,
+        matrix_parameters,
+    )
+    return optimizer, runtime
+
+
+if __name__ == "__main__":
+    train.main(
+        hyperparameters_factory=GreedyLoreHyperparameters,
+        optimizer_factory=init_greedy_lore_optimizer,
+        configure_parser=configure_greedy_lore_parser,
+        validate_hyperparameters=validate_greedy_lore_hyperparameters,
+    )

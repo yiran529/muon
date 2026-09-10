@@ -104,6 +104,8 @@ def test_adamw_optimizer_side_mode_is_rejected():
 
 
 def test_hook_mode_builds_ordinary_muon_and_registers_exactly_one_hook():
+    import train
+
     module = _module()
     from dion import ArcTopKDDPState, Muon
 
@@ -127,6 +129,10 @@ def test_hook_mode_builds_ordinary_muon_and_registers_exactly_one_hook():
     assert runtime.finish_step == state.finish_step
     assert runtime.commit_step == state.commit_step
     assert runtime.checkpoint_state is state
+    assert runtime.checkpoint_state_name is None
+    assert train.extra_stateful_from_gradient_sync_runtime(runtime) == {
+        "arc_compressor": state
+    }
     assert [spec.stable_name for spec in state.parameter_specs] == [
         name for name, _parameter in model.named_parameters()
     ]

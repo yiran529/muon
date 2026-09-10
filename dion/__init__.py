@@ -6,6 +6,8 @@ from .muon import Muon
 from .muon_arctopk import ArcTopKMuon
 from .adamw_arctopk import ArcTopKAdamW
 from .arc_topk_ddp_hook import ArcTopKDDPParameterSpec, ArcTopKDDPState
+from .greedy_lore import GreedyLoreConfig
+from .greedy_lore_ddp_hook import GreedyLoreDDPParameterSpec, GreedyLoreDDPState
 from .muon_reference import Muon as MuonReference
 from .dion2 import Dion2
 from .normuon import NorMuon

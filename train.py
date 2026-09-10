@@ -109,6 +109,7 @@ class GradientSyncRuntime:
     finish_step: Optional[Callable[[], Any]] = None
     commit_step: Optional[Callable[[], Any]] = None
     checkpoint_state: Any = None
+    checkpoint_state_name: Optional[str] = None
 
 
 def normalize_gradient_sync_runtime(
@@ -127,6 +128,15 @@ def normalize_gradient_sync_runtime(
     return factory_result, GradientSyncRuntime(
         optimizer_owns_gradient_sync=optimizer_owns_gradient_sync
     )
+
+
+def extra_stateful_from_gradient_sync_runtime(
+    gradient_sync_runtime: GradientSyncRuntime,
+) -> Optional[Mapping[str, Any]]:
+    if gradient_sync_runtime.checkpoint_state is None:
+        return None
+    name = gradient_sync_runtime.checkpoint_state_name or "arc_compressor"
+    return {name: gradient_sync_runtime.checkpoint_state}
 
 
 # Helper function to only print on global rank 0
@@ -1185,10 +1195,8 @@ def main(
         train_loader=train_loader,
         val_loader=val_loader,
         wandb_id=None,
-        extra_stateful=(
-            {"arc_compressor": gradient_sync_runtime.checkpoint_state}
-            if gradient_sync_runtime.checkpoint_state is not None
-            else None
+        extra_stateful=extra_stateful_from_gradient_sync_runtime(
+            gradient_sync_runtime
         ),
     )
 
