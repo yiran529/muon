@@ -5,6 +5,63 @@
 > added after the original design; it does not expand M002 to ARC's newer
 > all-two-dimensional-parameter compression scope.
 
+## Source hierarchy and local reference snapshot
+
+Algorithm semantics are resolved in this order:
+
+1. arXiv:2507.08784v4, especially Algorithms 2-3 and equations (21)-(25);
+2. dimensionally valid equations and prose in Appendix D;
+3. the read-only local author-code snapshot at `~/greedy_lore`;
+4. Dion's distributed-safety and integration requirements.
+
+The local snapshot has no `.git` directory, so it cannot be identified by an
+upstream commit. The files inspected on 2026-09-10 are pinned here by SHA-256:
+
+```text
+comm_hooks/lore_hook.py
+  3f4b9fdb0a46537c46cf6d62fd6ca168c7489a11041fc6d8c61aab226cc57b85
+comm_hooks/subspace_hook.py
+  beb7c30037904928c1eedfdf92342938ec62b4ef6f6469f6f1ddbadd50783545
+comm_hooks/fake_subspace_hook.py
+  094fe77718247d93da2b9f023a87848a2b0d572bae31b3d192f1589fd555d2be
+comm_hooks/utils.py
+  501861b91065d6e551f50a578f3dc33368a5091a1ea619158423f14aeb863d35
+run_c4_llama60m_lore_fp32.slurm
+  ec344141e2c08c28978e923e8d498ad38ee2a6820e496b3ef5fc67764165fced
+run_c4_llama60m_lore_bf16.slurm
+  9691a53244b94fb2106a4e51e655765eaa6935234f3d30f41118eb93964a4de1
+```
+
+The snapshot is useful for the left/right SVD orientation, same-shape
+batching, transformer-only compression, warmup/refresh cadence, factor
+packing, and reconstruction structure. It is not a production dependency and
+is not imported by Dion tests or runtime code. `lore_hook.py` implements a
+periodically refreshed fixed top-r SVD projector; the code closest to Algorithm
+2's greedy selection is in `subspace_hook.py` and its executable simulation in
+`fake_subspace_hook.py`.
+
+Several snapshot details are deliberately not copied:
+
+- `subspace_hook.py` leaves the non-random `get_subspace_norm()` implementation
+  as `pass`, while `fake_subspace_hook.py` simulates communication with a full
+  gradient All-Reduce;
+- state is keyed by DDP bucket index and iteration advances via
+  `bucket.is_last()`, which is unsafe across bucket rebuild/reorder;
+- Future callbacks call `.wait()`, `torch.cuda.synchronize()`, and diagnostic
+  `.item()` operations;
+- the executable approximate-score path uses `torch.rand` followed by `abs`,
+  whereas Algorithm 2 specifies independent standard-normal vectors and
+  elementwise square after signed global averaging;
+- `lore_hook.py` clears the EF14 residual before reducing the raw gradient;
+  `subspace_hook.py` can retain it but still does not add it to the refresh
+  input. Algorithm 3 instead first defines the corrected local gradient as
+  `gradient + previous_error`, passes it to Semi-Lazy-SVD, and only then resets
+  the new error to zero;
+- its `min_compression_rate` gate accounts for the factor payload `b*r` but not
+  the score vector `a` or amortized refresh payload. M002 reports complete
+  payload accounting and does not silently change the paper-defined target
+  parameter set using this legacy heuristic.
+
 ## Goal
 
 Implement the GreedyLore method from arXiv:2507.08784v4 as an optional DDP
@@ -214,6 +271,12 @@ Algorithm correctness depends on these orderings:
 The `P R^T` expression printed in Algorithm 3 is dimensionally inconsistent;
 the implementation follows equations (9)-(10) and uses `P @ R`.
 
+For regression comparison with the local snapshot, the normalized `a x b`
+orientation is algebraically equivalent to its explicit two-branch form:
+choose columns of `U` and left-multiply when the original row count is smaller,
+or choose rows of `Vh` and right-multiply otherwise. Tests encode these
+equations locally; they do not import from `~/greedy_lore`.
+
 ## Bucket and collective protocol
 
 Runtime state is keyed by parameter identity; persistence and seeds use stable
@@ -353,6 +416,10 @@ Correctness requires:
 - exactly one compressor advance per successful training-loop update under large gradient
   accumulation;
 - deterministic DCP continuation across a refresh boundary.
+- self-contained parity tests for the local snapshot's dimensionally valid
+  orientation, factor, reconstruction, and refresh-cadence equations, plus a
+  deliberate-divergence test proving nonzero old error participates in a
+  paper-faithful refresh.
 
 Performance acceptance requires reporting refresh and compressed traces,
 full-period wall-clock, peak allocated memory, score/SVD/factor/reconstruction

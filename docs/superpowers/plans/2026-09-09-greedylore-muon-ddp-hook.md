@@ -6,6 +6,10 @@
 > ARC all-2D, shared Muon parameter-group, scalar AdamW, scheduler/clipping, and
 > compressor-step lifecycle changes.
 
+> **Author-code reference:** Read-only snapshot at `~/greedy_lore`, which has
+> no Git metadata. Use the SHA-256-pinned files and source hierarchy in the spec;
+> never add this external directory as a runtime or test dependency.
+
 **Goal:** Add a paper-faithful GreedyLore low-rank DDP gradient synchronization path that feeds reconstructed gradients into the unchanged Muon optimizer, with deterministic state, checkpointing, and end-to-end profiling.
 
 **Architecture:** Keep dense Muon and ARC-TopK unchanged. Add pure GreedyLore tensor primitives, a dedicated stateful asynchronous DDP bucket hook, and a narrow training entry that constructs ordinary Muon; reuse the existing gradient-sync lifecycle, no-sync accumulation policy, observer, profiler capture, and checkpoint manager contracts. The default basis path performs identical local SVD on homogeneous ranks with deterministic sign canonicalization, while an explicit full-basis broadcast mode remains available for strong-consistency diagnosis.
@@ -17,6 +21,7 @@
 ## Global Constraints
 
 - Compression owns only data-parallel gradient synchronization; do not modify dion/muon.py, Muon momentum, orthogonalization, result communication, or parameter updates.
+- Treat paper Algorithms 2-3 as authoritative for recurrence and score semantics. Use `~/greedy_lore` only to cross-check dimensionally valid orientation, batching, packing, and reconstruction patterns; do not copy its bucket-index state, blocking waits/synchronization, full-gradient fake communication, incomplete score helper, or raw-gradient refresh discrepancy.
 - Preserve dion/arc_topk_ddp_hook.py, all ARC behavior, and existing arc_compressor checkpoint names.
 - The first implementation supports DDP, find_unused_parameters=False, a static participating parameter set, fixed world size, and two-dimensional Muon matrix parameters.
 - Define matrix membership from the first group returned by train.build_muon_param_groups(), not from ndim alone. Unlike current ARC all-2D mode, embedding and lm-head parameters remain dense_aux in M002; expanding that scope is a separate ablation.
@@ -38,6 +43,8 @@
 **Files:**
 - Create: dion/greedy_lore.py
 - Create: tests/test_greedy_lore.py
+- Reference (read-only): ~/greedy_lore/comm_hooks/subspace_hook.py:105-178
+- Reference (read-only): ~/greedy_lore/comm_hooks/fake_subspace_hook.py:108-168
 
 **Interfaces:**
 - Consumes: torch.Tensor, a stable parameter ID, and the configuration values from the spec.
@@ -132,6 +139,12 @@ def test_orientation_round_trip(shape, expected, transposed):
 
 Also require matrix_orientation((2, 3, 4)) to raise ValueError mentioning two-dimensional input.
 
+Add self-contained parity cases for both branches used by the author snapshot:
+for rows < columns, compare normalized-orientation projection with selecting
+columns from `U`; for rows >= columns, compare it with selecting rows from `Vh`
+and right-multiplying. Copy only the small equations and literal tensors into
+the test—never import the external snapshot.
+
 - [ ] **Step 5: Implement orientation with view operations only**
 
 Use tensor.mT for both directions when transposed=True; do not allocate a persistent transposed copy.
@@ -178,6 +191,8 @@ git commit -m "feat: add GreedyLore tensor foundations"
 - Modify: dion/greedy_lore.py
 - Modify: tests/test_greedy_lore.py
 - Create: tests/test_greedy_lore_oracle.py
+- Reference (read-only): ~/greedy_lore/comm_hooks/fake_subspace_hook.py:235-359
+- Reference (read-only): ~/greedy_lore/comm_hooks/lore_hook.py:190-430
 
 **Interfaces:**
 - Consumes: the Task 1 orientation, seed, and basis helpers.
@@ -212,6 +227,14 @@ expected = projector @ global_r
 
 Include a case where rank lambdas have opposite signs so mean(lambda.square()) chooses a different column from mean(lambda).square().
 
+Add two source-cross-check cases. First, show that ranking
+`abs(mean(signed_lambda))` from the snapshot's `sigma_type=1` branch agrees
+with ranking `mean(signed_lambda).square()` when there are no ties, while the
+implementation retains the paper's square and stable tie rule. Second, start a
+refresh with nonzero old error and prove the oracle reduces `gradient + error`
+before resetting error, explicitly guarding against the snapshot's raw-gradient
+EF14 refresh behavior.
+
 - [ ] **Step 2: Run the oracle and verify RED**
 
 ~~~bash
@@ -244,6 +267,11 @@ reconstructed = projector @ averaged_factor
 ~~~
 
 Return a fresh local factor; collective code later reduces a distinct packing buffer.
+
+The author snapshot's approximate branch uses uniform random values, but the
+paper requires independent standard-normal vectors. Keep `torch.randn` from
+Task 1; add a test that would fail if the implementation switches to a
+nonnegative-only distribution.
 
 - [ ] **Step 5: Add boundary tests**
 
@@ -440,6 +468,8 @@ git commit -m "feat: sequence GreedyLore DDP bucket futures"
 - Modify: dion/greedy_lore_ddp_hook.py
 - Create: tests/test_greedy_lore_ddp_hook.py
 - Create: tests/test_greedy_lore_ddp_hook_distributed.py
+- Reference (read-only): ~/greedy_lore/comm_hooks/lore_hook.py:190-285
+- Reference (read-only): ~/greedy_lore/comm_hooks/subspace_hook.py:197-285
 
 **Interfaces:**
 - Consumes: Tasks 1-4 state, recurrence primitives, and Future sequencer.
@@ -466,6 +496,9 @@ Use the FP32 bucket buffer directly for matrix and same-bucket auxiliary slices.
 - [ ] **Step 4: Write failing local-SVD refresh tests**
 
 Use two ranks with a nonzero old error. Assert the refresh input is gradient + old_error, output is its exact global average, error resets to zero, the complete canonicalized basis and first-rank support are stored, no factor All-Reduce occurs, and no basis broadcast occurs in local_svd mode.
+
+This test is also the explicit paper-versus-snapshot guard: the expected output
+must differ from an All-Reduce of the raw gradient alone.
 
 Add zero, repeated, and near-repeated singular-value matrices. Compare basis, support, and reconstructed output separately across ranks. Also manually rotate a repeated-singular-value basis on one rank and require validate_replicated_basis_across_ranks() to reject it. Passing these tests validates only the named homogeneous environment; it does not turn local_svd into a general consistency guarantee.
 
@@ -498,6 +531,8 @@ git commit -m "feat: add GreedyLore dense and refresh hook paths"
 - Modify: tests/test_greedy_lore_ddp_hook.py
 - Modify: tests/test_greedy_lore_ddp_hook_distributed.py
 - Modify: tests/test_greedy_lore_ddp_hook_nccl.py
+- Reference (read-only): ~/greedy_lore/comm_hooks/subspace_hook.py:287-439
+- Reference (read-only): ~/greedy_lore/comm_hooks/fake_subspace_hook.py:266-359
 
 **Interfaces:**
 - Consumes: approximate_signed_lambda, select_projector, compress_local, and reconstruct_global from Task 2.
@@ -514,6 +549,11 @@ Construct lambdas whose signs cancel across ranks and prove support is selected 
 - [ ] **Step 3: Implement score packing and the first All-Reduce**
 
 Group matrix views by compressed shape for batched local math, derive seeds from stable parameter IDs and the exact phase stored in BucketContext, and generate random vectors through local generators. Because every mixed matrix bucket is FP32, pack its signed lambda vectors and FP32 dense auxiliary values into the same first reduction in stable parameter order. A dense-only bucket of another dtype takes its single exact dense reduction and stops.
+
+Use the snapshot only as a layout cross-check for same-shape batching and
+contiguous factor storage. Unlike the snapshot, never key persistent buffers by
+bucket index, never derive seeds with global RNG plus `.item()`, and include the
+score vector in logical-byte/profitability reporting.
 
 - [ ] **Step 4: Implement deterministic support and local error update**
 
@@ -762,6 +802,8 @@ git commit -m "perf: profile GreedyLore Muon communication"
 - Modify: docs/compressed_muon/EXPERIMENTS.md
 - Modify: docs/compressed_muon/RESULTS.md
 - Modify: docs/compressed_muon/PAPER_NOTES.md
+- Reference (read-only): ~/greedy_lore/run_c4_llama60m_lore_fp32.slurm
+- Reference (read-only): ~/greedy_lore/run_c4_llama60m_lore_bf16.slurm
 
 **Interfaces:**
 - Consumes: all preceding implementation, tests, profiler launcher, and repository research conventions.
@@ -770,6 +812,11 @@ git commit -m "perf: profile GreedyLore Muon communication"
 - [ ] **Step 1: Register the method before formal experiments**
 
 Add M002 with status testing, describe compression as DDP gradient-input compression before unchanged Muon, state that MSGD/Adam theory does not transfer, and document local-SVD versus broadcast consistency/cost. Create one append-only worklog with links to the spec, plan, implementation, config, and subsequent artifacts.
+
+Record the local author-code snapshot path and pinned hashes, the reusable
+orientation/batching ideas, and every intentional divergence listed in the
+spec. Do not call the snapshot an executable oracle: its real greedy hook has
+an incomplete score helper and its fake hook communicates the dense tensor.
 
 - [ ] **Step 2: Run the complete CPU correctness gate**
 
@@ -811,6 +858,19 @@ Run at least three rotated paired blocks without profiler, each covering an inte
 - [ ] **Step 6: Run a short quality gate before long training**
 
 Compare dense Muon and local-SVD GreedyLore from identical initialization/data order for multiple seeds. Record training/validation loss, gradient norms, NaN/Inf checks, and residual norms. Do not start a long paper-scale run unless the short run is stable and the performance evidence justifies it.
+
+For the first paper-oriented quality recipe, use the repository's current
+GPT-60M geometry corresponding to the paper's LLaMA-60M setup: global batch
+512, device batch 128 on four ranks, sequence length 256, 10,000 updates,
+1,000 warmup updates, rank 32, update interval 200, and Adam-style scalar
+settings. Keep this separate from the short gate. Record two recipe deltas
+explicitly: the inspected author launcher sets `grad_clipping=0` while the
+current CM039 staged Muon recipe uses `grad_clip_norm=1.0`; moreover, the
+snapshot's 60M launcher uses 200 scheduler-warmup steps even though paper Table
+VII reports 1,000. The snapshot omits the referenced C4 training source, so its
+cosine endpoint cannot be verified locally. Treat clipping as a paired ablation,
+use Dion's existing cosine-to-zero behavior explicitly, and label these as
+paper-oriented comparisons rather than exact reproductions.
 
 - [ ] **Step 7: Apply claim boundaries and update research records**
 
