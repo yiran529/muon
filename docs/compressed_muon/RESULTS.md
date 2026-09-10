@@ -227,3 +227,86 @@ CM035 与 CM036 是先后运行的独立 controller，且 GPU 4–7 存在共享
 
 - `artifacts/compressed_muon/CM035-m001-adamw-paper-recipe-all2d-hook-gpt60m-train-ddp-ws4-s42/`
 - `artifacts/compressed_muon/CM036-m001-ef14-all2d-hook-adamw-paper-recipe-gpt60m-ddp-ws4-s42/`
+
+## CM037–CM041：独立 scalar AdamW、EF14 与 Muon 配方消融（2026-09-10）
+
+本轮继续使用 4×RTX 4090、BF16、compile、FineWeb10B、seq256、global batch512、
+device batch128/GA1、seed42 和严格 token-weighted validation。GPT-60M 训练 8393
+updates（`1,100,087,296` tokens），GPT-130M 训练 16785 updates
+（`2,200,043,520` tokens）。所有 ARC cell 均为 all-2D DDP hook：压缩全部
+`ndim == 2` 梯度，包括 Transformer block、embedding 和 lm_head；非二维梯度保持
+dense。ARC 固定 EF14（CM037 的诊断对照除外）、ratio0.2、projection rank4、eta1、
+seed42、step1000 后压缩和 160 MiB bucket cap。
+
+Muon 矩阵继续使用 LR `0.02`、momentum `0.95`、Nesterov、
+`adjust_lr=spectral_norm` 和 weight decay `0.01`。embedding/lm_head 的 AdamW
+首次独立配置为 LR `0.001`、betas `(0.9, 0.999)`、epsilon `1e-8` 和 weight
+decay `0`。实现同时修正旧参数组写入未被 Muon scalar kernel 消费的 `betas` 键：
+现在显式写入实际读取的 `beta1`、`beta2` 和 `epsilon`。CM037/CM038/CM040 无
+warmup、最后 20% 线性衰减且不裁剪；CM039/CM041 使用 1000-step linear warmup、
+随后 cosine decay 到 0 和 global grad-norm clip `1.0`。
+
+### GPT-60M：CM037–CM039
+
+| 实验 | 模式 | final val loss | PPL | step average | tokens/s | peak memory |
+|---|---|---:|---:|---:|---:|---:|
+| CM037 | dense | 3.9832 | 53.69 | 98.97 ms | 1,324,361 | 6835 MiB |
+| CM037 | EF21M all-2D | 4.6848 | 108.29 | 99.89 ms | 1,312,163 | 7844 MiB |
+| CM038 | dense repeat | 3.9832 | 53.69 | 99.03 ms | 1,323,559 | 6835 MiB |
+| CM038 | EF14 all-2D | **4.0032** | **54.77** | **96.35 ms** | **1,360,374** | 7355 MiB |
+| CM039 | dense + warmup/cosine/clip | 4.0274 | 56.11 | 99.41 ms | 1,318,499 | 6835 MiB |
+| CM039 | EF14 all-2D + warmup/cosine/clip | 4.0494 | 57.36 | 96.59 ms | 1,356,993 | 7355 MiB |
+
+CM037 中 EF21M 相对同期 dense 高 `0.7016` loss、PPL 高 `101.70%`，且单步慢
+`0.93%`；仅降低并修正 scalar AdamW 超参数没有解决 EF21M 的质量问题。CM038 只将
+ARC 的误差反馈换成 EF14，并重复相同 dense：loss gap 缩至 `0.0200`、PPL gap
+`2.02%`，ARC 单步快 `2.71%`、吞吐高 `2.78%`，峰值显存多 `520 MiB`。CM039
+加入 warmup/cosine/clip 后，dense/ARC 相对 CM038 分别高 `0.0442/0.0462` loss，
+配方未改善最终质量；其 ARC 相对同期 dense 高 `0.0220` loss，单步仍快 `2.84%`。
+
+### GPT-130M：CM040–CM041
+
+| 实验 | 模式 | final val loss | PPL | step average | tokens/s | peak memory |
+|---|---|---:|---:|---:|---:|---:|
+| CM040 | dense | 3.5804 | 35.89 | **209.89 ms** | **624,479** | 12760 MiB |
+| CM040 | EF14 all-2D | **3.5949** | **36.41** | 211.05 ms | 621,047 | 14075 MiB |
+| CM041 | dense + warmup/cosine/clip | 3.5851 | 36.06 | 213.20 ms | 614,784 | 12760 MiB |
+| CM041 | EF14 all-2D + warmup/cosine/clip | 3.6002 | 36.61 | **212.78 ms** | **615,998** | 14075 MiB |
+
+CM040 的 EF14 相对 dense 只高 `0.0145` loss、PPL 高 `1.46%`，但单步慢
+`0.55%`；CM041 对应 gap 为 `0.0151`/`1.52%`，ARC 单步快 `0.20%`。后者已经小到
+单次运行噪声范围，不应解释为稳定加速。warmup/cosine/clip 相对 CM040 使 dense/ARC
+分别高 `0.0047/0.0053` loss，也没有显示最终质量收益。EF14 在两个模型规模、两种
+schedule 下均将 all-2D 压缩的质量差距控制在约 `0.015–0.022 loss`；这是当前最强的
+质量证据，但所有设置仍只有 seed42。
+
+### 为什么正式长程 wall-clock 没有复现 CM032 的 6%–9%
+
+本轮并非完全“没有优势”：60M 的两个 EF14 cell 相对同期 dense 快约
+`2.7%–2.8%`，只是 130M 为 `-0.55%/+0.20%`，整体只能总结为小幅或基本持平。
+CM032 的 60M/130M all-2D hook 曾相对同期 dense 快 `9.17%/8.25%`，但不能把该
+比例直接外推到本轮，原因如下：
+
+1. CM032 是 shared-GPU、每模式单次、20 warmup + 200 measured 的探索性短测；其
+   dense 绝对时间为 `143.37/298.78 ms`，明显慢于本轮的约 `99/210–213 ms`，说明
+   外部负载和短窗口基线占了相当比例。CM032 自己已预登记为非稳定性能主结果。
+2. CM032 从 step0 压缩；本轮前 1000 steps 使用 dense，同一平均数中约有 60M
+   `11.9%`、130M `6.0%` 的更新不享受压缩收益，因此会摊薄压缩阶段的潜在降时。
+3. CM032 使用 EF21M，本轮使用 EF14；两者的 tracker/residual 更新和显存流量不同，
+   所以不是只改变训练长度的同实现复测。
+4. 单机 4×4090、device batch128/GA1 下，forward/backward/Muon 正交化占据大量关键
+   路径，dense DDP 通信也可与 backward 重叠。all-2D hook 减少通信字节和同步尾部，
+   但 projection、Top-K、residual 更新、bucket callback 及额外内存流量仍需付费；
+   当 dense 基线从受扰动的 `299 ms` 回到约 `210 ms` 时，这些固定成本足以抵消大部分
+   通信收益。
+
+因此 CM032 仍是“all-2D hook 在特定短测负载下存在加速机会”的有效探索证据，而
+CM037–CM041 更适合描述当前质量配方和长程平均 step time：EF14 已解决主要质量问题，
+但当前单机大 physical batch 下只有 60M 小幅加速，130M 尚无稳定 wall-clock 优势。
+若继续验证性能，应在独占 GPU 上做多次、随机化顺序的纯 steady-state paired timing，
+并单独报告 step1000 后的压缩区间；更低带宽或跨节点环境更可能放大通信缩减收益。
+
+原始产物：
+
+- `artifacts/compressed_muon/CM037-CM039-m001-staged-scalar-adamw-ef14-muon-gpt60m-ws4-s42/`
+- `artifacts/compressed_muon/CM040-CM041-m001-ef14-muon-gpt130m-ws4-s42/`

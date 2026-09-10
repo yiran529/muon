@@ -1012,3 +1012,82 @@ CM036。CM036 自身先在相同 batch 做三步 EF14 probe，失败则不会进
 用例组成。将未修改的 `HEAD` 用 `git archive` 解压到独立临时目录后，单独运行这
 11 项仍为 `11 failed`，表明它们是本轮修改前即可复现的基线失败；本轮未扩大范围
 修复这些无关模块。
+
+## 2026-09-10：CM037–CM041 Muon scalar AdamW、EF14 与 schedule 消融
+
+CM035/CM036 确认 EF14 明显优于当前 EF21M 后，本轮将同一误差反馈语义移回 Muon
+混合优化器，并先修正 auxiliary AdamW 参数组。旧训练入口让 embedding 和 lm_head
+与 Muon 共用 `lr=0.02`，同时向混合 Muon 参数组写入 `betas=(0.95, 0.98)`；但当前
+Muon scalar kernel 实际读取 `beta1`、`beta2` 和 `epsilon`，所以该 `betas` 键没有
+生效，实际回落到默认 `(0.9, 0.95)`。commit `3664f09` 新增独立
+`scalar_lr/scalar_adam_beta1/scalar_adam_beta2/scalar_adam_eps/`
+`scalar_weight_decay`，并由 dense 与 ARC 入口共享同一个参数组构造函数。显式配置为
+Muon LR `0.02`、momentum `0.95`、Nesterov、spectral-norm LR adjustment、weight
+decay `0.01`；embedding/lm_head AdamW 为 LR `0.001`、betas `(0.9, 0.999)`、
+epsilon `1e-8`、weight decay `0`。相关 optimizer/parser 回归为 `19 passed`。
+
+commit `b81849a` 登记 CM037–CM039 三个严格顺序的 GPT-60M 两-cell 阶段，每阶段都
+重复同期 dense 后再运行 ARC。共同训练设置为 4×RTX4090、BF16、compile、FineWeb10B、
+seq256、global batch512、device batch128/GA1、8393 updates
+（`1,100,087,296` tokens）、每500步验证 `10,485,760` tokens 和 seed42。ARC hook
+压缩全部 `ndim == 2` 梯度，包括 block、embedding 和 lm_head；非二维参数保持 dense。
+ratio0.2、projection rank4、eta1、ARC seed42、step1000 后压缩和 bucket cap160 MiB
+固定。CM037 使用 EF21M；CM038 只将 ARC 换成 EF14；CM039 在 CM038 基础上对两侧
+加入 exact 1000-step warmup、cosine-to-zero 和 global grad-norm clip1.0。其余阶段
+使用无 warmup、最后20%线性衰减、无 clipping。六配置/controller contract 为
+`4 passed`。
+
+首次 controller 承载会话在启动 CM038 dense 后被外部结束；该训练子进程仍正常跑完。
+随后用 user systemd service 从 CM038 EF14 恢复。CM038 EF14 本身完成训练并输出最终
+指标后，rank0 因 W&B 向 Google Storage 上传文件持续收到 EOF 而等待；只终止该
+W&B core 子进程后，torchrun 正常返回并继续 CM039，没有重跑或丢弃已完成的训练。
+最终六个 cell 均生成有效 result/summary，resume service exit0。CM040/CM041 的 130M
+扩展在前一服务成功结束后自动启动，使用 W&B offline 避免上传影响控制流；四个 cell
+均 exit0。130M 使用 dim768、8 layers、12 heads、16785 updates
+（`2,200,043,520` tokens），其余训练和 ARC 参数与对应 60M 阶段相同。
+
+### 正式结果
+
+| 实验 | 模型/配方 | dense loss / PPL | ARC loss / PPL | dense / ARC step | ARC vs dense step | dense / ARC memory |
+|---|---|---:|---:|---:|---:|---:|
+| CM037 | 60M，EF21M | 3.9832 / 53.69 | 4.6848 / 108.29 | 98.97 / 99.89 ms | 慢 0.93% | 6835 / 7844 MiB |
+| CM038 | 60M，EF14 | 3.9832 / 53.69 | 4.0032 / 54.77 | 99.03 / 96.35 ms | 快 2.71% | 6835 / 7355 MiB |
+| CM039 | 60M，EF14 + warmup/cosine/clip | 4.0274 / 56.11 | 4.0494 / 57.36 | 99.41 / 96.59 ms | 快 2.84% | 6835 / 7355 MiB |
+| CM040 | 130M，EF14 | 3.5804 / 35.89 | 3.5949 / 36.41 | 209.89 / 211.05 ms | 慢 0.55% | 12760 / 14075 MiB |
+| CM041 | 130M，EF14 + warmup/cosine/clip | 3.5851 / 36.06 | 3.6002 / 36.61 | 213.20 / 212.78 ms | 快 0.20% | 12760 / 14075 MiB |
+
+CM037 的 EF21M gap 仍为 `+0.7016 loss`/`+101.70% PPL`，表明独立 scalar LR 和
+正确 AdamW moments 本身不能解释或修复旧退化。CM038 只替换 EF 语义后 gap 降到
+`+0.0200 loss`/`+2.02% PPL`；CM040 在 130M 上进一步为 `+0.0145`/`+1.46%`。
+CM039/CM041 的对应 gap 为 `+0.0220/+0.0151 loss`，说明结论跨两种 schedule 保持。
+这组同配置、同期 dense 对照强烈支持 EF14 是主要质量修正，而不是 embedding/lm_head
+必须退出压缩：在 ratio0.2 all-2D 下，包括这两个大词表矩阵仍可接近 dense。限制仍是
+每个设置只有 seed42，尚不能估计方差。
+
+warmup/cosine/clip 没有改善当前 token budget 的最终质量：相对 CM038，CM039 的
+dense/ARC 分别高 `0.0442/0.0462` loss；相对 CM040，CM041 分别高
+`0.0047/0.0053`。不能据此断言这些策略普遍有害，因为 cosine 改变了整个训练段的
+累计 LR，当前实验也没有将 warmup、cosine 和 clip 单独拆开。
+
+### wall-clock 与 CM032 的关系
+
+正式长程结果不是所有规模都“没有优势”：60M EF14 在两套 schedule 下相对同期 dense
+快 `2.71%/2.84%`；130M 为慢 `0.55%`/快 `0.20%`，应视为基本持平。CM032 的
+all-2D 短测曾快 `9.17%/8.25%`，但它是 shared-GPU、单次、200 measured steps、
+compression start0 的探索实验，且 dense 绝对时间 `143.37/298.78 ms` 明显高于
+本轮约 `99/210–213 ms`。外部负载与短窗口使该相对比例不够稳定；CM032 也使用
+EF21M，而非本轮 EF14。
+
+此外，正式训练前1000步保持 dense，分别占 60M/130M 更新数的 `11.9%/6.0%`，会
+摊薄压缩段收益。单机4090、device batch128/GA1 下，dense DDP 通信本来就能与较长的
+backward 重叠，forward/backward 和 Muon orthogonalization 占主要关键路径；ARC
+虽降低通信字节和 tail，仍增加 projection、Top-K、EF residual、bucket callback 和
+内存流量。当无干扰 dense 回到约 `210 ms` 时，这些成本足以抵消 130M 的通信收益。
+所以 CM032 仍说明特定短测负载有加速机会，本轮长程结果则支持“60M 小幅加速、130M
+当前单机负载下中性”。若继续做性能结论，需要独占 GPU、多次随机化顺序，并单独统计
+step1000 后 steady-state；通信受限或跨节点环境更有可能放大 ARC 的收益。
+
+原始结果与完整 summary：
+
+- `artifacts/compressed_muon/CM037-CM039-m001-staged-scalar-adamw-ef14-muon-gpt60m-ws4-s42/`
+- `artifacts/compressed_muon/CM040-CM041-m001-ef14-muon-gpt130m-ws4-s42/`
