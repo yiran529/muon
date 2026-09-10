@@ -635,19 +635,15 @@ def _launch_refresh_bucket(
             )
         )
 
-    final = context.completion_future
+    completion = torch.futures.Future(devices=_future_devices(context.buffer.device))
 
     def fail(exc: BaseException) -> None:
-        if not final.done():
-            final.set_exception(exc)
+        if not completion.done():
+            completion.set_exception(exc)
 
-    def complete_after_broadcasts(completed: torch.futures.Future) -> None:
-        try:
-            completed.value()
-            if not final.done():
-                final.set_result(context.buffer)
-        except BaseException as exc:
-            fail(exc)
+    def complete_after_broadcasts(completed: torch.futures.Future) -> Tensor:
+        completed.value()
+        return context.buffer
 
     def after_dense(completed: torch.futures.Future) -> None:
         try:
@@ -677,20 +673,25 @@ def _launch_refresh_bucket(
                     )
                 )
             if futures:
-                torch.futures.collect_all(futures).add_done_callback(
-                    _on_bucket_execution_stream(
+                broadcast_completion = torch.futures.collect_all(futures).then(
+                    _on_bucket_execution_stream_result(
                         state,
                         context,
                         complete_after_broadcasts,
                     )
                 )
+                bridge_future(
+                    broadcast_completion,
+                    completion,
+                    lambda value: value,
+                )
             else:
-                final.set_result(context.buffer)
+                completion.set_result(context.buffer)
         except BaseException as exc:
             fail(exc)
 
     source.add_done_callback(_on_bucket_execution_stream(state, context, after_dense))
-    return final
+    return completion
 
 
 def greedy_lore_ddp_hook(
