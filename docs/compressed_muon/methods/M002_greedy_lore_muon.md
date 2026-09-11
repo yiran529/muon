@@ -85,7 +85,7 @@ M002 相对快照的有意差异如下：
 
 ## 当前状态与已知限制
 
-状态为 `testing`。Task 10 已在本机同构 2×RTX 4090 环境通过完整 CPU gate、NCCL stress、rank-consistency preflight 与 dense/local-SVD/broadcast 真实训练入口 smoke。CM044 的 tiny profiler/timing 结果为负：该配置中绝大多数 payload 是不压缩的 dense auxiliary 参数，local-SVD 与 broadcast 的完整 period logical gradient payload 只比 dense 少 `0.72%` 与 `0.35%`，而平均 step time 分别是 dense 的约 `17.2×` 与 `23.1×`。三 seed、12-update 合成回归 gate 无 NaN/Inf，但不能替代真实语言模型质量实验。因此不启动 10,000-update paper-oriented recipe；跨模型/网络的正式性能和训练质量仍为 pending，不作一般速度、显存、训练质量或理论收敛声明。
+状态为 `testing`。Task 10 已在本机同构 2×RTX 4090 环境通过完整 CPU gate、NCCL stress、rank-consistency preflight 与 dense/local-SVD/broadcast 真实训练入口 smoke。CM044 的 tiny interval2 结果为负；interval200 的四卡尺度 timing 依次观察到 60M null（`+0.17%`）、130M preliminary-positive（`-1.86%`）和 350M positive（`-15.97%`），其中 350M peak allocated 从 `7062 MiB` 增至 `9731 MiB`。该趋势支持“模型增大、可压缩 transformer matrix 占比提高时通信收益更可能覆盖固定成本”，但三种模型 batch geometry 不同，且只有三轮性能重复，没有代表性多 seed 训练质量或 time-to-quality 证据。因此仍不启动 10,000-update paper-oriented recipe，不作一般训练质量或理论收敛声明。
 
 原合并阻塞项 timing fail-closed 尾部边界已修复：parser 现在识别最后一个 `step_avg` marker 后再校验格式、有限性与正值，不会由较早合法值掩盖 malformed、负数、`NaN` 或 `Inf` 的末标记；对应回归已通过。CM045 将相同 tiny 几何的 interval 调至官方默认量级 200，local-SVD 从 CM044 的 `155.103 ms` 降至 `16.643 ms`，但同期 dense 为 `7.980 ms`，仍慢约 `2.09×`。这确认高频 refresh 是极端 slowdown 的重要组成，也确认当前 tiny 仅 1.50% 可压缩 payload 时仍不足以覆盖普通压缩路径固定成本。
 

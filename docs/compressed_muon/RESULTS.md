@@ -355,3 +355,34 @@ local-SVD refresh 的完整 critical-path tail 远大于 SVD GPU kernel sum，�
 CM044 分类为 **negative**：在该 tiny 单机负载，M002 只有 `0.72%`（broadcast `0.35%`）logical gradient payload reduction，却显著增加 measured collective/exposed work、complete-period wall-clock 和 peak memory。该结果不证明较大 shared-Muon-matrix 比例或不同网络下也为负，也不证明 GreedyLore-Muon 等价于 dense Muon；它只足以拒绝在当前证据上宣称加速，并阻止条件性的 10,000-update paper-oriented run。
 
 原始产物：`artifacts/compressed_muon/CM044-m002-greedylore-muon-tiny-ddp-ws2-s42/`，包括 plan、每 cell command/controller environment/stdout/stderr/exit、36 traces、`summary.json`、`timing-summary.json` 与 timing parser。注意 `environment.txt` 是 controller snapshot；精确 per-command CUDA/PYTHONPATH/NCCL override 以各 cell `command.txt` 为准。
+
+## CM045–CM051：M002 interval-200 规模化 timing（2026-09-11）
+
+在 update interval 调整到原 GreedyLore 的 `200` 后，使用 profiler-off、每个 repeat
+恰好覆盖一个完整 200-update period 的配对 timing 比较 dense 与 local-SVD。每个模型
+均完成 3 个 rotated-order repeat；下表中的变化率以相同 repeat 配对计算，负数表示
+local-SVD 更快。
+
+| 模型/实验 | dense mean | local-SVD mean | 配对变化 | 95% mean-difference interval | dense / local peak memory | 判断 |
+|---|---:|---:|---:|---:|---:|---|
+| tiny / CM045 | 7.980 ms | 16.643 ms | +108.58% | [8.39, 8.92] ms | 193 / 251 MiB | negative |
+| 60M / CM047 | 113.167 ms | 113.360 ms | +0.17% | [-2.32, 1.79] ms | 6865 / 7347 MiB | null |
+| 130M / CM049 | 239.217 ms | 234.770 ms | -1.86% | [-5.74, -3.14] ms | 13048 / 13889 MiB | preliminary-positive |
+| 350M / CM051 | 232.880 ms | 195.567 ms | **-15.97%** | [-45.33, -31.43] ms | 7062 / 9731 MiB | positive |
+
+CM051 的三个配对 repeat 均为 local-SVD 更快（`-35.18/-45.33/-31.43 ms`），平均
+吞吐从 `35,200` 增至 `41,893 tokens/s`；代价是 peak allocated 增加 `2669 MiB`
+（`37.8%`）。该实验采用 global/device batch `32/8`，而 60M/130M 采用
+`512/128`，因此不能跨模型比较绝对 step time 或 throughput。CM049 的优势小于预登记
+的 `2%` 实用阈值，当前只视作初步正向信号；CM047 未显示差异。
+
+这些实验只有 3 个性能 repeat，并且是短程 timing，不提供收敛、最终质量或
+time-to-quality 证据。CM051 使用 timing-only runner，6/6 cell exit `0`，不生成新
+trace；保留的 trace 来自单独的 CM050 preflight，不能用来替代 CM051 的性能统计。
+
+原始产物：
+
+- `artifacts/compressed_muon/CM045-m002-greedylore-muon-tiny-interval200-ddp-ws2-s42/`
+- `artifacts/compressed_muon/CM047-m002-gpt60m-interval200-ddp-ws4-s42/`
+- `artifacts/compressed_muon/CM049-m002-gpt130m-interval200-ddp-ws4-s42/`
+- `artifacts/compressed_muon/CM051-m002-gpt350m-interval200-ddp-ws4-s42/`

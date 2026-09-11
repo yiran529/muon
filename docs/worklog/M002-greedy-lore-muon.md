@@ -274,3 +274,15 @@ GPU2–5 启动前均为 `3 MiB`、`0% utilization`，无 compute process；`m00
 CM050 的 6/6 profiler cells 均 exit `0`，原始 24/24 rank traces 共 `2,338,797,659 B`（约 2.18 GiB），dense/GreedyLore peak allocated 为 `7062/9731 MiB`，因此 350M 显存与执行 preflight 已通过。trace summarizer 单核 99.9% CPU 连续运行超过 3.5 小时仍未完成；按用户决定停止该 parser 与旧串行 controller，不把 trace summary 作为正式 wall-clock 的前置 gate。
 
 保留 `CM050-.../greedylore_local_svd-refresh-r1/profiler/rank-0.json`（约 424 MiB）供以后诊断，删除 CM050 其余 23 份 trace；删除不可从仓库恢复，CM046–CM049 历史 trace 未改动。launcher/summarizer 增加 `profile_modes=none` 的 timing-only 合法路径：仍要求 plan、command、exit、finished timestamp 和有限正值末尾 timing，正常生成 `summary.json`（空 profile cells）与 `timing-summary.json`。对应 launcher/parser 测试为 `29 passed`。CM051 随后只运行 dense/local-SVD 的 3 rotated、20 warmup + 200 measured update timing，不再生成 trace。
+
+### CM051 350M timing-only 结果
+
+CM051 于 `21:12:26–21:23:27+08:00` 完成，6/6 timing cells exit `0`，日志无 OOM/timeout/traceback，trace 文件数严格为 `0`。每个 cell 为 20 warmup + 200 measured updates，三轮使用 dense/local-SVD rotated pairing。
+
+- dense：`228.14/241.35/229.15 ms`，mean `232.880 ms`，CV `3.16%`，throughput `35,200 tok/s`，peak `7062 MiB`。
+- local-SVD：`192.96/196.02/197.72 ms`，mean `195.567 ms`，CV `1.23%`，throughput `41,893 tok/s`，peak `9731 MiB`。
+- paired local-SVD minus dense：`-35.18/-45.33/-31.43 ms`，mean `-37.313 ms`，mean ratio `0.8403`（`-15.97%`），bootstrap mean-difference 95% interval `[-45.33,-31.43] ms`。
+
+在该 350M、global/device batch32/8 几何下结果分类为 **positive**：三轮同方向，完整 interval200 周期 step 降低约 16%，但 peak allocated 增加 `2669 MiB`（约 `37.8%`）。尺度趋势为 60M null（`+0.17%`）、130M preliminary-positive（`-1.86%`）、350M positive（`-15.97%`），与更大模型中 transformer Muon matrix 占总 payload 比例上升的方向一致。三种模型 batch geometry 不同，不能横向比较绝对吞吐；三轮 timing 也不能替代多 seed 训练质量与 time-to-quality，尤其不能据此声称 GreedyLore-Muon 已保持 dense Muon 收敛性质。
+
+artifact：`artifacts/compressed_muon/CM051-m002-gpt350m-interval200-ddp-ws4-s42/`，包含 `plan.json`、6 个 timing cell 的 command/environment/log/exit/time、空 profile `summary.json` 和 `timing-summary.json`。
