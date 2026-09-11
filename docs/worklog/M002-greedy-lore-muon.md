@@ -233,3 +233,16 @@ done
 **最可能的解释：**CM044 的 `17.2×/23.1×` slowdown 不是单一 SVD kernel 导致，而是“`98.5%` payload 不可压缩 + interval2 高频 refresh + 逐参数小算子/小 collective + 全局安全串行链 + Muon result communication 不变”的叠加。local-SVD 比 broadcast 快约 `25.7%`，符合省掉 basis broadcast 的方向；但 broadcast compressed trace 中异常大的 score/factor collective 时间无法由当前 tiny 三重复唯一归因，不能据此声称算法固有的 NCCL 成本。
 
 **尚待验证：**把 interval 改为 `200` 会显著摊薄 refresh，但在当前 tiny 参数边界下，总 payload 理论收益仍受约 `1.5%` 可压缩占比限制。是否能在 GPT-60M 等 transformer matrix 占比更高的模型上转正，必须先完成 same-shape batching，再用代表性几何、独占四卡和完整周期实测；不能由 CM044 外推。
+
+## 2026-09-11：后续性能优化队列与首批执行
+
+按“预期收益大、修改量小、尽量保持作者 GreedyLore 结构”的原则登记以下顺序：
+
+1. **P0 / 正在完成**：修复 timing parser 的非法末尾 `step_avg` fail-closed 边界，补 malformed、负数与非有限值回归。
+2. **P1 / running**：CM045 复用 CM044 tiny paired 几何，将 `update_interval` 从 2 改为官方默认量级 200，先量化 refresh 摊销；仍明确受 1.50% 可压缩 payload 上限约束。
+3. **P1 / TODO**：参考 ARC 的 canonical shape/device/dtype 分组和作者仓库的 same-shape batching，先 batch 每个普通 compressed step 的 score、Top-r、factor、error 与 reconstruction；保持当前 score+dense_aux/factor 两阶段 packed All-Reduce 和全局 Future 顺序不变。
+4. **P1 / TODO**：为 factor 一次性分配 packed buffer，并让 batched factor 直接写入 view，移除逐参数 `.clone()` 后再 `cat()`；仅在 profiler 证明必要时增加可安全处理 bucket rebuild 的持久 workspace。
+5. **P2 / TODO**：普通步优化验证后再评估 batched refresh SVD；`update_interval=200` 时 refresh 仅占 0.5%，其平均收益优先级低于普通步 batching。
+6. **P2 / TODO**：仅针对强一致性 fallback 评估按 bucket 打包 basis broadcast；跨 bucket Future 并发、CUDA Graph 与 all-2D GreedyLore 均推迟。all-2D 若开展必须单独登记消融，不能改变 M002 默认 transformer-Muon-matrix-only 边界。
+
+首批 parser TDD 的 RED 已确认：在一个合法 timing 后追加 `invalid/-1/nan/inf/1e999` 末标记时，旧 parser 的 5 个 case 均错误成功。最小修复改为先识别末个 token，再显式执行 float、finite 和正值校验；相关 parser/launcher 测试随后为 `21 passed`。完整回归与 CM045 结果在本节后续追加。

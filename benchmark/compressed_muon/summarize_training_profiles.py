@@ -14,9 +14,7 @@ from pathlib import Path
 from benchmark.compressed_muon.profiler_trace import summarize_training_trace
 
 
-_FINAL_TIMING_RE = re.compile(
-    r"step_avg:(?P<value>(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))ms\b"
-)
+_FINAL_TIMING_RE = re.compile(r"step_avg:(?P<value>[^\s]*)")
 _TIMING_CELL_RE = re.compile(r"^(?P<mode>.+)-timing-r(?P<repeat>[0-9]+)$")
 _LOSS_RE = re.compile(r"val_loss:(?P<value>(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))")
 _MEMORY_RE = re.compile(
@@ -51,12 +49,19 @@ def _cell_logs(cell_dir: Path) -> str:
 
 
 def _final_timing(logs: str, cell: str) -> float:
-    matches = [
-        float(match.group("value")) for match in _FINAL_TIMING_RE.finditer(logs)
-    ]
-    if not matches or not math.isfinite(matches[-1]) or matches[-1] <= 0:
+    matches = list(_FINAL_TIMING_RE.finditer(logs))
+    if not matches:
         raise SystemExit(f"missing final timing for {cell}")
-    return matches[-1]
+    final_token = matches[-1].group("value")
+    if not final_token.endswith("ms"):
+        raise SystemExit(f"invalid final timing for {cell}")
+    try:
+        final_timing = float(final_token[:-2])
+    except ValueError as exc:
+        raise SystemExit(f"invalid final timing for {cell}") from exc
+    if not math.isfinite(final_timing) or final_timing <= 0:
+        raise SystemExit(f"invalid final timing for {cell}")
+    return final_timing
 
 
 def _timing_cell_record(artifact_root: Path, cell_name: str) -> dict:
