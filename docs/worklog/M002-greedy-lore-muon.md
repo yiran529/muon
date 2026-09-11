@@ -238,11 +238,25 @@ done
 
 按“预期收益大、修改量小、尽量保持作者 GreedyLore 结构”的原则登记以下顺序：
 
-1. **P0 / 正在完成**：修复 timing parser 的非法末尾 `step_avg` fail-closed 边界，补 malformed、负数与非有限值回归。
-2. **P1 / running**：CM045 复用 CM044 tiny paired 几何，将 `update_interval` 从 2 改为官方默认量级 200，先量化 refresh 摊销；仍明确受 1.50% 可压缩 payload 上限约束。
+1. **P0 / completed**：修复 timing parser 的非法末尾 `step_avg` fail-closed 边界，补 malformed、负数与非有限值回归。
+2. **P1 / completed/negative**：CM045 复用 CM044 tiny paired 几何，将 `update_interval` 从 2 改为官方默认量级 200，量化 refresh 摊销；结果仍受 1.50% 可压缩 payload 上限约束。
 3. **P1 / TODO**：参考 ARC 的 canonical shape/device/dtype 分组和作者仓库的 same-shape batching，先 batch 每个普通 compressed step 的 score、Top-r、factor、error 与 reconstruction；保持当前 score+dense_aux/factor 两阶段 packed All-Reduce 和全局 Future 顺序不变。
 4. **P1 / TODO**：为 factor 一次性分配 packed buffer，并让 batched factor 直接写入 view，移除逐参数 `.clone()` 后再 `cat()`；仅在 profiler 证明必要时增加可安全处理 bucket rebuild 的持久 workspace。
 5. **P2 / TODO**：普通步优化验证后再评估 batched refresh SVD；`update_interval=200` 时 refresh 仅占 0.5%，其平均收益优先级低于普通步 batching。
 6. **P2 / TODO**：仅针对强一致性 fallback 评估按 bucket 打包 basis broadcast；跨 bucket Future 并发、CUDA Graph 与 all-2D GreedyLore 均推迟。all-2D 若开展必须单独登记消融，不能改变 M002 默认 transformer-Muon-matrix-only 边界。
 
 首批 parser TDD 的 RED 已确认：在一个合法 timing 后追加 `invalid/-1/nan/inf/1e999` 末标记时，旧 parser 的 5 个 case 均错误成功。最小修复改为先识别末个 token，再显式执行 float、finite 和正值校验；相关 parser/launcher 测试随后为 `21 passed`。完整回归与 CM045 结果在本节后续追加。
+
+### CM045 interval200 结果
+
+controller 于 `2026-09-11T14:14:06+08:00` 至 `14:27:33+08:00` 在 GPU2/3 完成；27/27 cells exit `0`、18 个 profiler cells 共 36/36 rank traces，日志无 OOM/timeout/traceback marker。profiler-off timing 每个 cell 为 2 warmup + 200 measured updates，恰好覆盖一个 interval200 完整周期，并使用 3 个 rotated paired blocks。
+
+- dense：`7.86/8.06/8.02 ms`，mean `7.980 ms`，CV `1.33%`，peak `193 MiB`。
+- local-SVD：`16.54/16.45/16.94 ms`，mean `16.643 ms`，CV `1.57%`，peak `251 MiB`。
+- broadcast：`16.64/16.67/16.72 ms`，mean `16.677 ms`，CV `0.24%`，peak `276 MiB`。
+- paired local-SVD minus dense：`+8.663 ms`，mean ratio `2.0858`（`+108.58%`），bootstrap mean-difference 95% interval `[8.39, 8.92] ms`。
+- paired broadcast minus dense：`+8.697 ms`/`+109.00%`；local-SVD minus broadcast 为 `-0.033 ms`，95% interval `[-0.22, 0.22] ms`，本实验无法区分两者完整周期性能。
+
+与 CM044 interval2 的 `155.103/208.710 ms` 相比，local-SVD/broadcast 平均 step 分别下降 `89.27%/92.01%`；这确认高频 refresh 是此前极端 slowdown 的重要组成。结论仍为 **negative**：默认 cadence 将 slowdown 从约 17.2× 缩小到约 2.09×，但 tiny 模型仅 1.50% gradient payload 可压缩，普通 compressed step 的逐参数调度、两阶段 latency-bound collective、额外状态和 unchanged Muon result communication 仍足以压过带宽收益。CM045 只隔离 cadence，不支持代表性模型速度或训练质量结论；下一步保持队列中的 ordinary-step same-shape batching 优先级。
+
+artifact：`artifacts/compressed_muon/CM045-m002-greedylore-muon-tiny-interval200-ddp-ws2-s42/`，包含 plan、每 cell command/environment/log/exit/time、36 traces、`summary.json` 与 `timing-summary.json`。
