@@ -274,3 +274,43 @@ def test_profile_summary_rejects_rank_divergent_collective_launch_order(tmp_path
 
     with pytest.raises(SystemExit, match="signature"):
         summarize_profile_root(tmp_path, require_plan=True)
+
+
+def test_profile_summary_aggregates_greedylore_gpu_ranges_and_compressor_tail(tmp_path):
+    cell = "greedylore_local_svd-refresh-r1"
+    (tmp_path / "plan.json").write_text(json.dumps({
+        "world_size": 2,
+        "cells": [cell],
+        "require_final_timing": True,
+    }))
+
+    def trace(local_kernel_us):
+        return {"traceEvents": [
+            {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 1000},
+            {"ph": "X", "name": "train/final_backward", "cat": "cpu_op", "ts": 100, "dur": 500},
+            {"ph": "X", "name": "aten::mm_backward", "cat": "cpu_op", "ts": 110, "dur": 1,
+             "args": {"External id": 1}},
+            {"ph": "X", "name": "backward_gemm", "cat": "kernel", "ts": 120, "dur": 180,
+             "args": {"External id": 1}},
+            {"ph": "X", "name": "greedylore_hook/dense/payload bytes=24", "cat": "cpu_op",
+             "ts": 320, "dur": 10, "args": {"External id": 2}},
+            {"ph": "X", "name": "ncclDevKernel_AllReduce", "cat": "kernel", "ts": 330, "dur": 40,
+             "args": {"External id": 2}},
+            {"ph": "X", "name": "greedylore_hook/local_svd", "cat": "cpu_op", "ts": 380, "dur": 80},
+            {"ph": "X", "name": "aten::linalg_svd", "cat": "cpu_op", "ts": 390, "dur": 1,
+             "args": {"External id": 3}},
+            {"ph": "X", "name": "gesvd_kernel", "cat": "kernel", "ts": 400, "dur": local_kernel_us,
+             "args": {"External id": 3}},
+        ]}
+
+    _write_profile_cell(tmp_path, cell, 0, trace(50))
+    _write_profile_cell(tmp_path, cell, 1, trace(70))
+
+    result = summarize_profile_root(tmp_path, require_plan=True)
+    cell_summary = result["cells"][0]
+
+    assert cell_summary["rank_max_gpu_ranges_ms"]["greedylore_hook_local_svd"] == pytest.approx(0.07)
+    assert cell_summary["rank_max_compressor_critical_path_tail_ms"] == pytest.approx(0.17)
+    assert result["by_mode"]["greedylore_local_svd-refresh"]["mean_rank_max_gpu_ranges_ms"] == {
+        "greedylore_hook_local_svd": pytest.approx(0.07)
+    }

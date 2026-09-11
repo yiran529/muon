@@ -20,6 +20,16 @@ def _mean_mapping(cells, key):
     }
 
 
+def _max_optional(values):
+    present = [value for value in values if value is not None]
+    return max(present) if present else None
+
+
+def _mean_optional(values):
+    present = [value for value in values if value is not None]
+    return statistics.mean(present) if present else None
+
+
 def _validate_plan_completeness(artifact_root: Path, cells: list[dict]) -> None:
     plan_path = artifact_root / "plan.json"
     if not plan_path.is_file():
@@ -61,7 +71,7 @@ def _validate_plan_completeness(artifact_root: Path, cells: list[dict]) -> None:
                     item["message_bytes"],
                 )
                 for item in rank["collective_launches"]
-                if item["category"].startswith("arc_hook_")
+                if item["category"].startswith(("arc_hook_", "greedylore_hook_"))
             )
             signatures.append(signature)
         if len(set(signatures)) != 1:
@@ -89,6 +99,11 @@ def summarize_profile_root(artifact_root: Path, *, require_plan: bool = False) -
             category: max(item["cpu_ranges_ms"].get(category, 0.0) for item in traces)
             for category in categories
         }
+        gpu_categories = sorted({k for item in traces for k in item["gpu_ranges_ms"]})
+        rank_max_gpu_ranges = {
+            category: max(item["gpu_ranges_ms"].get(category, 0.0) for item in traces)
+            for category in gpu_categories
+        }
         collective_categories = sorted({
             item["category"] for trace in traces for item in trace["collectives"]
         })
@@ -101,9 +116,10 @@ def summarize_profile_root(artifact_root: Path, *, require_plan: bool = False) -
         }
         cells.append({
             "cell": cell_dir.name,
-            "mode": cell_dir.name.split("-r", 1)[0],
+            "mode": re.sub(r"-r\d+$", "", cell_dir.name),
             "ranks": traces,
             "rank_max_cpu_ranges_ms": rank_max_ranges,
+            "rank_max_gpu_ranges_ms": rank_max_gpu_ranges,
             "rank_max_collective_time_ms": rank_max_collectives,
             "rank_max_nccl_union_time_ms": max(item["nccl_union_time_ms"] for item in traces),
             "rank_max_exposed_nccl_time_ms": max(item["exposed_nccl_time_ms"] for item in traces),
@@ -112,6 +128,9 @@ def summarize_profile_root(artifact_root: Path, *, require_plan: bool = False) -
             ),
             "rank_max_exposed_gradient_sync_tail_ms": max(
                 item["exposed_gradient_sync_tail_ms"] for item in traces
+            ),
+            "rank_max_compressor_critical_path_tail_ms": _max_optional(
+                item["compressor_critical_path_tail_ms"] for item in traces
             ),
             "max_unattributed_nccl_fraction": max(item["unattributed_nccl_fraction"] for item in traces),
         })
@@ -140,7 +159,12 @@ def summarize_profile_root(artifact_root: Path, *, require_plan: bool = False) -
                 cell["rank_max_exposed_gradient_sync_tail_ms"]
                 for cell in mode_cells
             ),
+            "mean_rank_max_compressor_critical_path_tail_ms": _mean_optional(
+                cell["rank_max_compressor_critical_path_tail_ms"]
+                for cell in mode_cells
+            ),
             "mean_rank_max_cpu_ranges_ms": _mean_mapping(mode_cells, "rank_max_cpu_ranges_ms"),
+            "mean_rank_max_gpu_ranges_ms": _mean_mapping(mode_cells, "rank_max_gpu_ranges_ms"),
             "mean_rank_max_collective_time_ms": _mean_mapping(mode_cells, "rank_max_collective_time_ms"),
         }
     return payload

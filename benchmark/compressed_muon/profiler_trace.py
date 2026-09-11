@@ -44,12 +44,36 @@ _CATEGORY_NAMES = {
     "arc_hook/finalize": "arc_hook_finalize",
     "arc_hook/bucket_ready": "arc_hook_bucket_ready",
     "arc_hook/future_complete": "arc_hook_future_complete",
+    "greedylore_hook/bucket_ready": "greedylore_hook_bucket_ready",
+    "greedylore_hook/dense": "greedylore_hook_dense",
+    "greedylore_hook/local_svd": "greedylore_hook_local_svd",
+    "greedylore_hook/basis_broadcast": "greedylore_hook_basis_broadcast",
+    "greedylore_hook/score": "greedylore_hook_score",
+    "greedylore_hook/score_plus_aux_allreduce": "greedylore_hook_score_plus_aux_allreduce",
+    "greedylore_hook/topr": "greedylore_hook_topr",
+    "greedylore_hook/factor": "greedylore_hook_factor",
+    "greedylore_hook/factor_allreduce": "greedylore_hook_factor_allreduce",
+    "greedylore_hook/error": "greedylore_hook_error",
+    "greedylore_hook/reconstruction": "greedylore_hook_reconstruction",
+    "greedylore_hook/future_complete": "greedylore_hook_future_complete",
+}
+
+_OPERATION_BY_CATEGORY = {
+    "arc_seed": "broadcast",
+    "greedylore_hook_basis_broadcast": "broadcast",
+}
+
+_GREEDY_LORE_COLLECTIVES = {
+    "greedylore_hook_dense",
+    "greedylore_hook_basis_broadcast",
+    "greedylore_hook_score_plus_aux_allreduce",
+    "greedylore_hook_factor_allreduce",
 }
 
 _COLLECTIVE_CATEGORIES = {
     "ddp_gradient", "arc_seed", "arc_sketch", "arc_selected_values",
     "arc_dense_uncompressed", "muon_result", "arc_hook_dense",
-    "arc_hook_sketch", "arc_hook_selected_values",
+    "arc_hook_sketch", "arc_hook_selected_values", *_GREEDY_LORE_COLLECTIVES,
 }
 
 _ARC_HOOK_COLLECTIVES = {
@@ -58,11 +82,21 @@ _ARC_HOOK_COLLECTIVES = {
 
 _GRADIENT_COLLECTIVES = {
     "ddp_gradient", "arc_sketch", "arc_selected_values",
-    "arc_dense_uncompressed", *_ARC_HOOK_COLLECTIVES,
+    "arc_dense_uncompressed", *_ARC_HOOK_COLLECTIVES, *_GREEDY_LORE_COLLECTIVES,
+}
+
+_GREEDY_LORE_LOCAL_CATEGORIES = {
+    "greedylore_hook_local_svd",
+    "greedylore_hook_score",
+    "greedylore_hook_topr",
+    "greedylore_hook_factor",
+    "greedylore_hook_error",
+    "greedylore_hook_reconstruction",
 }
 
 _HOOK_LOCAL_CATEGORIES = {
     "arc_hook_local_prepare", "arc_hook_topk", "arc_hook_finalize",
+    *_GREEDY_LORE_LOCAL_CATEGORIES,
 }
 
 
@@ -140,9 +174,9 @@ def _merge_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[flo
 def _range_category(name: str) -> str | None:
     if name in _CATEGORY_NAMES: return _CATEGORY_NAMES[name]
     for range_name, category in _CATEGORY_NAMES.items():
-        if range_name.startswith("arc_hook/") and name.startswith(range_name + " "):
+        if name.startswith(range_name + " "):
             return category
-        if range_name.startswith("arc_hook/") and name.startswith(range_name + "/"):
+        if name.startswith(range_name + "/"):
             return category
     lower = name.lower().replace("-", "_")
     if "ddp" in lower and ("reduce" in lower or "bucket" in lower): return "ddp_gradient"
@@ -303,19 +337,29 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
                 if corr is not None
                 else []
             )
-            is_hook_local = any(
-                local[1] <= start and end <= local[2]
-                or (corr is not None and local[3] is not None and str(corr) == str(local[3]))
-                for local in hook_local_ranges
-            )
-            is_hook_local = is_hook_local or any(
-                any(
-                    local[1] <= float(cpu_event.get("ts", 0.0))
-                    and float(cpu_event.get("ts", 0.0)) + _duration(cpu_event) <= local[2]
-                    for local in hook_local_ranges
+            local_candidates = [
+                local for local in hook_local_ranges
+                if local[1] <= start and end <= local[2]
+                or (
+                    corr is not None
+                    and local[3] is not None
+                    and str(corr) == str(local[3])
                 )
-                for cpu_event in correlated_cpu_events
+            ]
+            for cpu_event in correlated_cpu_events:
+                cpu_start = float(cpu_event.get("ts", 0.0))
+                cpu_end = cpu_start + _duration(cpu_event)
+                local_candidates.extend(
+                    local for local in hook_local_ranges
+                    if local[1] <= cpu_start and cpu_end <= local[2]
+                )
+            local_category = (
+                min(local_candidates, key=lambda local: local[2] - local[1])[0]
+                if local_candidates
+                else None
             )
+            if local_category is not None:
+                category_intervals[local_category].append((start, end))
             is_backward_compute = any(
                 any(
                     backward[1] <= float(cpu_event.get("ts", 0.0))
@@ -324,7 +368,7 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
                 )
                 for cpu_event in correlated_cpu_events
             )
-            if is_backward_compute and not is_hook_local:
+            if is_backward_compute and local_category is None:
                 compute_intervals.append((start, end))
     launch_metrics: dict[str, dict[str, int]] = defaultdict(
         lambda: {"count": 0, "message_bytes": 0}
@@ -340,7 +384,7 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
         launch_metrics[category]["message_bytes"] += message_bytes
         collective_launches.append({
             "category": category,
-            "operation": "broadcast" if category == "arc_seed" else "all_reduce",
+            "operation": _OPERATION_BY_CATEGORY.get(category, "all_reduce"),
             "message_bytes": message_bytes,
             "start_us": _start,
         })
@@ -351,6 +395,7 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
         item = groups[category]
         launches = launch_metrics.get(category)
         collectives.append({"category": category, "kernel_count": item["kernel_count"],
+                            "operation": _OPERATION_BY_CATEGORY.get(category, "all_reduce"),
                             "launch_count": (launches["count"] if launches else item["kernel_count"]),
                             "duration_ms": item["duration_us"] / 1000.0,
                             "message_bytes": (launches["message_bytes"] if launches else item["message_bytes"])})
@@ -366,6 +411,20 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
         for category in _GRADIENT_COLLECTIVES
         for interval in category_intervals.get(category, [])
     ]
+    greedylore_collective_intervals = [
+        interval
+        for category in _GREEDY_LORE_COLLECTIVES
+        for interval in category_intervals.get(category, [])
+    ]
+    greedylore_local_intervals = [
+        interval
+        for category in _GREEDY_LORE_LOCAL_CATEGORIES
+        for interval in category_intervals.get(category, [])
+    ]
+    greedylore_future_ends = [
+        end for category, _start, end, _corr, _event in ranges
+        if category == "greedylore_hook_future_complete"
+    ]
     last_compute_end = max((end for _start, end in compute_intervals), default=None)
     exposed_gradient_tail_us = (
         _interval_union(
@@ -380,6 +439,14 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
     backward_end = max((item[2] for item in backward_ranges), default=None)
     first_arc_start = min((start for start, _end in arc_intervals), default=None)
     last_arc_end = max((end for _start, end in arc_intervals), default=None)
+    compressor_end = max(
+        [
+            end for _start, end in greedylore_collective_intervals
+        ] + [
+            end for _start, end in greedylore_local_intervals
+        ] + greedylore_future_ends,
+        default=None,
+    )
     return {
         "nccl_kernel_time_ms": sum(item["duration_ms"] for item in collectives),
         "raw_nccl_total_ms": sum(item["duration_ms"] for item in collectives),
@@ -393,6 +460,16 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
             _overlap(arc_intervals, compute_intervals) / 1000.0
         ),
         "exposed_gradient_sync_tail_ms": exposed_gradient_tail_us / 1000.0,
+        "compressor_critical_path_tail_ms": (
+            max(0.0, compressor_end - last_compute_end) / 1000.0
+            if last_compute_end is not None and compressor_end is not None
+            else None if last_compute_end is None else 0.0
+        ),
+        "gpu_ranges_ms": {
+            category: _interval_union(category_intervals.get(category, [])) / 1000.0
+            for category in sorted(_HOOK_LOCAL_CATEGORIES)
+            if category_intervals.get(category)
+        },
         "first_arc_collective_from_backward_start_ms": (
             (first_arc_start - backward_start) / 1000.0
             if first_arc_start is not None and backward_start is not None

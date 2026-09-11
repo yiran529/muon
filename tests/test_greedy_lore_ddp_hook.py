@@ -1,5 +1,7 @@
 """Single-rank reconstruction tests for the GreedyLore DDP communication hook."""
 
+import inspect
+
 import torch
 import pytest
 
@@ -269,7 +271,41 @@ def test_dense_only_compressed_bucket_launches_one_dense_reduction_and_stops():
 
 
 def test_registered_hook_callback_path_avoids_forbidden_synchronization():
-    source = hook_module.__loader__.get_source(hook_module.__name__)
+    callback_path = (
+        hook_module.greedy_lore_ddp_hook,
+        hook_module.GreedyLoreDDPState.note_bucket,
+        hook_module.GreedyLoreDDPState.execution_stream,
+        hook_module._future_devices,
+        hook_module._profile_range,
+        hook_module._tensor_bytes,
+        hook_module._collective_profile_range,
+        hook_module._bucket_profile_metadata,
+        hook_module.bridge_future,
+        hook_module._future_tensor,
+        hook_module.enqueue_bucket_chain,
+        hook_module._all_reduce_future,
+        hook_module._broadcast_future,
+        hook_module._on_bucket_execution_stream,
+        hook_module._on_bucket_execution_stream_result,
+        hook_module._matrix_entries,
+        hook_module._stable_matrix_entries,
+        hook_module._prepare_refresh_buffer,
+        hook_module._divide_completed_buffer,
+        hook_module._refresh_local_svd,
+        hook_module._launch_dense_bucket,
+        hook_module._launch_refresh_bucket,
+        hook_module._parameter_spec_for_dense,
+        hook_module._ordered_compressed_entries,
+        hook_module._prepare_score_plus_aux_buffer,
+        hook_module._select_projector_profiled,
+        hook_module._compress_local_profiled,
+        hook_module._prepare_factor_buffer,
+        hook_module._copy_averaged_dense_aux,
+        hook_module._reconstruct_compressed_matrices,
+        hook_module._mark_future_complete,
+        hook_module._launch_compressed_bucket,
+    )
+    source = "\n".join(inspect.getsource(function) for function in callback_path)
 
     assert "Work.wait" not in source
     assert "torch.cuda.synchronize" not in source

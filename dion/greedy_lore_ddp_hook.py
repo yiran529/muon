@@ -1,6 +1,8 @@
 """Stable state and lifecycle for the GreedyLore DDP communication hook."""
 
+import json
 import threading
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Literal, Sequence
 
@@ -8,13 +10,13 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
+from torch.profiler import record_function
 from torch.nn import Parameter
 
 from .greedy_lore import (
     GreedyLoreConfig,
     MatrixOrientation,
     approximate_signed_lambda,
-    compress_local,
     compressed_phase,
     corrected_gradient,
     derive_greedy_lore_seed,
@@ -95,6 +97,83 @@ def _completed_future(device: torch.device) -> torch.futures.Future:
     future = torch.futures.Future(devices=_future_devices(device))
     future.set_result(None)
     return future
+
+
+def _profile_range(name: str, **metadata: Any):
+    return record_function(name, args=json.dumps(metadata, sort_keys=True))
+
+
+def _tensor_bytes(tensor: Tensor) -> int:
+    return int(tensor.numel() * tensor.element_size())
+
+
+@contextmanager
+def _collective_profile_range(
+    category: str,
+    operation: str,
+    tensor: Tensor,
+    *,
+    bytes: int | None = None,
+    numel: int | None = None,
+):
+    payload_bytes = _tensor_bytes(tensor) if bytes is None else int(bytes)
+    logical_numel = int(tensor.numel()) if numel is None else int(numel)
+    observe_collective(
+        category,
+        operation,
+        tensor,
+        bytes=payload_bytes,
+        numel=logical_numel,
+    )
+    with _profile_range(
+        category,
+        operation=operation,
+        bytes=payload_bytes,
+        numel=logical_numel,
+    ):
+        with _profile_range(
+            f"{category}/payload bytes={payload_bytes}",
+            operation=operation,
+            bytes=payload_bytes,
+            numel=logical_numel,
+        ):
+            yield
+
+
+def _bucket_profile_metadata(state: "GreedyLoreDDPState", context: "BucketContext"):
+    matrix_bytes = 0
+    dense_bytes = 0
+    score_numel = 0
+    factor_numel = 0
+    basis_bytes = 0
+    for gradient, parameter_state in zip(context.gradients, context.parameter_states):
+        if parameter_state is None:
+            dense_bytes += _tensor_bytes(gradient)
+            score_numel += gradient.numel()
+            continue
+        matrix_bytes += _tensor_bytes(gradient)
+        rows, columns = parameter_state.orientation.compressed_shape
+        score_numel += rows
+        factor_numel += state.config.rank * columns
+        if (
+            context.phase is not None
+            and is_refresh_step(context.step, state.config)
+            and state.config.basis_sync == "broadcast"
+        ):
+            basis_bytes += _tensor_bytes(parameter_state.basis)
+    phase = "warmup"
+    if context.phase is not None:
+        phase = "refresh" if is_refresh_step(context.step, state.config) else "compressed"
+    return {
+        "bucket_bytes": _tensor_bytes(context.buffer),
+        "matrix_bytes": matrix_bytes,
+        "dense_aux_bytes": dense_bytes,
+        "score_bytes": score_numel * 4 if phase == "compressed" else 0,
+        "factor_bytes": factor_numel * 4 if phase == "compressed" else 0,
+        "basis_bytes": basis_bytes,
+        "parameter_count": len(context.parameters),
+        "phase": phase,
+    }
 
 
 class GreedyLoreDDPState:
@@ -732,13 +811,13 @@ def _all_reduce_future(
     category: str,
 ) -> torch.futures.Future:
     if state.process_group is not None and state.world_size > 1:
-        observe_collective(category, "all_reduce", tensor)
-        return dist.all_reduce(
-            tensor,
-            op=dist.ReduceOp.SUM,
-            group=state.process_group,
-            async_op=True,
-        ).get_future()
+        with _collective_profile_range(category, "all_reduce", tensor):
+            return dist.all_reduce(
+                tensor,
+                op=dist.ReduceOp.SUM,
+                group=state.process_group,
+                async_op=True,
+            ).get_future()
     future = torch.futures.Future(devices=_future_devices(tensor.device))
     future.set_result(tensor)
     return future
@@ -750,13 +829,13 @@ def _broadcast_future(
     category: str,
 ) -> torch.futures.Future:
     if state.process_group is not None and state.world_size > 1:
-        observe_collective(category, "broadcast", tensor)
-        return dist.broadcast(
-            tensor,
-            src=state.group_ranks[0],
-            group=state.process_group,
-            async_op=True,
-        ).get_future()
+        with _collective_profile_range(category, "broadcast", tensor):
+            return dist.broadcast(
+                tensor,
+                src=state.group_ranks[0],
+                group=state.process_group,
+                async_op=True,
+            ).get_future()
     future = torch.futures.Future(devices=_future_devices(tensor.device))
     future.set_result(tensor)
     return future
@@ -846,12 +925,13 @@ def _refresh_local_svd(
     completed: torch.futures.Future,
 ) -> Tensor:
     _divide_completed_buffer(state, completed.value())
-    for gradient, parameter_state in _matrix_entries(context):
-        global_corrected = orient_matrix(gradient, parameter_state.orientation)
-        basis, _, support = refresh_basis(global_corrected, state.config.rank)
-        parameter_state.basis.copy_(basis)
-        parameter_state.last_support.copy_(support)
-        parameter_state.error.zero_()
+    with _profile_range("greedylore_hook/local_svd"):
+        for gradient, parameter_state in _matrix_entries(context):
+            global_corrected = orient_matrix(gradient, parameter_state.orientation)
+            basis, _, support = refresh_basis(global_corrected, state.config.rank)
+            parameter_state.basis.copy_(basis)
+            parameter_state.last_support.copy_(support)
+            parameter_state.error.zero_()
     return context.buffer
 
 
@@ -898,13 +978,22 @@ def _launch_refresh_bucket(
             _divide_completed_buffer(state, completed.value())
             futures = []
             for gradient, parameter_state in _stable_matrix_entries(context):
-                if state.global_rank == state.group_ranks[0]:
-                    global_corrected = orient_matrix(
-                        gradient,
-                        parameter_state.orientation,
-                    )
-                    basis, _, _ = refresh_basis(global_corrected, state.config.rank)
-                    parameter_state.basis.copy_(basis)
+                range_context = (
+                    _profile_range("greedylore_hook/local_svd")
+                    if state.global_rank == state.group_ranks[0]
+                    else nullcontext()
+                )
+                with range_context:
+                    if state.global_rank == state.group_ranks[0]:
+                        global_corrected = orient_matrix(
+                            gradient,
+                            parameter_state.orientation,
+                        )
+                        basis, _, _ = refresh_basis(
+                            global_corrected,
+                            state.config.rank,
+                        )
+                        parameter_state.basis.copy_(basis)
                 parameter_state.last_support.copy_(
                     torch.arange(
                         state.config.rank,
@@ -977,72 +1066,90 @@ def _prepare_score_plus_aux_buffer(
     state: GreedyLoreDDPState,
     context: BucketContext,
 ) -> tuple[Tensor, list[CompressedMatrixWork], list[tuple[Tensor, int, int]]]:
-    chunks = []
-    matrix_work = []
-    dense_ranges = []
-    offset = 0
-    if context.phase is None:
-        raise GreedyLoreStateError("compressed score packing requires a phase")
-    for gradient, parameter_state, _parameter, _stable_id in _ordered_compressed_entries(
-        state,
-        context,
-    ):
-        if parameter_state is None:
-            flat_dense = gradient.reshape(-1).to(dtype=torch.float32)
-            chunks.append(flat_dense)
-            dense_ranges.append((gradient, offset, flat_dense.numel()))
-            offset += flat_dense.numel()
-            continue
-        corrected = corrected_gradient(
-            gradient,
-            parameter_state.error,
-            parameter_state.orientation,
-        )
-        rows, columns = corrected.shape
-        random_vectors = make_random_vectors(
-            rows=rows,
-            columns=columns,
-            seed=derive_greedy_lore_seed(
-                base_seed=state.config.seed,
-                phase=context.phase,
-                stable_parameter_id=parameter_state.spec.stable_id,
-            ),
-            device=corrected.device,
-        )
-        signed_lambda = approximate_signed_lambda(
-            corrected,
-            parameter_state.basis,
-            random_vectors,
-        )
-        chunks.append(signed_lambda)
-        matrix_work.append(
-            CompressedMatrixWork(
-                gradient=gradient,
-                parameter_state=parameter_state,
-                corrected=corrected,
-                signed_lambda=signed_lambda,
-                score_offset=offset,
+    with _profile_range("greedylore_hook/score"):
+        chunks = []
+        matrix_work = []
+        dense_ranges = []
+        offset = 0
+        if context.phase is None:
+            raise GreedyLoreStateError("compressed score packing requires a phase")
+        for gradient, parameter_state, _parameter, _stable_id in _ordered_compressed_entries(
+            state,
+            context,
+        ):
+            if parameter_state is None:
+                flat_dense = gradient.reshape(-1).to(dtype=torch.float32)
+                chunks.append(flat_dense)
+                dense_ranges.append((gradient, offset, flat_dense.numel()))
+                offset += flat_dense.numel()
+                continue
+            corrected = corrected_gradient(
+                gradient,
+                parameter_state.error,
+                parameter_state.orientation,
             )
-        )
-        offset += signed_lambda.numel()
-    if not chunks:
-        return (
-            torch.empty(0, dtype=torch.float32, device=context.buffer.device),
-            matrix_work,
-            dense_ranges,
-        )
-    score_plus_aux = torch.cat([chunk.reshape(-1) for chunk in chunks])
-    context.retained.extend([score_plus_aux, matrix_work, dense_ranges])
-    return score_plus_aux, matrix_work, dense_ranges
+            rows, columns = corrected.shape
+            random_vectors = make_random_vectors(
+                rows=rows,
+                columns=columns,
+                seed=derive_greedy_lore_seed(
+                    base_seed=state.config.seed,
+                    phase=context.phase,
+                    stable_parameter_id=parameter_state.spec.stable_id,
+                ),
+                device=corrected.device,
+            )
+            signed_lambda = approximate_signed_lambda(
+                corrected,
+                parameter_state.basis,
+                random_vectors,
+            )
+            chunks.append(signed_lambda)
+            matrix_work.append(
+                CompressedMatrixWork(
+                    gradient=gradient,
+                    parameter_state=parameter_state,
+                    corrected=corrected,
+                    signed_lambda=signed_lambda,
+                    score_offset=offset,
+                )
+            )
+            offset += signed_lambda.numel()
+        if not chunks:
+            return (
+                torch.empty(0, dtype=torch.float32, device=context.buffer.device),
+                matrix_work,
+                dense_ranges,
+            )
+        score_plus_aux = torch.cat([chunk.reshape(-1) for chunk in chunks])
+        context.retained.extend([score_plus_aux, matrix_work, dense_ranges])
+        return score_plus_aux, matrix_work, dense_ranges
 
 
-def _copy_averaged_dense_aux(
-    score_plus_aux: Tensor,
-    dense_ranges: list[tuple[Tensor, int, int]],
+def _select_projector_profiled(
+    state: GreedyLoreDDPState,
+    work: CompressedMatrixWork,
+    averaged_lambda: Tensor,
 ) -> None:
-    for gradient, offset, numel in dense_ranges:
-        averaged = score_plus_aux[offset : offset + numel].view_as(gradient)
-        gradient.copy_(averaged.to(dtype=gradient.dtype))
+    with _profile_range("greedylore_hook/topr"):
+        projector, support = select_projector(
+            work.parameter_state.basis,
+            averaged_lambda,
+            state.config.rank,
+        )
+    work.projector = projector
+    work.support = support
+    work.parameter_state.last_support.copy_(support)
+
+
+def _compress_local_profiled(work: CompressedMatrixWork) -> None:
+    assert work.projector is not None
+    with _profile_range("greedylore_hook/factor"):
+        local_factor = work.projector.mT @ work.corrected
+    with _profile_range("greedylore_hook/error"):
+        next_error = work.corrected - work.projector @ local_factor
+        work.parameter_state.error.copy_(next_error)
+    work.local_factor = local_factor
 
 
 def _prepare_factor_buffer(
@@ -1056,22 +1163,23 @@ def _prepare_factor_buffer(
         averaged_lambda = score_plus_aux[
             work.score_offset : work.score_offset + work.signed_lambda.numel()
         ]
-        projector, support = select_projector(
-            work.parameter_state.basis,
-            averaged_lambda,
-            state.config.rank,
-        )
-        local_factor, next_error = compress_local(work.corrected, projector)
-        work.parameter_state.error.copy_(next_error)
-        work.parameter_state.last_support.copy_(support)
-        work.projector = projector
-        work.support = support
-        work.local_factor = local_factor
+        _select_projector_profiled(state, work, averaged_lambda)
+        _compress_local_profiled(work)
+        assert work.local_factor is not None
         work.factor_offset = offset
-        chunks.append(local_factor.reshape(-1).clone())
-        offset += local_factor.numel()
+        chunks.append(work.local_factor.reshape(-1).clone())
+        offset += work.local_factor.numel()
     factor_buffer = torch.cat(chunks)
     return factor_buffer
+
+
+def _copy_averaged_dense_aux(
+    score_plus_aux: Tensor,
+    dense_ranges: list[tuple[Tensor, int, int]],
+) -> None:
+    for gradient, offset, numel in dense_ranges:
+        averaged = score_plus_aux[offset : offset + numel].view_as(gradient)
+        gradient.copy_(averaged.to(dtype=gradient.dtype))
 
 
 def _reconstruct_compressed_matrices(
@@ -1081,21 +1189,31 @@ def _reconstruct_compressed_matrices(
 ) -> Tensor:
     if state.world_size > 1:
         factor_buffer.div_(state.world_size)
-    for work in matrix_work:
-        assert work.projector is not None
-        assert work.local_factor is not None
-        assert work.factor_offset is not None
-        offset = work.factor_offset
-        averaged_factor = factor_buffer[
-            offset : offset + work.local_factor.numel()
-        ].view_as(work.local_factor)
-        reconstructed = reconstruct_global(work.projector, averaged_factor)
-        work.gradient.copy_(
-            unorient_matrix(reconstructed, work.parameter_state.orientation).to(
-                dtype=work.gradient.dtype
+    with _profile_range("greedylore_hook/reconstruction"):
+        for work in matrix_work:
+            assert work.projector is not None
+            assert work.local_factor is not None
+            assert work.factor_offset is not None
+            offset = work.factor_offset
+            averaged_factor = factor_buffer[
+                offset : offset + work.local_factor.numel()
+            ].view_as(work.local_factor)
+            reconstructed = reconstruct_global(work.projector, averaged_factor)
+            work.gradient.copy_(
+                unorient_matrix(reconstructed, work.parameter_state.orientation).to(
+                    dtype=work.gradient.dtype
+                )
             )
-        )
     return matrix_work[0].gradient.new_empty(0)
+
+
+def _mark_future_complete(future: torch.futures.Future) -> torch.futures.Future:
+    def mark(_completed: torch.futures.Future) -> None:
+        with _profile_range("greedylore_hook/future_complete"):
+            pass
+
+    future.add_done_callback(mark)
+    return future
 
 
 def _launch_compressed_bucket(
@@ -1163,20 +1281,25 @@ def greedy_lore_ddp_hook(
     """Synchronize one DDP bucket through the globally sequenced GreedyLore chain."""
 
     context = state.note_bucket(bucket)
+    with _profile_range(
+        "greedylore_hook/bucket_ready",
+        **_bucket_profile_metadata(state, context),
+    ):
+        pass
     if context.phase is None:
-        return enqueue_bucket_chain(
+        return _mark_future_complete(enqueue_bucket_chain(
             state,
             context,
             lambda current: _launch_dense_bucket(state, current),
-        )
+        ))
     if is_refresh_step(context.step, state.config):
-        return enqueue_bucket_chain(
+        return _mark_future_complete(enqueue_bucket_chain(
             state,
             context,
             lambda current: _launch_refresh_bucket(state, current),
-        )
-    return enqueue_bucket_chain(
+        ))
+    return _mark_future_complete(enqueue_bucket_chain(
         state,
         context,
         lambda current: _launch_compressed_bucket(state, current),
-    )
+    ))
