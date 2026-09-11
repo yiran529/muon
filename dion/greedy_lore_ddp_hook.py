@@ -1281,9 +1281,13 @@ def greedy_lore_ddp_hook(
     """Synchronize one DDP bucket through the globally sequenced GreedyLore chain."""
 
     context = state.note_bucket(bucket)
+    bucket_metadata = _bucket_profile_metadata(state, context)
+    bucket_metadata_suffix = " ".join(
+        f"{key}={value}" for key, value in sorted(bucket_metadata.items())
+    )
     with _profile_range(
-        "greedylore_hook/bucket_ready",
-        **_bucket_profile_metadata(state, context),
+        f"greedylore_hook/bucket_ready {bucket_metadata_suffix}",
+        **bucket_metadata,
     ):
         pass
     if context.phase is None:

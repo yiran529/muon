@@ -377,6 +377,8 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
     for category, _start, _end, _corr, range_event in ranges:
         if category not in _COLLECTIVE_CATEGORIES:
             continue
+        if not _is_cpu_annotation(range_event):
+            continue
         if "/payload " not in str(range_event.get("name", "")):
             continue
         message_bytes = _numeric_arg(range_event, "bytes")
@@ -530,12 +532,33 @@ def summarize_training_trace(trace: Any) -> dict[str, Any]:
     bucket_events = [
         event for event in events
         if event.get("ph") == "X"
-        and str(event.get("name", "")).startswith("arc_hook/bucket_ready")
+        and str(event.get("name", "")).startswith((
+            "arc_hook/bucket_ready",
+            "greedylore_hook/bucket_ready",
+        ))
         and _is_cpu_annotation(event)
     ]
+    arc_bucket_events = [
+        event for event in bucket_events
+        if str(event.get("name", "")).startswith("arc_hook/bucket_ready")
+    ]
+    greedylore_bucket_events = [
+        event for event in bucket_events
+        if str(event.get("name", "")).startswith("greedylore_hook/bucket_ready")
+    ]
     result["bucket_count"] = len(bucket_events)
-    for key in ("bucket_bytes", "arc_bytes", "dense_bytes"):
-        result[key] = sum(_numeric_arg(event, key) for event in bucket_events)
+    result["bucket_bytes"] = sum(_numeric_arg(event, "bucket_bytes") for event in bucket_events)
+    for key in ("arc_bytes", "dense_bytes"):
+        result[key] = sum(_numeric_arg(event, key) for event in arc_bucket_events)
+    for key in (
+        "matrix_bytes",
+        "dense_aux_bytes",
+        "score_bytes",
+        "factor_bytes",
+        "basis_bytes",
+        "parameter_count",
+    ):
+        result[key] = sum(_numeric_arg(event, key) for event in greedylore_bucket_events)
     backward_ranges = [
         event for event in events
         if event.get("ph") == "X"

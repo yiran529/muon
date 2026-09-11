@@ -3,6 +3,8 @@ import subprocess
 
 from pathlib import Path
 
+from dion.greedy_lore import GreedyLoreConfig, compressed_phase, is_refresh_step
+
 
 REPO = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO / "benchmark/compressed_muon/run_greedy_lore_profiler.sh"
@@ -52,8 +54,8 @@ def test_print_plan_rotates_greedylore_modes_and_parameterizes_resources(tmp_pat
         "rank": 2,
         "update_interval": 4,
         "start_compress_step": 5,
-        "refresh_profile_step": 6,
-        "compressed_profile_step": 7,
+        "refresh_profile_step": 5,
+        "compressed_profile_step": 6,
     }
     assert plan["gpu_list"] == "1,3"
     assert plan["exclude_gpus"] == "0"
@@ -81,6 +83,97 @@ def test_print_plan_rotates_greedylore_modes_and_parameterizes_resources(tmp_pat
         "dense-timing-r2",
     ]
     assert "CUDA_VISIBLE_DEVICES=0" not in json.dumps(plan)
+
+
+def test_print_plan_profiles_exact_refresh_then_nonrefresh_lifecycle_step():
+    plan = json.loads(_plan(
+        "--world-size", "1",
+        "--global-batch-size", "1",
+        "--device-batch-size", "1",
+        "--timing-warmup-steps", "5",
+        "--measured-full-periods", "2",
+        "--greedy-lore-update-interval", "2",
+    ).stdout)
+
+    greedy_lore = plan["greedy_lore"]
+    config = GreedyLoreConfig(
+        start_compress_step=greedy_lore["start_compress_step"],
+        update_interval=greedy_lore["update_interval"],
+    )
+    # train.py's begin_step assigns active step s + 1 before loop step s.
+    refresh_loop_step = greedy_lore["refresh_profile_step"]
+    compressed_loop_step = greedy_lore["compressed_profile_step"]
+    assert refresh_loop_step == 5
+    assert compressed_loop_step == 6
+    assert compressed_phase(refresh_loop_step + 1, config.start_compress_step) == 0
+    assert is_refresh_step(refresh_loop_step + 1, config)
+    assert compressed_phase(compressed_loop_step + 1, config.start_compress_step) == 1
+    assert not is_refresh_step(compressed_loop_step + 1, config)
+
+
+def _run_normal(*args):
+    return subprocess.run(
+        ["bash", str(LAUNCHER), *args],
+        cwd=REPO,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _minimal_run_args(artifact_root):
+    return (
+        "--world-size", "1",
+        "--global-batch-size", "1",
+        "--device-batch-size", "1",
+        "--artifact-root", str(artifact_root),
+    )
+
+
+def test_normal_run_refuses_existing_nonempty_artifact_root(tmp_path):
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    sentinel = artifact_root / "sentinel.txt"
+    sentinel.write_text("keep me\n")
+
+    completed = _run_normal(*_minimal_run_args(artifact_root))
+
+    assert completed.returncode == 73
+    assert "refusing" in completed.stderr
+    assert sentinel.read_text() == "keep me\n"
+    assert not (artifact_root / "started_at.txt").exists()
+    assert not (artifact_root / "plan.json").exists()
+
+
+def test_normal_run_refuses_existing_started_artifact_root(tmp_path):
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    sentinel = artifact_root / "started_at.txt"
+    sentinel.write_text("original\n")
+
+    completed = _run_normal(*_minimal_run_args(artifact_root))
+
+    assert completed.returncode == 73
+    assert sentinel.read_text() == "original\n"
+    assert not (artifact_root / "plan.json").exists()
+
+
+def test_normal_run_refuses_artifact_root_symlink(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    sentinel = target / "sentinel.txt"
+    sentinel.write_text("keep me\n")
+    artifact_root = tmp_path / "artifacts-link"
+    artifact_root.symlink_to(target, target_is_directory=True)
+
+    completed = _run_normal(*_minimal_run_args(artifact_root))
+
+    assert completed.returncode == 73
+    assert "refusing" in completed.stderr
+    assert artifact_root.is_symlink()
+    assert sentinel.read_text() == "keep me\n"
+    assert not (target / "started_at.txt").exists()
+    assert not (target / "plan.json").exists()
 
 
 def test_print_plan_rejects_nondivisible_greedylore_global_batch():

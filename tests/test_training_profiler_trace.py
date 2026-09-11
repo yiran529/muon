@@ -137,6 +137,31 @@ def test_hook_collectives_are_classified_explicitly_and_report_bucket_metrics():
     assert result["exposed_gradient_sync_tail_ms"] == pytest.approx(0.10)
 
 
+def test_training_summary_reports_greedylore_bucket_payload_totals():
+    trace = {"traceEvents": [
+        {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 2000},
+        {"ph": "X", "name": "greedylore_hook/bucket_ready "
+         "basis_bytes=128 bucket_bytes=176 dense_aux_bytes=80 "
+         "factor_bytes=24 matrix_bytes=96 parameter_count=3 "
+         "phase=compressed score_bytes=12", "cat": "user_annotation",
+         "ts": 200, "dur": 2},
+    ]}
+
+    result = summarize_training_trace(trace)
+
+    assert result["bucket_count"] == 1
+    assert result["bucket_bytes"] == 176
+    assert result["arc_bytes"] == 0
+    assert result["dense_bytes"] == 0
+    assert result["matrix_bytes"] == 96
+    assert result["dense_aux_bytes"] == 80
+    assert result["score_bytes"] == 12
+    assert result["factor_bytes"] == 24
+    assert result["basis_bytes"] == 128
+    assert result["parameter_count"] == 3
+    assert result["cpu_ranges_ms"]["greedylore_hook_bucket_ready"] == pytest.approx(0.002)
+
+
 def test_host_backward_containment_does_not_fake_gpu_compute_overlap():
     trace = {"traceEvents": [
         {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 2000},

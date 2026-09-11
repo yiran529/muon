@@ -122,6 +122,36 @@ def test_greedylore_collectives_payloads_operations_and_local_gpu_ranges():
     assert result["compressor_critical_path_tail_ms"] == pytest.approx(0.591)
 
 
+def test_gpu_user_annotation_payload_mirror_is_not_counted_as_a_second_launch():
+    trace = {"traceEvents": [
+        {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 1000},
+        {"ph": "X", "name": "greedylore_hook/dense/payload bytes=128", "cat": "cpu_op",
+         "ts": 100, "dur": 20, "args": {"External id": 7}},
+        {"ph": "X", "name": "greedylore_hook/dense/payload bytes=128",
+         "cat": "gpu_user_annotation", "ts": 100, "dur": 20,
+         "args": {"External id": 7}},
+        _kernel("ncclDevKernel_AllReduce", 110, 40, 7),
+    ]}
+
+    result = summarize_training_trace(trace)
+
+    assert result["collective_launches"] == [{
+        "category": "greedylore_hook_dense",
+        "operation": "all_reduce",
+        "message_bytes": 128,
+        "start_us": 100.0,
+    }]
+    assert next(item for item in result["collectives"]
+                if item["category"] == "greedylore_hook_dense") == {
+        "category": "greedylore_hook_dense",
+        "kernel_count": 1,
+        "operation": "all_reduce",
+        "launch_count": 1,
+        "duration_ms": pytest.approx(0.04),
+        "message_bytes": 128,
+    }
+
+
 def test_compressor_tail_is_none_without_genuine_backward_gpu_kernel():
     trace = {"traceEvents": [
         {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 1000},
@@ -199,7 +229,13 @@ def test_hook_emits_bucket_collective_and_local_record_function_ranges(monkeypat
         set_active_observer(None)
 
     entered = [name for kind, name, _args in RecordingRange.calls if kind == "enter"]
-    assert "greedylore_hook/bucket_ready" in entered
+    bucket_ready = [name for name in entered
+                    if name.startswith("greedylore_hook/bucket_ready")]
+    assert len(bucket_ready) == 1
+    assert "bucket_bytes=" in bucket_ready[0]
+    assert "matrix_bytes=" in bucket_ready[0]
+    assert "dense_aux_bytes=" in bucket_ready[0]
+    assert "phase=" in bucket_ready[0]
     assert "greedylore_hook/score" in entered
     assert "greedylore_hook/topr" in entered
     assert "greedylore_hook/factor" in entered

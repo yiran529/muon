@@ -64,8 +64,8 @@ if ((timing_warmup_steps < 1 || measured_full_periods < 1 || greedy_lore_update_
     exit 64
 fi
 grad_accum_steps=$((global_batch_size / denominator))
-refresh_profile_step=$((timing_warmup_steps + 1))
-compressed_profile_step=$((timing_warmup_steps + 2))
+refresh_profile_step="$timing_warmup_steps"
+compressed_profile_step=$((timing_warmup_steps + 1))
 timing_num_iterations=$((timing_warmup_steps + measured_full_periods * greedy_lore_update_interval))
 val_tokens=$((world_size * device_batch_size * sequence_length))
 artifact_root="${artifact_root:-$repo_dir/artifacts/compressed_muon/CM-greedylore-profiler-ws${world_size}}"
@@ -164,11 +164,13 @@ if [[ "$mode" == "summarize" ]]; then
     exit 0
 fi
 
-mkdir -p "$artifact_root"
-if [[ -e "$artifact_root/started_at.txt" ]]; then
-    printf 'refusing to overwrite existing run: %s\n' "$artifact_root" >&2
-    exit 73
+if [[ -e "$artifact_root" || -L "$artifact_root" ]]; then
+    if [[ -L "$artifact_root" || ! -d "$artifact_root" || -n "$(find "$artifact_root" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+        printf 'refusing to overwrite existing artifact root: %s\n' "$artifact_root" >&2
+        exit 73
+    fi
 fi
+mkdir -p "$artifact_root"
 timestamp > "$artifact_root/started_at.txt"
 print_plan > "$artifact_root/plan.json"
 
