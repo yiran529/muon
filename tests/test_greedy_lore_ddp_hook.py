@@ -5,6 +5,7 @@ import inspect
 import torch
 import pytest
 
+from dion.collective_observer import CollectiveObserver, set_active_observer
 from dion.greedy_lore import (
     GreedyLoreConfig,
     approximate_signed_lambda,
@@ -255,19 +256,76 @@ def test_compressed_step_reduces_signed_scores_before_square_and_updates_local_e
     torch.testing.assert_close(bucket.gradients()[1], expected_dense)
 
 
-def test_dense_only_compressed_bucket_launches_one_dense_reduction_and_stops():
+def test_compressed_dense_only_bucket_metadata_has_no_matrix_payload():
+    dense = torch.nn.Parameter(torch.zeros(3))
+    bucket = FakeGradBucket([dense], [torch.ones_like(dense)])
+    state = _state([(dense, "dense", "dense_aux")], start_compress_step=0)
+    state.committed_step = 1
+
+    state.begin_step()
+    context = state.note_bucket(bucket)
+    metadata = hook_module._bucket_profile_metadata(state, context)
+
+    assert metadata["matrix_bytes"] == 0
+    assert metadata["dense_aux_bytes"] == 12
+    assert metadata["score_bytes"] == 0
+    assert metadata["factor_bytes"] == 0
+    assert metadata["basis_bytes"] == 0
+
+
+def test_compressed_mixed_bucket_metadata_includes_aux_and_signed_scores():
+    matrix = torch.nn.Parameter(torch.zeros(2, 3))
+    dense = torch.nn.Parameter(torch.zeros(2))
+    bucket = FakeGradBucket(
+        [matrix, dense], [torch.ones_like(matrix), torch.ones_like(dense)]
+    )
+    state = _state(
+        [(matrix, "matrix", "matrix"), (dense, "dense", "dense_aux")],
+        start_compress_step=0,
+    )
+    state.committed_step = 1
+
+    state.begin_step()
+    context = state.note_bucket(bucket)
+    metadata = hook_module._bucket_profile_metadata(state, context)
+
+    assert metadata["matrix_bytes"] == 24
+    assert metadata["dense_aux_bytes"] == 8
+    # Two dense auxiliary values plus one signed score per matrix row.
+    assert metadata["score_bytes"] == 16
+    assert metadata["factor_bytes"] == 12
+
+
+def test_dense_only_compressed_bucket_launches_one_dense_reduction_and_stops(monkeypatch):
     dense = torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16))
     gradient = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
     bucket = FakeGradBucket([dense], [gradient])
     state = _state([(dense, "dense", "dense_aux")], start_compress_step=0)
     state.committed_step = 1
+    observer = CollectiveObserver()
 
-    state.begin_step()
-    result = greedy_lore_ddp_hook(state, bucket).wait()
-    state.finish_step()
+    def fake_all_reduce(current_state, tensor, category):
+        with hook_module._collective_profile_range(category, "all_reduce", tensor):
+            pass
+        future = torch.futures.Future()
+        future.set_result(tensor)
+        return future
+
+    monkeypatch.setattr(hook_module, "_all_reduce_future", fake_all_reduce)
+
+    set_active_observer(observer)
+    try:
+        state.begin_step()
+        result = greedy_lore_ddp_hook(state, bucket).wait()
+        state.finish_step()
+    finally:
+        set_active_observer(None)
 
     assert result.dtype == torch.bfloat16
     torch.testing.assert_close(result, gradient)
+    assert observer.signature() == [
+        ("greedylore_hook/dense", "all_reduce", 3, "bfloat16", 6)
+    ]
 
 
 def test_registered_hook_callback_path_avoids_forbidden_synchronization():

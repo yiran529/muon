@@ -550,15 +550,30 @@ def summarize_training_trace(trace: Any) -> dict[str, Any]:
     result["bucket_bytes"] = sum(_numeric_arg(event, "bucket_bytes") for event in bucket_events)
     for key in ("arc_bytes", "dense_bytes"):
         result[key] = sum(_numeric_arg(event, key) for event in arc_bucket_events)
-    for key in (
-        "matrix_bytes",
-        "dense_aux_bytes",
-        "score_bytes",
-        "factor_bytes",
-        "basis_bytes",
-        "parameter_count",
-    ):
-        result[key] = sum(_numeric_arg(event, key) for event in greedylore_bucket_events)
+    bucket_totals = {
+        key: 0
+        for key in (
+            "matrix_bytes",
+            "dense_aux_bytes",
+            "score_bytes",
+            "factor_bytes",
+            "basis_bytes",
+            "parameter_count",
+        )
+    }
+    for event in greedylore_bucket_events:
+        matrix_bytes = _numeric_arg(event, "matrix_bytes")
+        bucket_totals["matrix_bytes"] += matrix_bytes
+        bucket_totals["dense_aux_bytes"] += _numeric_arg(event, "dense_aux_bytes")
+        bucket_totals["parameter_count"] += _numeric_arg(event, "parameter_count")
+        # Older hook traces counted dense auxiliary values in score_bytes even
+        # when the bucket took the dense fallback and had no score collective.
+        # Normalize those legacy annotations while preserving mixed-bucket
+        # score-plus-aux payloads and all actual collective payload ranges.
+        if matrix_bytes:
+            for key in ("score_bytes", "factor_bytes", "basis_bytes"):
+                bucket_totals[key] += _numeric_arg(event, key)
+    result.update(bucket_totals)
     backward_ranges = [
         event for event in events
         if event.get("ph") == "X"

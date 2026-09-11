@@ -146,10 +146,12 @@ def _bucket_profile_metadata(state: "GreedyLoreDDPState", context: "BucketContex
     score_numel = 0
     factor_numel = 0
     basis_bytes = 0
+    has_matrix = any(parameter_state is not None for parameter_state in context.parameter_states)
     for gradient, parameter_state in zip(context.gradients, context.parameter_states):
         if parameter_state is None:
             dense_bytes += _tensor_bytes(gradient)
-            score_numel += gradient.numel()
+            if has_matrix:
+                score_numel += gradient.numel()
             continue
         matrix_bytes += _tensor_bytes(gradient)
         rows, columns = parameter_state.orientation.compressed_shape

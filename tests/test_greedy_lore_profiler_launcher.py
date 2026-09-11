@@ -130,6 +130,36 @@ def _minimal_run_args(artifact_root):
     )
 
 
+def _write_summarize_only_fixture(root, *, exit_code="0", stdout=None):
+    (root / "plan.json").write_text(json.dumps({
+        "world_size": 1,
+        "cells": ["dense-refresh-r1"],
+        "timing_cells": ["dense-timing-r1"],
+        "require_final_timing": True,
+        "global_batch_size": 1,
+        "sequence_length": 1,
+    }))
+    profile_trace = root / "dense-refresh-r1/profiler/rank-0.json"
+    profile_trace.parent.mkdir(parents=True)
+    profile_trace.write_text(json.dumps({"traceEvents": [
+        {"ph": "X", "name": "train/profile_window", "cat": "user_annotation", "ts": 0, "dur": 1000},
+    ]}))
+    profile_dir = profile_trace.parent.parent
+    (profile_dir / "exit_code.txt").write_text("0\n")
+    (profile_dir / "stdout.log").write_text(
+        "step:1/1 val_loss:1.0 step_avg:10ms\n"
+    )
+    timing_dir = root / "dense-timing-r1"
+    timing_dir.mkdir()
+    (timing_dir / "command.txt").write_text("python train.py\n")
+    (timing_dir / "exit_code.txt").write_text(f"{exit_code}\n")
+    (timing_dir / "finished_at.txt").write_text("2026-09-11T00:00:00+00:00\n")
+    (timing_dir / "stdout.log").write_text(
+        "training finished\n" if stdout is None else stdout
+    )
+    (timing_dir / "stderr.log").write_text("")
+
+
 def test_normal_run_refuses_existing_nonempty_artifact_root(tmp_path):
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir()
@@ -143,6 +173,53 @@ def test_normal_run_refuses_existing_nonempty_artifact_root(tmp_path):
     assert sentinel.read_text() == "keep me\n"
     assert not (artifact_root / "started_at.txt").exists()
     assert not (artifact_root / "plan.json").exists()
+
+
+def test_summarize_only_produces_timing_summary_before_completion(tmp_path):
+    _write_summarize_only_fixture(
+        tmp_path,
+        stdout="step:1/1 val_loss:1.0 step_avg:10ms\nPeak memory consumption: 8 MiB\n",
+    )
+
+    completed = _run_normal(
+        "--artifact-root", str(tmp_path),
+        "--summarize-only",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (tmp_path / "finished_at.txt").read_text().strip()
+    assert "EXPERIMENT_DONE" in (tmp_path / "status.log").read_text()
+    assert json.loads((tmp_path / "timing-summary.json").read_text())["modes"]["dense"]
+
+
+def test_summarize_only_rejects_nonzero_timing_cell(tmp_path):
+    _write_summarize_only_fixture(
+        tmp_path,
+        exit_code="9",
+        stdout="step:1/1 val_loss:1.0 step_avg:10ms\n",
+    )
+
+    completed = _run_normal(
+        "--artifact-root", str(tmp_path),
+        "--summarize-only",
+    )
+
+    assert completed.returncode != 0
+    assert not (tmp_path / "finished_at.txt").exists()
+    assert "SUMMARY_FAILED" in (tmp_path / "status.log").read_text()
+
+
+def test_summarize_only_rejects_timing_cell_without_final_timing(tmp_path):
+    _write_summarize_only_fixture(tmp_path)
+
+    completed = _run_normal(
+        "--artifact-root", str(tmp_path),
+        "--summarize-only",
+    )
+
+    assert completed.returncode != 0
+    assert not (tmp_path / "finished_at.txt").exists()
+    assert "SUMMARY_FAILED" in (tmp_path / "status.log").read_text()
 
 
 def test_normal_run_refuses_existing_started_artifact_root(tmp_path):
