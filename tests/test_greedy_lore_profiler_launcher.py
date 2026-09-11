@@ -111,6 +111,49 @@ def test_print_plan_profiles_exact_refresh_then_nonrefresh_lifecycle_step():
     assert not is_refresh_step(compressed_loop_step + 1, config)
 
 
+def test_print_plan_filters_profile_and_timing_modes_independently():
+    plan = json.loads(_plan(
+        "--repeats", "3",
+        "--profile-modes", "dense,greedylore_local_svd,greedylore_broadcast",
+        "--timing-modes", "dense,greedylore_local_svd",
+    ).stdout)
+
+    assert plan["profile_modes"] == [
+        "dense",
+        "greedylore_local_svd",
+        "greedylore_broadcast",
+    ]
+    assert plan["timing_modes"] == ["dense", "greedylore_local_svd"]
+    assert len(plan["cells"]) == 18
+    assert len(plan["timing_cells"]) == 6
+    assert not any("broadcast-timing" in cell for cell in plan["timing_cells"])
+    assert plan["timing_cells"] == [
+        "dense-timing-r1",
+        "greedylore_local_svd-timing-r1",
+        "greedylore_local_svd-timing-r2",
+        "dense-timing-r2",
+        "dense-timing-r3",
+        "greedylore_local_svd-timing-r3",
+    ]
+
+
+def test_print_plan_supports_profile_only_preflight():
+    plan = json.loads(_plan(
+        "--profile-modes", "dense,greedylore_local_svd,greedylore_broadcast",
+        "--timing-modes", "none",
+    ).stdout)
+
+    assert len(plan["cells"]) == 6
+    assert plan["timing_cells"] == []
+
+
+def test_print_plan_rejects_unknown_profile_mode():
+    completed = _plan("--profile-modes", "unknown", check=False)
+
+    assert completed.returncode == 64
+    assert "invalid profile mode" in completed.stderr
+
+
 def _run_normal(*args):
     return subprocess.run(
         ["bash", str(LAUNCHER), *args],

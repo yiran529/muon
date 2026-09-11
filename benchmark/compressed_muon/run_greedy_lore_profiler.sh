@@ -18,6 +18,8 @@ timing_warmup_steps=20
 measured_full_periods=1
 bucket_cap_mb=160
 repeats=1
+profile_modes_csv="dense,greedylore_local_svd,greedylore_broadcast"
+timing_modes_csv="dense,greedylore_local_svd,greedylore_broadcast"
 training_seed=42
 greedy_lore_rank=32
 greedy_lore_update_interval=200
@@ -41,6 +43,8 @@ while (($#)); do
         --timing-warmup-steps) timing_warmup_steps="$2"; shift 2 ;;
         --measured-full-periods) measured_full_periods="$2"; shift 2 ;;
         --repeats) repeats="$2"; shift 2 ;;
+        --profile-modes) profile_modes_csv="$2"; shift 2 ;;
+        --timing-modes) timing_modes_csv="$2"; shift 2 ;;
         --training-seed) training_seed="$2"; shift 2 ;;
         --greedy-lore-rank) greedy_lore_rank="$2"; shift 2 ;;
         --greedy-lore-update-interval) greedy_lore_update_interval="$2"; shift 2 ;;
@@ -53,6 +57,37 @@ while (($#)); do
         *) printf 'unknown argument: %s\n' "$1" >&2; exit 64 ;;
     esac
 done
+
+validate_modes() {
+    local raw="$1" label="$2" allow_none="$3" value seen=","
+    local -a values
+    if [[ "$raw" == "none" ]]; then
+        ((allow_none == 1)) && return 0
+        printf '%s modes cannot be none\n' "$label" >&2
+        return 64
+    fi
+    IFS=',' read -ra values <<<"$raw"
+    for value in "${values[@]}"; do
+        case "$value" in
+            dense|greedylore_local_svd|greedylore_broadcast) ;;
+            *) printf 'invalid %s mode: %s\n' "$label" "$value" >&2; return 64 ;;
+        esac
+        if [[ "$seen" == *",$value,"* ]]; then
+            printf 'duplicate %s mode: %s\n' "$label" "$value" >&2
+            return 64
+        fi
+        seen+="$value,"
+    done
+}
+
+validate_modes "$profile_modes_csv" profile 0 || exit $?
+validate_modes "$timing_modes_csv" timing 1 || exit $?
+IFS=',' read -ra profile_modes <<<"$profile_modes_csv"
+if [[ "$timing_modes_csv" == "none" ]]; then
+    timing_modes=()
+else
+    IFS=',' read -ra timing_modes <<<"$timing_modes_csv"
+fi
 
 denominator=$((world_size * device_batch_size))
 if ((world_size < 1 || device_batch_size < 1 || global_batch_size % denominator != 0)); then
@@ -91,20 +126,29 @@ print_plan() {
     COMPRESSED="$compressed_profile_step" WARMUP="$timing_warmup_steps" PERIODS="$measured_full_periods" \
     TIMING_NI="$timing_num_iterations" BUCKET="$bucket_cap_mb" REPS="$repeats" GL_RANK="$greedy_lore_rank" \
     GL_INTERVAL="$greedy_lore_update_interval" GPU_LIST_VALUE="${gpu_list:-dynamic}" EXCLUDED="$exclude_gpus" \
+    PROFILE_MODES="$profile_modes_csv" TIMING_MODES="$timing_modes_csv" \
     ROOT="$artifact_root" "$python_bin" - <<'PY'
 import json
 import os
 
 repeats = int(os.environ["REPS"])
-modes = ("dense", "greedylore_local_svd", "greedylore_broadcast")
+profile_modes = tuple(os.environ["PROFILE_MODES"].split(","))
+timing_modes = (
+    ()
+    if os.environ["TIMING_MODES"] == "none"
+    else tuple(os.environ["TIMING_MODES"].split(","))
+)
 cells = []
 timing_cells = []
 for repeat in range(1, repeats + 1):
-    order = modes[(repeat - 1) % len(modes):] + modes[:(repeat - 1) % len(modes)]
-    for mode in order:
+    profile_offset = (repeat - 1) % len(profile_modes)
+    profile_order = profile_modes[profile_offset:] + profile_modes[:profile_offset]
+    for mode in profile_order:
         cells.append(f"{mode}-refresh-r{repeat}")
         cells.append(f"{mode}-compressed-r{repeat}")
-    for mode in order:
+    timing_offset = (repeat - 1) % len(timing_modes) if timing_modes else 0
+    timing_order = timing_modes[timing_offset:] + timing_modes[:timing_offset]
+    for mode in timing_order:
         timing_cells.append(f"{mode}-timing-r{repeat}")
 print(json.dumps({
     "world_size": int(os.environ["WS"]),
@@ -121,6 +165,8 @@ print(json.dumps({
     "timing_warmup_steps": int(os.environ["WARMUP"]),
     "measured_full_periods": int(os.environ["PERIODS"]),
     "timing_num_iterations": int(os.environ["TIMING_NI"]),
+    "profile_modes": list(profile_modes),
+    "timing_modes": list(timing_modes),
     "greedy_lore": {
         "rank": int(os.environ["GL_RANK"]),
         "update_interval": int(os.environ["GL_INTERVAL"]),
@@ -263,15 +309,14 @@ run_cell() {
 
 run_repeat() {
     local repeat="$1"
-    local modes=(dense greedylore_local_svd greedylore_broadcast)
-    local offset=$(((repeat - 1) % 3))
-    local order=("${modes[@]:$offset}" "${modes[@]:0:$offset}")
-    local mode_name
-    for mode_name in "${order[@]}"; do
+    local index mode_name
+    for ((index=0; index<${#profile_modes[@]}; index++)); do
+        mode_name="${profile_modes[$(((repeat - 1 + index) % ${#profile_modes[@]}))]}"
         run_cell "${mode_name}-refresh-r${repeat}" "$mode_name" refresh profile || exit $?
         run_cell "${mode_name}-compressed-r${repeat}" "$mode_name" compressed profile || exit $?
     done
-    for mode_name in "${order[@]}"; do
+    for ((index=0; index<${#timing_modes[@]}; index++)); do
+        mode_name="${timing_modes[$(((repeat - 1 + index) % ${#timing_modes[@]}))]}"
         run_cell "${mode_name}-timing-r${repeat}" "$mode_name" compressed timing || exit $?
     done
 }
