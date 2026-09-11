@@ -260,3 +260,11 @@ controller 于 `2026-09-11T14:14:06+08:00` 至 `14:27:33+08:00` 在 GPU2/3 完�
 与 CM044 interval2 的 `155.103/208.710 ms` 相比，local-SVD/broadcast 平均 step 分别下降 `89.27%/92.01%`；这确认高频 refresh 是此前极端 slowdown 的重要组成。结论仍为 **negative**：默认 cadence 将 slowdown 从约 17.2× 缩小到约 2.09×，但 tiny 模型仅 1.50% gradient payload 可压缩，普通 compressed step 的逐参数调度、两阶段 latency-bound collective、额外状态和 unchanged Muon result communication 仍足以压过带宽收益。CM045 只隔离 cadence，不支持代表性模型速度或训练质量结论；下一步保持队列中的 ordinary-step same-shape batching 优先级。
 
 artifact：`artifacts/compressed_muon/CM045-m002-greedylore-muon-tiny-interval200-ddp-ws2-s42/`，包含 plan、每 cell command/environment/log/exit/time、36 traces、`summary.json` 与 `timing-summary.json`。
+
+## 2026-09-11：代表性模型 staged timing 计划
+
+用户批准把 interval200 测速扩展到 GPT-60M/130M/350M。为避免 broadcast fallback 和高风险 350M 直接消耗完整 timing 预算，登记 CM046–CM051 并串行设置 gate：60M preflight → 130M preflight → 60M/130M formal timing → 350M preflight → 350M formal timing。preflight 只运行 dense/local-SVD/broadcast 各一个 refresh/compressed profiler cell；formal 只运行 dense/local-SVD 的 3 rotated profiler/timing repeats，timing 为 20 warmup + 200 measured updates，覆盖一个完整 interval200 周期。
+
+60M/130M 复用已有成功的 seq256、global/device batch512/128、GA1 几何；350M 为控制 activation 与完整 basis/error 状态叠加后的 OOM 风险，使用 seq256、global/device batch32/8、GA1。因此只在每个模型内部做 paired ratio，不横向比较三种模型的绝对吞吐。统一使用 4×RTX 4090、rank32、bucket160 MiB、seed42 和 local-SVD 主路径；broadcast 只作为单轮强一致性/通信诊断。launcher 新增独立 `--profile-modes`/`--timing-modes` 过滤，默认行为保持不变，相关 launcher/parser 测试为 `27 passed`。
+
+GPU2–5 启动前均为 `3 MiB`、`0% utilization`，无 compute process；`m002-scale-timing` tmux controller 已按上述 gate 顺序启动。每个 launcher 自行保存 plan、cell command/environment/log/exit/time 和 summary；任一阶段非零退出将通过 `&&` 阻止后续阶段启动，不会在 preflight 失败后继续消耗正式 timing 预算。
