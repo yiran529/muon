@@ -292,5 +292,6 @@ CM051 于 `21:12:26–21:23:27+08:00` 完成，6/6 timing cells exit `0`，日�
 - 论文对齐项：60M/130M 分别使用 10,000/20,000 updates、1,000/2,000 warmup、cosine decay to 10%、clip1；M002 使用 rank32、interval200、step1000 开始压缩、error feedback、`local_svd`。
 - 解释边界：数据仍是 Dion 现有 FineWeb10B，模型仍是 Dion GPT/LLaMA-like 架构，因此这是 paper-aligned M002-on-Muon controlled study，不是论文 C4/AdamW 严格复现；M002 仍只压缩 Muon matrix group，未静默扩展为 all-2D。
 - 执行：`benchmark/compressed_muon/run_cm052_cm053_m002_quality.sh` 自动等待任意 4 张至少有 18 GiB 空闲显存的 GPU，并按 CM052a→CM052b→CM053a→CM053b 串行运行；正式训练不开 Kineto trace。CM052b perplexity 相对 CM052a 若超过 1.10，controller 自动停止，不启动 CM053。
+- 启动状态：2026-09-12 01:32（Asia/Shanghai）在 tmux `cm052_cm053_m002_quality` 启动；当时仅 GPU 7 满足空闲门槛，controller 已进入自动等待。状态与计划位于 `artifacts/compressed_muon/CM052-CM053-m002-paper-aligned-quality-controller/`。
 
 artifact：`artifacts/compressed_muon/CM051-m002-gpt350m-interval200-ddp-ws4-s42/`，包含 `plan.json`、6 个 timing cell 的 command/environment/log/exit/time、空 profile `summary.json` 和 `timing-summary.json`。
