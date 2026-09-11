@@ -55,6 +55,7 @@ class Hyperparameters:
     warmdown_ratio: float = 0.2
     warmup_steps: Optional[int] = None
     lr_schedule: str = "linear"
+    min_lr_ratio: float = 0.0
     timing_warmup_steps: int = 10
 
     # Model config
@@ -234,11 +235,14 @@ def learning_rate_multiplier(it: float, hp: Hyperparameters) -> float:
             return 1.0
         return max(0.0, (hp.num_iterations - it) / warmdown_iters)
     if hp.lr_schedule == "cosine":
+        if not 0.0 <= hp.min_lr_ratio <= 1.0:
+            raise ValueError("min_lr_ratio must be between 0 and 1")
         decay_iters = hp.num_iterations - warmup_iters
         if decay_iters <= 0:
-            return 0.0
+            return hp.min_lr_ratio
         progress = min(1.0, max(0.0, (it - warmup_iters) / decay_iters))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return hp.min_lr_ratio + (1.0 - hp.min_lr_ratio) * cosine
     raise ValueError(f"Unrecognized lr_schedule: {hp.lr_schedule}")
 
 
@@ -359,6 +363,7 @@ def parse_cli_args(configure_parser=None):
     parser.add_argument("--warmdown_ratio", type=float, default=None)
     parser.add_argument("--warmup_steps", type=int, default=None)
     parser.add_argument("--lr_schedule", choices=["linear", "cosine"], default=None)
+    parser.add_argument("--min_lr_ratio", type=float, default=None)
     parser.add_argument("--timing-warmup-steps", type=int, default=None)
     parser.add_argument("--bucket-cap-mb", type=float, default=None)
 

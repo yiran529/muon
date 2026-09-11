@@ -36,6 +36,21 @@ def test_cosine_schedule_uses_exact_warmup_steps():
     assert train.learning_rate_multiplier(8393, hp) == pytest.approx(0.0)
 
 
+def test_cosine_schedule_respects_minimum_lr_ratio():
+    hp = train.Hyperparameters(
+        num_iterations=100,
+        warmup_steps=10,
+        lr_schedule="cosine",
+        min_lr_ratio=0.1,
+    )
+
+    assert train.learning_rate_multiplier(0, hp) == pytest.approx(0.1)
+    assert train.learning_rate_multiplier(9, hp) == pytest.approx(1.0)
+    assert train.learning_rate_multiplier(10, hp) == pytest.approx(1.0)
+    assert train.learning_rate_multiplier(55, hp) == pytest.approx(0.55)
+    assert train.learning_rate_multiplier(100, hp) == pytest.approx(0.1)
+
+
 def test_gradient_norm_helper_clips_only_when_configured():
     unclipped = torch.nn.Parameter(torch.tensor([3.0, 4.0]))
     unclipped.grad = torch.tensor([3.0, 4.0])

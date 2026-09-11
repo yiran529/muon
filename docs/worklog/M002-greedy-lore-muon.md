@@ -285,4 +285,12 @@ CM051 于 `21:12:26–21:23:27+08:00` 完成，6/6 timing cells exit `0`，日�
 
 在该 350M、global/device batch32/8 几何下结果分类为 **positive**：三轮同方向，完整 interval200 周期 step 降低约 16%，但 peak allocated 增加 `2669 MiB`（约 `37.8%`）。尺度趋势为 60M null（`+0.17%`）、130M preliminary-positive（`-1.86%`）、350M positive（`-15.97%`），与更大模型中 transformer Muon matrix 占总 payload 比例上升的方向一致。三种模型 batch geometry 不同，不能横向比较绝对吞吐；三轮 timing 也不能替代多 seed 训练质量与 time-to-quality，尤其不能据此声称 GreedyLore-Muon 已保持 dense Muon 收敛性质。
 
+## 2026-09-12：CM052/CM053 paper-aligned 实际训练计划
+
+- 目的：先在 GPT-60M 和 GPT-130M 上比较 dense Muon 与 M002 local-SVD 的完整训练质量、稳定性和 time-to-quality，不用短 timing 结果替代收敛证据。
+- 公共设置：4×RTX 4090 DDP、BF16 compile、FineWeb10B、seq256、global/device batch512/128、seed1234、validation 每 500 step；Muon matrix 使用 `lr=0.02`、momentum `0.95`、weight decay `0.01`，auxiliary scalar AdamW 使用 `lr=0.001`、betas `(0.9, 0.999)`、eps `1e-8`、weight decay `0`。
+- 论文对齐项：60M/130M 分别使用 10,000/20,000 updates、1,000/2,000 warmup、cosine decay to 10%、clip1；M002 使用 rank32、interval200、step1000 开始压缩、error feedback、`local_svd`。
+- 解释边界：数据仍是 Dion 现有 FineWeb10B，模型仍是 Dion GPT/LLaMA-like 架构，因此这是 paper-aligned M002-on-Muon controlled study，不是论文 C4/AdamW 严格复现；M002 仍只压缩 Muon matrix group，未静默扩展为 all-2D。
+- 执行：`benchmark/compressed_muon/run_cm052_cm053_m002_quality.sh` 自动等待任意 4 张至少有 18 GiB 空闲显存的 GPU，并按 CM052a→CM052b→CM053a→CM053b 串行运行；正式训练不开 Kineto trace。CM052b perplexity 相对 CM052a 若超过 1.10，controller 自动停止，不启动 CM053。
+
 artifact：`artifacts/compressed_muon/CM051-m002-gpt350m-interval200-ddp-ws4-s42/`，包含 `plan.json`、6 个 timing cell 的 command/environment/log/exit/time、空 profile `summary.json` 和 `timing-summary.json`。
