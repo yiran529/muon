@@ -310,3 +310,48 @@ CM037–CM041 更适合描述当前质量配方和长程平均 step time：EF14 
 
 - `artifacts/compressed_muon/CM037-CM039-m001-staged-scalar-adamw-ef14-muon-gpt60m-ws4-s42/`
 - `artifacts/compressed_muon/CM040-CM041-m001-ef14-muon-gpt130m-ws4-s42/`
+
+## CM044：M002 GreedyLore-Muon 最小两卡 evidence gate（2026-09-11）
+
+### 口径与完整性
+
+在独占 GPU 2/3（RTX 4090）上比较 dense Muon、M002 local-SVD 和 M002 broadcast。三者固定 dim64/2 layers/4 heads、FP32 参数/BF16 autocast、seq32、global/device batch4/2、GA1、bucket1 MiB、seed42 和同一 FineWeb10B loader；M002 使用 rank2、update interval2、warmup2。每个模式以 rotated order 完成 3 个 profiler-off timing block，每 block 的 measured window 恰好覆盖 2 个 update，即一个完整 period；另为每 block/mode 分离采集 refresh 与 compressed trace。
+
+27/27 cell exit `0`，18 个 profiler cell 各有 2 份 rank trace（共 36），9 个 timing cell 都有 final timing，日志无 OOM/timeout/traceback marker。summary 的 hook signature rank-exact，所有 trace unattributed NCCL fraction 为 0。第一次 launcher attempt 因 worktree 缺少 dataset path 在 cell 前 fail closed，建立指向已验证共享数据的 symlink 后从空 artifact root 完整重跑；失败 attempt 另存，不混入统计。
+
+### Logical gradient payload
+
+trace 的实际 message size 显示 dense gradient 为 `26,148,864 B/update`。M002 local-SVD 的 refresh 为 `26,148,864 B`，compressed 为 `25,771,008 B`，完整 interval 平均 `25,959,936 B/update`，仅减少 `0.7225%`。broadcast refresh 另有 `196,608 B` full-basis payload，因此 period 平均 `26,058,240 B/update`，相对 dense 只减少 `0.3466%`。Muon result communication 保持独立、未被 M002 压缩。
+
+压缩比例很小不是算法绕过：该 tiny GPT 的 `26,148,864 B` bucket 中只有 `393,216 B` 属于 shared Muon matrix，`25,755,648 B` 是 M002 有意保持 dense 的 embedding/lm-head 等 auxiliary 参数。它说明方法范围与模型几何强烈决定总 payload，不能只用 matrix factor rank 推导整体通信降幅。
+
+### Refresh/compressed trace 归因
+
+以下为 3 个 repeat 的 rank-max 平均，单位 ms；overlap 只与 genuine backward GPU kernels 相交，本 tiny workload 的所有模式均为 `0`。
+
+| 模式/phase | NCCL union | 梯度 collectives | Muon result | SVD/score/factor/error/reconstruct GPU | collective tail | compressor critical-path tail |
+|---|---:|---|---:|---|---:|---:|
+| dense refresh | 4.287 | DDP gradient 2.925 | 1.362 | — | 1.382 | 0.000（parser 输出） |
+| dense compressed | 5.109 | DDP gradient 3.211 | 1.897 | — | 1.529 | 0.000（parser 输出） |
+| local-SVD refresh | 6.929 | corrected dense 2.943 | 4.095 | SVD 10.847 | 1.616 | 212.564 |
+| local-SVD compressed | 8.133 | dense 1.580；score AR 1.643；factor AR 1.452 | 3.582 | score 0.183；factor 0.045；error 0.069；reconstruct 0.054（Top-r 0.110） | 0.364 | 1.808 |
+| broadcast refresh | 223.444 | corrected dense 2.870；basis broadcast 213.579 | 6.996 | SVD 10.484 | 211.489 | 211.499 |
+| broadcast compressed | 145.529 | dense 1.660；score AR 55.680；factor AR 80.475 | 7.717 | score 0.178；factor 0.044；error 0.067；reconstruct 0.051（Top-r 0.106） | 0.000 | 1.343 |
+
+local-SVD refresh 的完整 critical-path tail 远大于 SVD GPU kernel sum，表明 per-parameter launch/host scheduling/Future sequencing 在极小 workload 上主导；这与尚未进行 same-shape batching 的已知限制一致，但 trace 不能把全部差额唯一归因于 batching。broadcast 的 full-basis collectives在 refresh 明确暴露。broadcast compressed 虽无 basis broadcast，collective 时间仍显著高于 local-SVD；本实验没有足够规模/重复去解释该差异为算法固有值。
+
+### Complete-period wall-clock 与显存
+
+| 模式 | repeats step ms | mean / median | sample SD / CV | throughput | peak allocated |
+|---|---|---:|---:|---:|---:|
+| dense | 8.54 / 8.86 / 9.73 | 9.043 / 8.860 ms | 0.616 ms / 6.81% | 14,197 tok/s | 193 MiB |
+| local-SVD | 155.95 / 154.00 / 155.36 | 155.103 / 155.360 ms | 1.000 ms / 0.64% | 825 tok/s | 225 MiB |
+| broadcast | 207.08 / 211.15 / 207.90 | 208.710 / 207.900 ms | 2.153 ms / 1.03% | 613 tok/s | 225 MiB |
+
+按相同 repeat 配对，local-SVD 相对 dense 平均增加 `146.06 ms`/`1620.3%`，paired bootstrap mean-difference 95% interval 为 `[145.14, 147.41] ms`；broadcast 相对 dense增加 `199.67 ms`/`2214.9%`，interval `[198.17, 202.29] ms`。local-SVD 相对 broadcast 少 `53.61 ms`/`25.68%`，interval `[-57.15,-51.13] ms`。两种 M002 的 peak allocated 都比 dense 多 `32 MiB`（`16.58%`）。区间不跨 0 且差异远大于 2%，故按预登记规则不扩到 10 blocks；dense CV 6.81% 仍提示 tiny denominator 易受固定开销/抖动影响。
+
+### 结论边界
+
+CM044 分类为 **negative**：在该 tiny 单机负载，M002 只有 `0.72%`（broadcast `0.35%`）logical gradient payload reduction，却显著增加 measured collective/exposed work、complete-period wall-clock 和 peak memory。该结果不证明较大 shared-Muon-matrix 比例或不同网络下也为负，也不证明 GreedyLore-Muon 等价于 dense Muon；它只足以拒绝在当前证据上宣称加速，并阻止条件性的 10,000-update paper-oriented run。
+
+原始产物：`artifacts/compressed_muon/CM044-m002-greedylore-muon-tiny-ddp-ws2-s42/`，包括 plan、每 cell command/controller environment/stdout/stderr/exit、36 traces、`summary.json`、`timing-summary.json` 与 timing parser。注意 `environment.txt` 是 controller snapshot；精确 per-command CUDA/PYTHONPATH/NCCL override 以各 cell `command.txt` 为准。
