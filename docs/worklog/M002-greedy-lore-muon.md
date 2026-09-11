@@ -199,3 +199,37 @@ done
 ## 2026-09-11：最终相关回归
 
 按 Task 10 Step 8 命令并增加 worktree 必需的 `PYTHONPATH=.`，运行 GreedyLore tensor/oracle/layout/state/Future/hook/checkpoint、训练集成、ARC hook、optimizer、training profiler 与 config 测试。结果为 `278 passed, 0 failed, 0 skipped, 14 warnings in 282.99s`，exit `0`；warnings 仍是既有 `torch.jit.script_method` deprecation。精确命令、raw log、exit 与时间戳位于 `artifacts/compressed_muon/M002-task10-final-20260911/final-regression.*`。
+
+## 2026-09-11：最终审查状态与性能诊断
+
+### 合并阻塞项
+
+- **P0 / evidence fail-closed**：timing parser 会从日志中选择最后一个“能被当前正数正则识别”的 `step_avg`。若日志先有合法值，随后以 malformed、负数、`NaN` 或 `Inf` 的 `step_avg` 结束，坏的末标记会被忽略，较早合法值仍可使 `--summarize-only` 成功。最终 scoped re-review 将此判为未完全修复的 Important finding。必须先让 parser 识别所有 `step_avg` 标记并显式拒绝非法末值，再补 malformed/negative/non-finite terminal-marker 回归，分支才可视为 merge-ready。
+- 该缺陷不改变 CM044 数字：现有 9/9 timing cell 的末标记均已逐一核验为有限正数，27/27 cell exit 0，原始 trace/log 未被最终修复重写。
+
+### 非阻塞待优化/工程债
+
+- **P1 / 性能**：把相同 compressed shape 的 score、factor、error 与 reconstruction 做真正的 batch，并优先复用持久 packing/workspace，减少当前 14 个矩阵逐参数的 Python、kernel-launch 和临时分配开销。
+- **P1 / 测量**：在独占四卡、代表性 GPT-60M、默认量级 `update_interval=200` 上重跑完整周期；先确认 shared Muon matrix 占总梯度 payload 的比例足够大，再判断优化后的 hook 是否值得做长质量实验。
+- **P1 / 独立消融**：若要压缩二维 embedding/lm-head，必须注册为 all-2D GreedyLore 消融；它会改变通信量、SVD 成本、optimizer coverage 与方法含义，不能静默改变 M002 的 transformer-Muon-matrix-only 边界。
+- **P2 / 并发**：首版为安全性使用一条全局 cross-bucket Future tail。只有在 batched local math 稳定后，才评估按 bucket/shape 放宽串行化；必须继续保证所有 rank collective 顺序一致。
+- **P2 / checkpoint**：直接 `load_state_dict()` 的 late committed-step/replicated-state validation 可能在损坏 payload 下留下部分本地写入；这符合当前 DCP corruption carve-out，但不是事务式恢复。
+- **P2 / evidence schema**：新 `timing-summary.json` 保留 aggregate throughput，但缺旧 parser 的 per-cell `throughput_tokens_per_second`；恢复字段以避免下游 schema drift。
+- **P2 / environment**：`environment.txt` 只是 controller snapshot；精确子进程 `CUDA_VISIBLE_DEVICES`、`PYTHONPATH` 与 NCCL override 仍以每个 cell 的 `command.txt` 为准。
+
+### 为什么 CM044 慢
+
+以下先区分可直接从 artifact 读出的事实与尚待代表性实验验证的推断。
+
+**已观测事实：**
+
+1. **几乎没有可省的总通信。** dense gradient payload 为 `26,148,864 B/update`，其中只有 `393,216 B`（约 `1.50%`）属于 M002 可压缩的 14 个 Muon 矩阵，`25,755,648 B`（约 `98.50%`）是仍需 exact dense sync 的 embedding/lm-head 等 auxiliary。compressed phase 把矩阵部分降到约 `15,360 B`，但完整 interval 的总 payload 只降低 `0.7225%`；broadcast 因 refresh basis payload 只降低 `0.3466%`。因此带宽收益从一开始就不足以覆盖任何明显固定开销。
+2. **测试把 refresh 设得极频繁。** CM044 使用 `update_interval=2`，每两个 update 就有一次 dense corrected-gradient refresh 和 SVD；正式默认是 `200`。这个设置适合在最短时间同时覆盖 refresh/compressed trace，却会把 refresh 成本以 `50%` 权重计入 wall clock，不是性能友好的生产 cadence。
+3. **refresh 的固定调度成本远大于矩阵计算本身。** local-SVD refresh 的 SVD GPU kernel 合计约 `10.847 ms`，但 compressor critical-path tail 为 `212.564 ms`。当前实现逐参数处理 14 个矩阵，并通过一条全局 Future tail 串行保护 collective 顺序；大量小 kernel、Python callback、Future/stream 交接及临时 packing 在 dim64 tiny workload 上压过实际算术。
+4. **压缩路径增加了小 collective 数量。** dense DDP 可用少量大 All-Reduce；mixed compressed bucket 则需要 `score_plus_aux_allreduce -> factor_allreduce`，另有 dense-only bucket。score/factor payload 很小，处于 latency-bound 区域，无法有效利用 4090/NCCL 带宽。broadcast refresh 还按稳定参数顺序执行多个小 basis broadcast，观测 basis collective 合计约 `213.579 ms`。
+5. **Muon 自己的 result communication 完全不变。** M002 只压缩 DDP gradient input；ordinary Muon 的 result communication 仍存在。因此即使矩阵梯度压缩理想化为免费，也只能优化 step 的一部分。
+6. **额外状态与 workspace 在 tiny 模型上比例显眼。** basis、error、score/factor packing 和异步保活使 peak allocated 从 dense `193 MiB` 增至 `225 MiB`。绝对值只有 `32 MiB`，但 tiny baseline 下是 `16.58%`。
+
+**最可能的解释：**CM044 的 `17.2×/23.1×` slowdown 不是单一 SVD kernel 导致，而是“`98.5%` payload 不可压缩 + interval2 高频 refresh + 逐参数小算子/小 collective + 全局安全串行链 + Muon result communication 不变”的叠加。local-SVD 比 broadcast 快约 `25.7%`，符合省掉 basis broadcast 的方向；但 broadcast compressed trace 中异常大的 score/factor collective 时间无法由当前 tiny 三重复唯一归因，不能据此声称算法固有的 NCCL 成本。
+
+**尚待验证：**把 interval 改为 `200` 会显著摊薄 refresh，但在当前 tiny 参数边界下，总 payload 理论收益仍受约 `1.5%` 可压缩占比限制。是否能在 GPT-60M 等 transformer matrix 占比更高的模型上转正，必须先完成 same-shape batching，再用代表性几何、独占四卡和完整周期实测；不能由 CM044 外推。

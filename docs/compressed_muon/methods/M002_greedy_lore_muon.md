@@ -87,4 +87,6 @@ M002 相对快照的有意差异如下：
 
 状态为 `testing`。Task 10 已在本机同构 2×RTX 4090 环境通过完整 CPU gate、NCCL stress、rank-consistency preflight 与 dense/local-SVD/broadcast 真实训练入口 smoke。CM044 的 tiny profiler/timing 结果为负：该配置中绝大多数 payload 是不压缩的 dense auxiliary 参数，local-SVD 与 broadcast 的完整 period logical gradient payload 只比 dense 少 `0.72%` 与 `0.35%`，而平均 step time 分别是 dense 的约 `17.2×` 与 `23.1×`。三 seed、12-update 合成回归 gate 无 NaN/Inf，但不能替代真实语言模型质量实验。因此不启动 10,000-update paper-oriented recipe；跨模型/网络的正式性能和训练质量仍为 pending，不作一般速度、显存、训练质量或理论收敛声明。
 
-已登记但本任务不重构的工程限制：local matrix math 尚未对同 compressed shape 参数 batching；直接 `load_state_dict()` 在存储损坏 carve-out 下的 late validation 可能发生非事务性部分写入；launcher 的 `--summarize-only` 不验证全部 timing artifacts；`environment.txt` 是 controller snapshot，不等于每条命令的精确 CUDA/PYTHONPATH/NCCL 环境（精确覆盖项仍记录于 `command.txt`）。
+当前合并阻塞项是 timing fail-closed 的一个尾部边界：若同一日志先出现合法 `step_avg`，随后以 malformed、负数、`NaN` 或 `Inf` 的 `step_avg` 结束，parser 会忽略坏的末标记并接受较早值。CM044 的 9 个 timing 日志均已人工核验为合法，因此现有 tiny negative 结论不受影响；但修复并增加回归测试前，不能把 evidence launcher 视为完全 fail-closed，也不建议合并本分支。
+
+已登记但本任务不重构的工程限制：local matrix math 尚未对同 compressed shape 参数 batching；直接 `load_state_dict()` 在存储损坏 carve-out 下的 late validation 可能发生非事务性部分写入；新生成的 `timing-summary.json` 缺少旧 parser 的 per-cell `throughput_tokens_per_second` 字段（aggregate throughput 保留）；`environment.txt` 是 controller snapshot，不等于每条命令的精确 CUDA/PYTHONPATH/NCCL 环境（精确覆盖项仍记录于 `command.txt`）。完整阻塞、优化优先级与 CM044 性能根因记录在 `docs/worklog/M002-greedy-lore-muon.md` 的“最终审查状态与性能诊断”。
