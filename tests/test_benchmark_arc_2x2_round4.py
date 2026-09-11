@@ -58,6 +58,7 @@ def test_unlinked_nccl_inside_compute_range_stays_unattributed():
     result = attribute_trace(trace)
     assert result["collectives"] == [{
         "category": "unattributed", "kernel_count": 1,
+        "operation": "all_reduce", "launch_count": 1,
         "duration_ms": pytest.approx(0.02), "message_bytes": 0,
     }]
 

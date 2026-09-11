@@ -132,6 +132,7 @@ def _trace_fixture():
     return {
         "traceEvents": [
             {"name": "benchmark/forward_backward", "ph": "X", "ts": 0, "dur": 100, "pid": 1, "tid": 1, "args": {"correlation": 10}},
+            {"name": "train/final_backward", "ph": "X", "cat": "cpu_op", "ts": 0, "dur": 100, "pid": 1, "tid": 1, "args": {}},
             {"name": "DDP bucket All-Reduce", "ph": "X", "ts": 10, "dur": 30, "pid": 1, "tid": 1, "args": {"correlation": 11, "bytes": 100}},
             {"name": "ncclKernel_AllReduce", "ph": "X", "ts": 20, "dur": 20, "pid": 2, "tid": 3, "args": {"correlation": 11}},
             {"name": "arc/sketch", "ph": "X", "ts": 100, "dur": 50, "pid": 1, "tid": 1, "args": {"correlation": 12, "bytes": 40}},
@@ -140,7 +141,8 @@ def _trace_fixture():
             {"name": "ncclKernel_AllReduce", "ph": "X", "ts": 160, "dur": 10, "pid": 2, "tid": 4, "args": {"correlation": 13}},
             {"name": "muon/result_collective", "ph": "X", "ts": 200, "dur": 20, "pid": 1, "tid": 1, "args": {"correlation": 14, "bytes": 80}},
             {"name": "ncclKernel_AllGather", "ph": "X", "ts": 205, "dur": 10, "pid": 2, "tid": 4, "args": {"correlation": 14}},
-            {"name": "aten::matmul", "ph": "X", "cat": "kernel", "ts": 15, "dur": 25, "pid": 2, "tid": 5},
+            {"name": "aten::matmul", "ph": "X", "cat": "cpu_op", "ts": 15, "dur": 25, "pid": 1, "tid": 1, "args": {"External id": 15}},
+            {"name": "aten::matmul", "ph": "X", "cat": "kernel", "ts": 15, "dur": 25, "pid": 2, "tid": 5, "args": {"External id": 15}},
             {"name": "ncclKernel_AllReduce", "ph": "X", "ts": 300, "dur": 7, "pid": 2, "tid": 4},
         ]
     }
@@ -167,7 +169,9 @@ def test_trace_union_flushes_tail_and_overlap_merges_concurrent_intervals():
         {"name": "arc/sketch", "ph": "X", "ts": 0, "dur": 100, "args": {"correlation": 1, "bytes": 1}},
         {"name": "ncclKernel_AllReduce", "ph": "X", "ts": 0, "dur": 50, "args": {"correlation": 1}},
         {"name": "ncclKernel_AllReduce", "ph": "X", "ts": 20, "dur": 50, "args": {"correlation": 1}},
-        {"name": "compute_kernel", "cat": "kernel", "ph": "X", "ts": 40, "dur": 20},
+        {"name": "train/final_backward", "cat": "cpu_op", "ph": "X", "ts": 0, "dur": 100, "args": {}},
+        {"name": "aten::compute", "cat": "cpu_op", "ph": "X", "ts": 40, "dur": 20, "args": {"External id": 2}},
+        {"name": "compute_kernel", "cat": "kernel", "ph": "X", "ts": 40, "dur": 20, "args": {"External id": 2}},
     ]}
     summary = attribute_trace(trace)
     assert summary["nccl_union_time_ms"] == pytest.approx(0.07)

@@ -114,6 +114,14 @@ class _MockWrapperTensor(torch.Tensor):
     def __init__(self, inner):
         self._inner = inner
 
+    def __repr__(self):
+        # Keep this test double's diagnostic representation metadata-only:
+        # Tensor.__repr__ inspects values and can trigger data-dependent guards.
+        return (
+            f"_MockWrapperTensor(shape={tuple(self.shape)}, dtype={self.dtype}, "
+            f"device={self.device})"
+        )
+
     def __tensor_flatten__(self):
         return ["_inner"], None
 
