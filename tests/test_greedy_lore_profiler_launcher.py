@@ -147,6 +147,25 @@ def test_print_plan_supports_profile_only_preflight():
     assert plan["timing_cells"] == []
 
 
+def test_print_plan_supports_timing_only_run():
+    plan = json.loads(_plan(
+        "--repeats", "3",
+        "--profile-modes", "none",
+        "--timing-modes", "dense,greedylore_local_svd",
+    ).stdout)
+
+    assert plan["profile_modes"] == []
+    assert plan["cells"] == []
+    assert plan["timing_cells"] == [
+        "dense-timing-r1",
+        "greedylore_local_svd-timing-r1",
+        "greedylore_local_svd-timing-r2",
+        "dense-timing-r2",
+        "dense-timing-r3",
+        "greedylore_local_svd-timing-r3",
+    ]
+
+
 def test_print_plan_rejects_unknown_profile_mode():
     completed = _plan("--profile-modes", "unknown", check=False)
 

@@ -173,3 +173,14 @@ def test_plan_completeness_produces_valid_timing_summary(tmp_path):
     timing_summary = json.loads((tmp_path / "timing-summary.json").read_text())
     assert timing_summary["modes"]["dense"]["cells"][0]["exit_code"] == 0
     assert timing_summary["modes"]["dense"]["cells"][0]["step_avg_ms"] == 10.0
+
+
+def test_plan_completeness_supports_timing_only_artifacts(tmp_path):
+    _write_plan(tmp_path, cells=(), timing_cells=("dense-timing-r1",))
+    _write_timing_cell(tmp_path, "dense-timing-r1")
+
+    summary = summarize_profile_root(tmp_path, require_plan=True)
+
+    assert summary == {"schema_version": 1, "cells": []}
+    timing_summary = json.loads((tmp_path / "timing-summary.json").read_text())
+    assert timing_summary["modes"]["dense"]["mean_step_ms"] == 10.0

@@ -268,3 +268,9 @@ artifact：`artifacts/compressed_muon/CM045-m002-greedylore-muon-tiny-interval20
 60M/130M 复用已有成功的 seq256、global/device batch512/128、GA1 几何；350M 为控制 activation 与完整 basis/error 状态叠加后的 OOM 风险，使用 seq256、global/device batch32/8、GA1。因此只在每个模型内部做 paired ratio，不横向比较三种模型的绝对吞吐。统一使用 4×RTX 4090、rank32、bucket160 MiB、seed42 和 local-SVD 主路径；broadcast 只作为单轮强一致性/通信诊断。launcher 新增独立 `--profile-modes`/`--timing-modes` 过滤，默认行为保持不变，相关 launcher/parser 测试为 `27 passed`。
 
 GPU2–5 启动前均为 `3 MiB`、`0% utilization`，无 compute process；`m002-scale-timing` tmux controller 已按上述 gate 顺序启动。每个 launcher 自行保存 plan、cell command/environment/log/exit/time 和 summary；任一阶段非零退出将通过 `&&` 阻止后续阶段启动，不会在 preflight 失败后继续消耗正式 timing 预算。
+
+### 2026-09-11：350M 切换为 timing-only
+
+CM050 的 6/6 profiler cells 均 exit `0`，原始 24/24 rank traces 共 `2,338,797,659 B`（约 2.18 GiB），dense/GreedyLore peak allocated 为 `7062/9731 MiB`，因此 350M 显存与执行 preflight 已通过。trace summarizer 单核 99.9% CPU 连续运行超过 3.5 小时仍未完成；按用户决定停止该 parser 与旧串行 controller，不把 trace summary 作为正式 wall-clock 的前置 gate。
+
+保留 `CM050-.../greedylore_local_svd-refresh-r1/profiler/rank-0.json`（约 424 MiB）供以后诊断，删除 CM050 其余 23 份 trace；删除不可从仓库恢复，CM046–CM049 历史 trace 未改动。launcher/summarizer 增加 `profile_modes=none` 的 timing-only 合法路径：仍要求 plan、command、exit、finished timestamp 和有限正值末尾 timing，正常生成 `summary.json`（空 profile cells）与 `timing-summary.json`。对应 launcher/parser 测试为 `29 passed`。CM051 随后只运行 dense/local-SVD 的 3 rotated、20 warmup + 200 measured update timing，不再生成 trace。

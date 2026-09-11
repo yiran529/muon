@@ -368,10 +368,10 @@ def summarize_profile_root(artifact_root: Path, *, require_plan: bool = False) -
             ),
             "max_unattributed_nccl_fraction": max(item["unattributed_nccl_fraction"] for item in traces),
         })
-    if not cells:
-        raise SystemExit("no rank traces found")
     if require_plan:
         _validate_plan_completeness(artifact_root, cells)
+    elif not cells:
+        raise SystemExit("no rank traces found")
     payload = {"schema_version": 1, "cells": cells}
     for mode in sorted({cell["mode"] for cell in cells}):
         mode_cells = [cell for cell in cells if cell["mode"] == mode]

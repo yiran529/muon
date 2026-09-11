@@ -80,9 +80,13 @@ validate_modes() {
     done
 }
 
-validate_modes "$profile_modes_csv" profile 0 || exit $?
+validate_modes "$profile_modes_csv" profile 1 || exit $?
 validate_modes "$timing_modes_csv" timing 1 || exit $?
-IFS=',' read -ra profile_modes <<<"$profile_modes_csv"
+if [[ "$profile_modes_csv" == "none" ]]; then
+    profile_modes=()
+else
+    IFS=',' read -ra profile_modes <<<"$profile_modes_csv"
+fi
 if [[ "$timing_modes_csv" == "none" ]]; then
     timing_modes=()
 else
@@ -132,7 +136,11 @@ import json
 import os
 
 repeats = int(os.environ["REPS"])
-profile_modes = tuple(os.environ["PROFILE_MODES"].split(","))
+profile_modes = (
+    ()
+    if os.environ["PROFILE_MODES"] == "none"
+    else tuple(os.environ["PROFILE_MODES"].split(","))
+)
 timing_modes = (
     ()
     if os.environ["TIMING_MODES"] == "none"
@@ -141,7 +149,7 @@ timing_modes = (
 cells = []
 timing_cells = []
 for repeat in range(1, repeats + 1):
-    profile_offset = (repeat - 1) % len(profile_modes)
+    profile_offset = (repeat - 1) % len(profile_modes) if profile_modes else 0
     profile_order = profile_modes[profile_offset:] + profile_modes[:profile_offset]
     for mode in profile_order:
         cells.append(f"{mode}-refresh-r{repeat}")
