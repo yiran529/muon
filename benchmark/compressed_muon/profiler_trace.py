@@ -337,21 +337,18 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
                 if corr is not None
                 else []
             )
-            local_candidates = [
-                local for local in hook_local_ranges
-                if local[1] <= start and end <= local[2]
-                or (
-                    corr is not None
-                    and local[3] is not None
-                    and str(corr) == str(local[3])
-                )
-            ]
+            local_candidates = []
             for cpu_event in correlated_cpu_events:
+                if not _is_cpu_annotation(cpu_event):
+                    continue
                 cpu_start = float(cpu_event.get("ts", 0.0))
                 cpu_end = cpu_start + _duration(cpu_event)
                 local_candidates.extend(
                     local for local in hook_local_ranges
-                    if local[1] <= cpu_start and cpu_end <= local[2]
+                    if local[4].get("pid") == cpu_event.get("pid")
+                    and local[4].get("tid") == cpu_event.get("tid")
+                    and local[1] <= cpu_start
+                    and cpu_end <= local[2]
                 )
             local_category = (
                 min(local_candidates, key=lambda local: local[2] - local[1])[0]

@@ -438,3 +438,38 @@ CM058/CM059 共 12/12 cells exit `0`，所有末尾 timing marker 均为有限�
 
 - `artifacts/compressed_muon/CM058-m002-gpt60m-factor-direct-interval200-ddp-ws4-s42/`
 - `artifacts/compressed_muon/CM059-m002-gpt130m-factor-direct-interval200-ddp-ws4-s42/`
+
+## CM060–CM062：M002 1B / global batch 512 四卡显存预检（2026-09-12）
+
+恢复 batching 前的原始 GreedyLore 实现后，固定 GPT-1B（dim1536、30 layers、24 heads）、4×RTX 4090、seq256、global batch512、device batch1 / GA128、rank32、bucket160 MiB、seed42。device batch 已是可用下限；预检临时使用 interval2、1 warmup + 2 measured update，仅为同时触发 refresh/compressed 路径并检查容量，**不是 interval200 性能结果**。
+
+| 实验 | 执行模式 | dense | M002 local-SVD | 判定 |
+|---|---|---|---|---|
+| CM060 | BF16 compile | 通过；peak 20219 MiB | 首次 compiled forward OOM；申请 148 MiB 时仅余 16.56 MiB | 容量不足 |
+| CM061 | compile + expandable segments | 通过；peak 20217 MiB | OOM；申请 144 MiB 时仅余 110.56 MiB；未分配 reserve 74.21 MiB | allocator 设置不足以解决 |
+| CM062 | no-compile + expandable segments | 通过；peak 21108 MiB | 首次 backward OOM；申请 296 MiB 时仅余 174.62 MiB | no-compile 仍不可行 |
+
+三次均为 dense cell exit `0`、M002 cell exit `1`；因此没有启动正式 20 warmup + 200 measured timing，也不报告 1B GreedyLore wall-clock 加速比。在 global batch512、四卡、seq256 约束下，device batch1 已将梯度累积提高到 128，继续增加 GA 无法降低单次 micro-batch 显存。后续若坚持 24 GiB 四卡，需要改变显存策略（例如 activation checkpointing）并重新建立 dense/M002 配对基线；否则需增加 GPU 数或单卡显存。原始产物：
+
+- `artifacts/compressed_muon/CM060-m002-gpt1b-global512-preflight-ddp-ws4-s42/`
+- `artifacts/compressed_muon/CM061-m002-gpt1b-global512-expandable-preflight-ddp-ws4-s42/`
+- `artifacts/compressed_muon/CM062-m002-gpt1b-global512-nocompile-preflight-ddp-ws4-s42/`
+
+## CM063：130M refresh/ordinary 低开销分相 timing（2026-09-12）
+
+为避免 Kineto 和逐步 `cudaSynchronize` 改变执行路径，CM063 在恢复后的原始 M002 上使用 differential timing：固定 CM049 的 GPT-130M、4卡、seq256、global/device batch512/128、rank32、bucket160 MiB 和 seed42，分别运行 interval100×2 periods 与 interval200×1 period。两侧都恰好覆盖 200 个 profiler-off measured update，但前者包含两个 refresh、后者包含一个；完成3组交替顺序配对。
+
+若 interval100/200 的平均 step 分别为 `A/B`，则 `ordinary = 2B - A`、`refresh = 199A - 198B`。结果如下：
+
+| repeat | interval100 A | interval200 B | ordinary 估计 | refresh 估计 | refresh−ordinary / 200 |
+|---|---:|---:|---:|---:|---:|
+| 1 | 239.06 ms | 232.15 ms | 225.24 ms | 1607.24 ms | 6.91 ms/update |
+| 2 | 239.51 ms | 232.99 ms | 226.47 ms | 1530.47 ms | 6.52 ms/update |
+| 3 | 244.66 ms | 231.25 ms | 217.84 ms | 2899.84 ms | 13.41 ms/update |
+| mean | 241.077 ms | 232.130 ms | 223.183 ms | 2012.517 ms | 8.947 ms/update |
+
+6/6 cells exit `0`、0 trace，无 OOM/timeout/traceback。三组都显示 refresh 明显慢于 ordinary，确认完整 full-basis SVD refresh 是130M interval200 的主要摊销项；但差分会把两个独立 process 的环境波动放大，第三组 refresh 估计明显偏高，因此 `8.95 ms/update` 只作量级诊断，不作精确分解或性能 claim。下一步对 refresh 优化的优先级高于继续修改 factor packing。
+
+同期修复 profiler local GPU 归因：GPU kernel 不再仅因执行时间落入 hook CPU annotation 就被归为 local work，而必须关联到同 pid/tid 且嵌套在该 annotation 中的 CPU launch/op。新反例覆盖并发 backward kernel 落入 score 时间窗的情形；CM049 完整历史 trace 的修正版汇总仍作为后台派生产物，不用未完成数据更新本节数值。
+
+原始产物：`artifacts/compressed_muon/CM063-*-m002-gpt130m-phase-timing-*/`。

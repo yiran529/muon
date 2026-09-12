@@ -346,3 +346,21 @@ artifact：`artifacts/compressed_muon/CM054-m002-gpt60m-batched-interval200-ddp-
 artifacts：`artifacts/compressed_muon/CM058-m002-gpt60m-factor-direct-interval200-ddp-ws4-s42/`、`artifacts/compressed_muon/CM059-m002-gpt130m-factor-direct-interval200-ddp-ws4-s42/`。
 
 按三种规模均无 direct-write 收益证据的结果，随后完整撤销 factor direct-write；`dion/greedy_lore_ddp_hook.py` 与 `7834661^` 的差异为空，即 ordinary compressed step 已恢复 batching 前的逐矩阵 factor 分配、clone 和最终 `cat`。TDD storage 回归先在 direct-write 版本上按预期失败，再在恢复后通过；完整 GreedyLore CPU/Future/Gloo gate 为 `186 passed`，两卡 NCCL gate 为 `3 passed`。
+
+## 2026-09-12：CM060–CM062 GPT-1B / global batch512 四卡预检
+
+固定 dim1536/30 layers/24 heads、4×RTX 4090、BF16、seq256、global/device batch512/1（GA128）、rank32、bucket160 MiB、seed42。由于 device batch1 已是下限，先用 interval2、1 warmup + 2 measured update 的无 trace 预检覆盖 refresh/compressed 路径；该窗口只用于显存 gate，不用于 wall-clock 结论。
+
+- CM060 compile：dense exit0、peak 20219 MiB；M002 在首次 compiled forward OOM，申请 148 MiB 时仅余 16.56 MiB。
+- CM061 compile + `expandable_segments:True`：dense exit0、peak 20217 MiB；M002 申请 144 MiB 时仅余 110.56 MiB，未分配 reserve 仅 74.21 MiB，说明并非只靠 allocator fragmentation 即可解决。
+- CM062 no-compile + expandable segments：dense exit0、peak 21108 MiB；M002 在首次 backward OOM，申请 296 MiB 时仅余 174.62 MiB。
+
+结论：恢复后的原始 M002 在 24 GiB 四卡、global batch512、seq256 下无法进入正式 1B timing；关闭 compile 也不能容纳。未启动 interval200 正式 run，后续若保持四卡需先引入 activation checkpointing 等显存策略并对 dense/M002 同时重建基线。
+
+## 2026-09-12：P0 profiler 归因修复与 CM063 分相 timing
+
+P0 发现 `profiler_trace.py` 会把仅在时间上落入 GreedyLore local CPU range 的并发 backward GPU kernel误归到 score等local类别，并进一步低估backward overlap、污染tail。TDD先构造“backward kernel执行于score时间窗、但launch关联到另一个CPU op/thread”的反例，旧实现按预期将 score GPU 从20 us误报为50 us且 overlap 为0；最小修复删除GPU时间窗local fallback，只接受关联到同pid/tid、且嵌套在local annotation内的CPU launch/op。新旧相关测试为 `21 passed`。CM049完整trace使用修正版的后台重解析单核耗时较长，其未完成结果不写入正式结论。
+
+P1 不在训练循环插入每step同步或Kineto，而以两个等长profiler-off窗口差分：interval100的200 measured updates含2次refresh，interval200含1次，因而总时间差等于 `refresh - ordinary`。3组交替配对均exit0；A/B分别为 `239.06/232.15`、`239.51/232.99`、`244.66/231.25 ms`，推得ordinary `225.24/226.47/217.84 ms`、refresh `1607.24/1530.47/2899.84 ms`，均值 `223.18/2012.52 ms`。refresh相对ordinary按interval200摊销为 `6.91/6.52/13.41 ms/update`，mean `8.95 ms/update`。第三组差分波动较大，数字只用于确认refresh是主要量级瓶颈，不作精确wall-clock分解。
+
+artifact：`artifacts/compressed_muon/CM063-*-m002-gpt130m-phase-timing-*/`。

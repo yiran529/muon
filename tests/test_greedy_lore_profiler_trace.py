@@ -122,6 +122,36 @@ def test_greedylore_collectives_payloads_operations_and_local_gpu_ranges():
     assert result["compressor_critical_path_tail_ms"] == pytest.approx(0.591)
 
 
+def test_backward_kernel_executing_during_hook_range_is_not_local_work():
+    trace = {"traceEvents": [
+        {"ph": "X", "name": "train/profile_window", "cat": "cpu_op",
+         "ts": 0, "dur": 1000},
+        {"ph": "X", "name": "train/final_backward", "cat": "cpu_op",
+         "ts": 100, "dur": 700, "pid": 1, "tid": 10},
+        {"ph": "X", "name": "aten::mm_backward", "cat": "cpu_op",
+         "ts": 110, "dur": 5, "pid": 1, "tid": 10,
+         "args": {"External id": 90}},
+        {"ph": "X", "name": "greedylore_hook/score", "cat": "cpu_op",
+         "ts": 200, "dur": 200, "pid": 1, "tid": 20},
+        {"ph": "X", "name": "aten::matmul", "cat": "cpu_op",
+         "ts": 210, "dur": 5, "pid": 1, "tid": 20,
+         "args": {"External id": 11}},
+        _kernel("backward_gemm", 250, 30, 90),
+        _kernel("score_kernel", 300, 20, 11),
+        {"ph": "X", "name": "greedylore_hook/factor_allreduce/payload bytes=48",
+         "cat": "cpu_op", "ts": 240, "dur": 10, "pid": 1, "tid": 20,
+         "args": {"External id": 12}},
+        _kernel("ncclDevKernel_AllReduce", 260, 50, 12),
+    ]}
+
+    result = summarize_training_trace(trace)
+
+    assert result["gpu_ranges_ms"] == {
+        "greedylore_hook_score": pytest.approx(0.020),
+    }
+    assert result["nccl_compute_overlap_ms"] == pytest.approx(0.020)
+
+
 def test_gpu_user_annotation_payload_mirror_is_not_counted_as_a_second_launch():
     trace = {"traceEvents": [
         {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 1000},
