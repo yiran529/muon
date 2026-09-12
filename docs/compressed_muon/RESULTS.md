@@ -386,3 +386,24 @@ trace；保留的 trace 来自单独的 CM050 preflight，不能用来替代 CM0
 - `artifacts/compressed_muon/CM047-m002-gpt60m-interval200-ddp-ws4-s42/`
 - `artifacts/compressed_muon/CM049-m002-gpt130m-interval200-ddp-ws4-s42/`
 - `artifacts/compressed_muon/CM051-m002-gpt350m-interval200-ddp-ws4-s42/`
+
+## CM052–CM053：M002 paper-aligned 完整训练（2026-09-12）
+
+在同一台 4×RTX 4090 节点上，以 seed1234 串行完成 GPT-60M/130M 的 dense Muon 与 M002 GreedyLore-Muon local-SVD 配对训练。公共设置为 FineWeb10B、BF16 compile、seq256、global/device batch512/128、cosine decay to 10%、clip1；60M 使用 10,000 updates/1.31072B tokens 和 1,000-step warmup，130M 使用 20,000 updates/2.62144B tokens 和 2,000-step warmup。M002 使用 rank32、interval200、step1000 后压缩、error feedback，并只压缩 Muon matrix group。
+
+| 模型 | dense / M002 val loss | dense / M002 ppl | ppl 变化 | dense / M002 step | step 变化 | dense / M002 peak | 判断 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 60M / CM052 | 4.0003 / 4.0837 | 54.61 / 59.36 | **+8.70%** | 112.61 / 114.25 ms | +1.46% | 6865 / 7347 MiB | quality-negative；performance null/negative |
+| 130M / CM053 | 3.5749 / 3.6582 | 35.69 / 38.79 | **+8.69%** | 241.22 / 238.01 ms | -1.33% | 13048 / 13889 MiB | quality-negative；preliminary performance-positive |
+
+两组的 best validation loss 都出现在最终 step；M002 在既定 token budget 内均未达到对应 dense 的最终质量，因此没有可报告的 dense-final-quality time-to-quality。60M 的 perplexity ratio 为 `1.08698`，通过预登记的 `1.10` 继续门禁，但该门禁只控制是否启动 130M，不代表质量等价。130M 的 `1.33%` step 加速与 CM049 的 `1.86%` 短程信号方向一致，但单次完整训练不足以建立稳定性能结论，且远不足以抵消约 `8.69%` 的 perplexity 恶化。
+
+结论分类为 **quality-negative**：当前 rank32/interval200 的 M002 配方在 60M 和 130M 上都稳定跑完，但相对 dense Muon 出现几乎相同的约 `8.7%` perplexity 退化，并增加约 `6.4%–7.0%` peak memory。现有证据不支持宣称保持 dense-Muon 质量，也不建议立即扩展多 seed；下一步应优先做低成本 rank/压缩起始时刻或 all-2D 独立消融，再决定是否投入新的完整训练。
+
+该实验是 paper-aligned M002-on-Muon controlled study，不是 GreedyLore 论文的 C4/AdamW 严格复现。原始命令、日志、checkpoint、W&B 对应关系和自动质量门禁位于：
+
+- `artifacts/compressed_muon/CM052-CM053-m002-paper-aligned-quality-controller/`
+- `artifacts/compressed_muon/CM052a-dense-muon-gpt60m-paper-aligned-ddp-ws4-s1234/`
+- `artifacts/compressed_muon/CM052b-m002-greedylore-muon-gpt60m-paper-aligned-ddp-ws4-s1234/`
+- `artifacts/compressed_muon/CM053a-dense-muon-gpt130m-paper-aligned-ddp-ws4-s1234/`
+- `artifacts/compressed_muon/CM053b-m002-greedylore-muon-gpt130m-paper-aligned-ddp-ws4-s1234/`

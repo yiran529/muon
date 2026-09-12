@@ -285,6 +285,8 @@ CM051 于 `21:12:26–21:23:27+08:00` 完成，6/6 timing cells exit `0`，日�
 
 在该 350M、global/device batch32/8 几何下结果分类为 **positive**：三轮同方向，完整 interval200 周期 step 降低约 16%，但 peak allocated 增加 `2669 MiB`（约 `37.8%`）。尺度趋势为 60M null（`+0.17%`）、130M preliminary-positive（`-1.86%`）、350M positive（`-15.97%`），与更大模型中 transformer Muon matrix 占总 payload 比例上升的方向一致。三种模型 batch geometry 不同，不能横向比较绝对吞吐；三轮 timing 也不能替代多 seed 训练质量与 time-to-quality，尤其不能据此声称 GreedyLore-Muon 已保持 dense Muon 收敛性质。
 
+artifact：`artifacts/compressed_muon/CM051-m002-gpt350m-interval200-ddp-ws4-s42/`，包含 `plan.json`、6 个 timing cell 的 command/environment/log/exit/time、空 profile `summary.json` 和 `timing-summary.json`。
+
 ## 2026-09-12：CM052/CM053 paper-aligned 实际训练计划
 
 - 目的：先在 GPT-60M 和 GPT-130M 上比较 dense Muon 与 M002 local-SVD 的完整训练质量、稳定性和 time-to-quality，不用短 timing 结果替代收敛证据。
@@ -294,4 +296,10 @@ CM051 于 `21:12:26–21:23:27+08:00` 完成，6/6 timing cells exit `0`，日�
 - 执行：`benchmark/compressed_muon/run_cm052_cm053_m002_quality.sh` 自动等待任意 4 张至少有 18 GiB 空闲显存的 GPU，并按 CM052a→CM052b→CM053a→CM053b 串行运行；正式训练不开 Kineto trace。CM052b perplexity 相对 CM052a 若超过 1.10，controller 自动停止，不启动 CM053。
 - 启动状态：2026-09-12 01:32（Asia/Shanghai）在 tmux `cm052_cm053_m002_quality` 启动；当时仅 GPU 7 满足空闲门槛，controller 已进入自动等待。状态与计划位于 `artifacts/compressed_muon/CM052-CM053-m002-paper-aligned-quality-controller/`。
 
-artifact：`artifacts/compressed_muon/CM051-m002-gpt350m-interval200-ddp-ws4-s42/`，包含 `plan.json`、6 个 timing cell 的 command/environment/log/exit/time、空 profile `summary.json` 和 `timing-summary.json`。
+### 完成结果
+
+controller 于 01:55 获得 GPU 2–5，4/4 probes 与 4/4 formal cells 均 exit `0`，并于 05:27 完成，controller exit `0`。60M dense/M002 的 final val loss 为 `4.0003/4.0837`，perplexity 为 `54.61/59.36`（M002 `+8.70%`），step 为 `112.61/114.25 ms`（`+1.46%`），peak 为 `6865/7347 MiB`。60M perplexity ratio `1.08698` 通过预登记的 1.10 继续门禁。
+
+130M dense/M002 的 final val loss 为 `3.5749/3.6582`，perplexity 为 `35.69/38.79`（M002 `+8.69%`），step 为 `241.22/238.01 ms`（`-1.33%`），peak 为 `13048/13889 MiB`。两组 best val loss 都是 final loss，M002 均未在当前预算内达到 dense final quality，故没有 dense-final-quality time-to-quality。
+
+结论为 **quality-negative**：130M 的小幅 step 收益延续 CM049 方向，但单次差异小于 2%，且不能补偿约 8.7% perplexity 退化；60M 同时没有性能收益。暂不扩展多 seed，优先评估修改量小的 rank/start-step 敏感性，all-2D 仍须作为单独方法范围消融登记。W&B IDs：CM052a `80b662fz`、CM052b `ktl0jkfd`、CM053a `wda2zc6n`、CM053b `9rugk05n`。
