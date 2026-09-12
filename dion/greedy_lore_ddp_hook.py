@@ -1144,25 +1144,14 @@ def _select_projector_profiled(
     work.parameter_state.last_support.copy_(support)
 
 
-def _compress_local_profiled(
-    work: CompressedMatrixWork,
-    factor_buffer: Tensor,
-    offset: int,
-) -> int:
+def _compress_local_profiled(work: CompressedMatrixWork) -> None:
     assert work.projector is not None
-    columns = work.corrected.shape[1]
-    factor_numel = work.projector.shape[1] * columns
-    local_factor = factor_buffer[offset : offset + factor_numel].view(
-        work.projector.shape[1], columns
-    )
     with _profile_range("greedylore_hook/factor"):
-        torch.mm(work.projector.mT, work.corrected, out=local_factor)
+        local_factor = work.projector.mT @ work.corrected
     with _profile_range("greedylore_hook/error"):
         next_error = work.corrected - work.projector @ local_factor
         work.parameter_state.error.copy_(next_error)
-    work.factor_offset = offset
     work.local_factor = local_factor
-    return offset + factor_numel
 
 
 def _prepare_factor_buffer(
@@ -1170,17 +1159,19 @@ def _prepare_factor_buffer(
     score_plus_aux: Tensor,
     matrix_work: list[CompressedMatrixWork],
 ) -> Tensor:
-    factor_numel = sum(
-        state.config.rank * work.corrected.shape[1] for work in matrix_work
-    )
-    factor_buffer = score_plus_aux.new_empty(factor_numel)
+    chunks = []
     offset = 0
     for work in matrix_work:
         averaged_lambda = score_plus_aux[
             work.score_offset : work.score_offset + work.signed_lambda.numel()
         ]
         _select_projector_profiled(state, work, averaged_lambda)
-        offset = _compress_local_profiled(work, factor_buffer, offset)
+        _compress_local_profiled(work)
+        assert work.local_factor is not None
+        work.factor_offset = offset
+        chunks.append(work.local_factor.reshape(-1).clone())
+        offset += work.local_factor.numel()
+    factor_buffer = torch.cat(chunks)
     return factor_buffer
 
 

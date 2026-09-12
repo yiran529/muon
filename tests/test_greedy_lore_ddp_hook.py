@@ -296,7 +296,7 @@ def test_compressed_step_keeps_compatible_oriented_shapes_on_per_matrix_path():
     assert operator_counts["aten::sort"] == 3
 
 
-def test_per_matrix_factors_are_direct_views_into_the_packed_collective_buffer():
+def test_per_matrix_factors_are_cloned_into_the_packed_collective_buffer():
     first = torch.nn.Parameter(torch.zeros(3, 2))
     different = torch.nn.Parameter(torch.zeros(2, 4))
     second = torch.nn.Parameter(torch.zeros(3, 2))
@@ -333,10 +333,12 @@ def test_per_matrix_factors_are_direct_views_into_the_packed_collective_buffer()
     assert [work.factor_offset for work in matrix_work] == [0, 3, 7]
     assert all(
         work.local_factor is not None
-        and work.local_factor.untyped_storage().data_ptr() == factor_storage
-        and work.factor_offset == work.local_factor.storage_offset()
-        and work.local_factor.is_contiguous()
+        and work.local_factor.untyped_storage().data_ptr() != factor_storage
         for work in matrix_work
+    )
+    torch.testing.assert_close(
+        factor_buffer,
+        torch.cat([work.local_factor.reshape(-1) for work in matrix_work]),
     )
 
 

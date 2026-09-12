@@ -422,3 +422,19 @@ trace；保留的 trace 来自单独的 CM050 preflight，不能用来替代 CM0
 6/6 cells exit `0`，所有末尾 timing marker 均为有限正值，日志无 OOM/timeout/traceback；step0 的 `nan` 只出现在 dense 计时尚未开始的初始化 marker。实验使用动态空闲门禁选出的 GPU `2,4,6,7`，timing-only artifact 不含 profiler trace。该短程实验不提供新的质量或 time-to-quality 结论。
 
 原始产物：`artifacts/compressed_muon/CM054-m002-gpt60m-batched-interval200-ddp-ws4-s42/`。
+
+## CM058–CM059：仅保留 factor direct-write 的 60M/130M timing（2026-09-12）
+
+撤销 ordinary-step same-shape batching、恢复逐矩阵 score/Top-r/factor/error/reconstruction 后，仅保留 factor collective buffer 一次分配和 `mm(..., out=view)` direct-write。两组严格复用各自历史实验的 4-GPU、seq256、global/device batch512/128、GA1、rank32、interval200、bucket160 MiB、seed42 口径，均完成 3 次 rotated pairing；每个 cell 为 20 warmup + 200 measured updates，timing-only、不生成 trace。
+
+| 模型/实验 | dense repeats / mean | local-SVD repeats / mean | paired 变化 | 95% mean-difference interval | dense / local peak | 判断 |
+|---|---:|---:|---:|---:|---:|---|
+| 60M / CM058 | 109.17/113.76/113.59 / 112.173 ms | 113.81/114.62/114.26 / 114.230 ms | +1.87% | [0.67, 4.64] ms | 6865 / 7347 MiB | slight-negative |
+| 130M / CM059 | 239.78/240.07/238.73 / 239.527 ms | 234.79/236.64/235.53 / 235.653 ms | -1.62% | [-4.99, -3.20] ms | 13048 / 13889 MiB | preliminary-positive；低于 2% |
+
+相对最初逐矩阵实现 CM047/CM049，direct-write 的 local-SVD 绝对 step 分别慢 `0.77%/0.38%`；结合 350M CM057 的 `+0.98%`，三个规模都没有显示 direct-write 的 wall-clock 收益。跨实验差值不能单独证明 direct-write 导致回退，但足以拒绝保留该优化的性能主张。60M/130M 的 M002 相对 dense 结论仍分别为小幅负向与低于 2% 的初步正向；这些短程 timing 不提供新的训练质量结论。
+
+CM058/CM059 共 12/12 cells exit `0`，所有末尾 timing marker 均为有限正值，无 OOM/timeout/traceback，trace 数为 0；dense step0 的 `nan` 是计时开始前的预期初始化 marker。原始产物：
+
+- `artifacts/compressed_muon/CM058-m002-gpt60m-factor-direct-interval200-ddp-ws4-s42/`
+- `artifacts/compressed_muon/CM059-m002-gpt130m-factor-direct-interval200-ddp-ws4-s42/`

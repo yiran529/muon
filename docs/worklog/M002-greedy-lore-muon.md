@@ -333,3 +333,16 @@ controller 于 13:29 获得 GPU `2,4,6,7`，并于 13:35 完成。6/6 timing cel
 结果分类为 **null**。相对历史 CM047，CM054 dense 从 `113.167` 降至 `110.973 ms`（`-1.94%`），local-SVD 从 `113.360` 降至 `111.380 ms`（`-1.75%`）；两模式同向下降，且 CM054 内 local-SVD 相对 dense 的差值仍为零附近，因此不能把绝对下降归因于 batching。local-SVD peak 从历史 `7347` 变为 `7345 MiB`，2 MiB 差异无实用意义。当前证据表明 same-shape batching/direct-write 在 60M 上正确但没有可测的完整周期 wall-clock 收益；若继续性能诊断，应先采集单个普通 compressed step 的轻量算子/allocator 证据，确认 `stack` 临时量与 launch reduction 的实际抵消关系，再决定是否投入持久 workspace，或转向更可能受益的 130M/350M。
 
 artifact：`artifacts/compressed_muon/CM054-m002-gpt60m-batched-interval200-ddp-ws4-s42/`。
+
+## 2026-09-12：CM058/CM059 factor direct-write 复测
+
+撤销 ordinary-step same-shape batching 后，仅保留逐矩阵 factor 直接写入一次分配的 packed collective buffer。CM058/CM059 分别严格复用 CM047/CM049 的 60M/130M 几何：4-rank DDP、BF16 compile、FineWeb10B、seq256、global/device batch512/128、GA1、rank32、interval200、bucket160 MiB、seed42；每组 3 次 rotated pairing、20 warmup + 200 measured updates、timing-only。
+
+- CM058 60M：dense `109.17/113.76/113.59 ms`，mean `112.173 ms`；local-SVD `113.81/114.62/114.26 ms`，mean `114.230 ms`。paired difference `+4.64/+0.86/+0.67 ms`，mean `+2.057 ms` / `+1.865%`，interval `[0.67,4.64] ms`；peak `6865/7347 MiB`。
+- CM059 130M：dense `239.78/240.07/238.73 ms`，mean `239.527 ms`；local-SVD `234.79/236.64/235.53 ms`，mean `235.653 ms`。paired difference `-4.99/-3.43/-3.20 ms`，mean `-3.873 ms` / `-1.617%`，interval `[-4.99,-3.20] ms`；peak `13048/13889 MiB`。
+
+两组共 12/12 cells exit `0`、0 traces，日志无 OOM/timeout/traceback；dense step0 的 `nan` 仅为计时初始化 marker。相对原始逐矩阵 CM047/CM049，direct-write local-SVD 分别慢 `0.77%/0.38%`；连同 CM057 350M 的 `+0.98%`，没有证据支持 direct-write 带来收益。跨实验变化不能确诊其本身造成回退，但下一版恢复 batching 前的完整原始 factor clone+cat 路径，不再保留该优化。
+
+artifacts：`artifacts/compressed_muon/CM058-m002-gpt60m-factor-direct-interval200-ddp-ws4-s42/`、`artifacts/compressed_muon/CM059-m002-gpt130m-factor-direct-interval200-ddp-ws4-s42/`。
+
+按三种规模均无 direct-write 收益证据的结果，随后完整撤销 factor direct-write；`dion/greedy_lore_ddp_hook.py` 与 `7834661^` 的差异为空，即 ordinary compressed step 已恢复 batching 前的逐矩阵 factor 分配、clone 和最终 `cat`。TDD storage 回归先在 direct-write 版本上按预期失败，再在恢复后通过；完整 GreedyLore CPU/Future/Gloo gate 为 `186 passed`，两卡 NCCL gate 为 `3 passed`。
