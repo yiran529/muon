@@ -16,6 +16,7 @@ from torch.nn import Parameter
 from .greedy_lore import (
     GreedyLoreConfig,
     MatrixOrientation,
+    approximate_signed_lambda,
     compressed_phase,
     corrected_gradient,
     derive_greedy_lore_seed,
@@ -23,7 +24,9 @@ from .greedy_lore import (
     make_random_vectors,
     matrix_orientation,
     orient_matrix,
+    reconstruct_global,
     refresh_basis,
+    select_projector,
     unorient_matrix,
 )
 from .collective_observer import observe_collective
@@ -84,14 +87,6 @@ class CompressedMatrixWork:
     projector: Tensor | None = None
     support: Tensor | None = None
     local_factor: Tensor | None = None
-
-
-@dataclass
-class CompressedMatrixBatch:
-    works: tuple[CompressedMatrixWork, ...]
-    corrected: Tensor
-    basis: Tensor
-    projector: Tensor | None = None
 
 
 def _future_devices(device: torch.device) -> list[torch.device]:
@@ -1072,188 +1067,120 @@ def _ordered_compressed_entries(
 def _prepare_score_plus_aux_buffer(
     state: GreedyLoreDDPState,
     context: BucketContext,
-) -> tuple[
-    Tensor,
-    list[CompressedMatrixBatch],
-    list[tuple[Tensor, int, int]],
-]:
+) -> tuple[Tensor, list[CompressedMatrixWork], list[tuple[Tensor, int, int]]]:
     with _profile_range("greedylore_hook/score"):
-        if context.phase is None:
-            raise GreedyLoreStateError("compressed score packing requires a phase")
-        ordered_entries = _ordered_compressed_entries(state, context)
-        grouped_entries: dict[
-            tuple[
-                tuple[int, int],
-                torch.dtype,
-                torch.device,
-                torch.dtype,
-                torch.dtype,
-            ],
-            list[tuple[Tensor, GreedyLoreParameterState]],
-        ] = {}
-        for gradient, parameter_state, _parameter, _stable_id in ordered_entries:
-            if parameter_state is None:
-                continue
-            key = (
-                parameter_state.orientation.compressed_shape,
-                gradient.dtype,
-                gradient.device,
-                parameter_state.error.dtype,
-                parameter_state.basis.dtype,
-            )
-            grouped_entries.setdefault(key, []).append((gradient, parameter_state))
-
-        matrix_batches = []
-        work_by_state_id = {}
-        for entries in grouped_entries.values():
-            corrected_batch = torch.stack(
-                [
-                    corrected_gradient(
-                        gradient,
-                        parameter_state.error,
-                        parameter_state.orientation,
-                    )
-                    for gradient, parameter_state in entries
-                ]
-            )
-            basis_batch = torch.stack(
-                [parameter_state.basis for _gradient, parameter_state in entries]
-            )
-            rows, columns = corrected_batch.shape[1:]
-            random_batch = torch.stack(
-                [
-                    make_random_vectors(
-                        rows=rows,
-                        columns=columns,
-                        seed=derive_greedy_lore_seed(
-                            base_seed=state.config.seed,
-                            phase=context.phase,
-                            stable_parameter_id=parameter_state.spec.stable_id,
-                        ),
-                        device=corrected_batch.device,
-                    )
-                    for _gradient, parameter_state in entries
-                ]
-            )
-            projected_rows = torch.bmm(basis_batch.transpose(1, 2), corrected_batch)
-            signed_lambda_batch = (projected_rows * random_batch).sum(dim=2)
-            works = []
-            for index, (gradient, parameter_state) in enumerate(entries):
-                work = CompressedMatrixWork(
-                    gradient=gradient,
-                    parameter_state=parameter_state,
-                    corrected=corrected_batch[index],
-                    signed_lambda=signed_lambda_batch[index],
-                    score_offset=-1,
-                )
-                works.append(work)
-                work_by_state_id[id(parameter_state)] = work
-            matrix_batches.append(
-                CompressedMatrixBatch(
-                    works=tuple(works),
-                    corrected=corrected_batch,
-                    basis=basis_batch,
-                )
-            )
-
         chunks = []
+        matrix_work = []
         dense_ranges = []
         offset = 0
-        for gradient, parameter_state, _parameter, _stable_id in ordered_entries:
+        if context.phase is None:
+            raise GreedyLoreStateError("compressed score packing requires a phase")
+        for gradient, parameter_state, _parameter, _stable_id in _ordered_compressed_entries(
+            state,
+            context,
+        ):
             if parameter_state is None:
                 flat_dense = gradient.reshape(-1).to(dtype=torch.float32)
                 chunks.append(flat_dense)
                 dense_ranges.append((gradient, offset, flat_dense.numel()))
                 offset += flat_dense.numel()
                 continue
-            work = work_by_state_id[id(parameter_state)]
-            work.score_offset = offset
-            chunks.append(work.signed_lambda)
-            offset += work.signed_lambda.numel()
+            corrected = corrected_gradient(
+                gradient,
+                parameter_state.error,
+                parameter_state.orientation,
+            )
+            rows, columns = corrected.shape
+            random_vectors = make_random_vectors(
+                rows=rows,
+                columns=columns,
+                seed=derive_greedy_lore_seed(
+                    base_seed=state.config.seed,
+                    phase=context.phase,
+                    stable_parameter_id=parameter_state.spec.stable_id,
+                ),
+                device=corrected.device,
+            )
+            signed_lambda = approximate_signed_lambda(
+                corrected,
+                parameter_state.basis,
+                random_vectors,
+            )
+            chunks.append(signed_lambda)
+            matrix_work.append(
+                CompressedMatrixWork(
+                    gradient=gradient,
+                    parameter_state=parameter_state,
+                    corrected=corrected,
+                    signed_lambda=signed_lambda,
+                    score_offset=offset,
+                )
+            )
+            offset += signed_lambda.numel()
         if not chunks:
             return (
                 torch.empty(0, dtype=torch.float32, device=context.buffer.device),
-                matrix_batches,
+                matrix_work,
                 dense_ranges,
             )
         score_plus_aux = torch.cat([chunk.reshape(-1) for chunk in chunks])
-        context.retained.extend([score_plus_aux, matrix_batches, dense_ranges])
-        return score_plus_aux, matrix_batches, dense_ranges
+        context.retained.extend([score_plus_aux, matrix_work, dense_ranges])
+        return score_plus_aux, matrix_work, dense_ranges
 
 
-def _select_projector_batch_profiled(
+def _select_projector_profiled(
     state: GreedyLoreDDPState,
-    batch: CompressedMatrixBatch,
+    work: CompressedMatrixWork,
     averaged_lambda: Tensor,
-) -> Tensor:
+) -> None:
     with _profile_range("greedylore_hook/topr"):
-        support = torch.argsort(
-            averaged_lambda.square(), dim=1, descending=True, stable=True
-        )[:, : state.config.rank]
-        projector = torch.gather(
-            batch.basis,
-            dim=2,
-            index=support.unsqueeze(1).expand(
-                -1, batch.basis.shape[1], state.config.rank
-            ),
+        projector, support = select_projector(
+            work.parameter_state.basis,
+            averaged_lambda,
+            state.config.rank,
         )
-    batch.projector = projector
-    for index, work in enumerate(batch.works):
-        work.projector = projector[index]
-        work.support = support[index]
-        work.parameter_state.last_support.copy_(support[index])
-    return projector
+    work.projector = projector
+    work.support = support
+    work.parameter_state.last_support.copy_(support)
 
 
-def _compress_local_batch_profiled(
-    batch: CompressedMatrixBatch,
-    projector: Tensor,
+def _compress_local_profiled(
+    work: CompressedMatrixWork,
     factor_buffer: Tensor,
     offset: int,
 ) -> int:
-    batch_size, _rows, columns = batch.corrected.shape
-    factor_numel = batch_size * projector.shape[2] * columns
+    assert work.projector is not None
+    columns = work.corrected.shape[1]
+    factor_numel = work.projector.shape[1] * columns
     local_factor = factor_buffer[offset : offset + factor_numel].view(
-        batch_size, projector.shape[2], columns
+        work.projector.shape[1], columns
     )
     with _profile_range("greedylore_hook/factor"):
-        torch.bmm(projector.transpose(1, 2), batch.corrected, out=local_factor)
+        torch.mm(work.projector.mT, work.corrected, out=local_factor)
     with _profile_range("greedylore_hook/error"):
-        next_error = batch.corrected - torch.bmm(projector, local_factor)
-        torch._foreach_copy_(
-            [work.parameter_state.error for work in batch.works],
-            list(next_error.unbind(0)),
-        )
-    for index, work in enumerate(batch.works):
-        work.factor_offset = offset + index * projector.shape[2] * columns
-        work.local_factor = local_factor[index]
+        next_error = work.corrected - work.projector @ local_factor
+        work.parameter_state.error.copy_(next_error)
+    work.factor_offset = offset
+    work.local_factor = local_factor
     return offset + factor_numel
 
 
 def _prepare_factor_buffer(
     state: GreedyLoreDDPState,
     score_plus_aux: Tensor,
-    matrix_batches: list[CompressedMatrixBatch],
+    matrix_work: list[CompressedMatrixWork],
 ) -> Tensor:
     factor_numel = sum(
-        len(batch.works) * state.config.rank * batch.corrected.shape[2]
-        for batch in matrix_batches
+        state.config.rank * work.corrected.shape[1] for work in matrix_work
     )
     factor_buffer = score_plus_aux.new_empty(factor_numel)
     offset = 0
-    for batch in matrix_batches:
-        averaged_lambda = torch.stack(
-            [
-                score_plus_aux[
-                    work.score_offset : work.score_offset + work.signed_lambda.numel()
-                ]
-                for work in batch.works
-            ]
-        )
-        projector = _select_projector_batch_profiled(state, batch, averaged_lambda)
-        offset = _compress_local_batch_profiled(
-            batch, projector, factor_buffer, offset
-        )
+    for work in matrix_work:
+        averaged_lambda = score_plus_aux[
+            work.score_offset : work.score_offset + work.signed_lambda.numel()
+        ]
+        _select_projector_profiled(state, work, averaged_lambda)
+        offset = _compress_local_profiled(work, factor_buffer, offset)
     return factor_buffer
 
 
@@ -1269,28 +1196,26 @@ def _copy_averaged_dense_aux(
 def _reconstruct_compressed_matrices(
     state: GreedyLoreDDPState,
     factor_buffer: Tensor,
-    matrix_batches: list[CompressedMatrixBatch],
+    matrix_work: list[CompressedMatrixWork],
 ) -> Tensor:
     if state.world_size > 1:
         factor_buffer.div_(state.world_size)
     with _profile_range("greedylore_hook/reconstruction"):
-        for batch in matrix_batches:
-            first = batch.works[0]
-            assert batch.projector is not None
-            assert first.local_factor is not None
-            assert first.factor_offset is not None
-            batch_factor_numel = len(batch.works) * first.local_factor.numel()
+        for work in matrix_work:
+            assert work.projector is not None
+            assert work.local_factor is not None
+            assert work.factor_offset is not None
+            offset = work.factor_offset
             averaged_factor = factor_buffer[
-                first.factor_offset : first.factor_offset + batch_factor_numel
-            ].view(len(batch.works), *first.local_factor.shape)
-            reconstructed = torch.bmm(batch.projector, averaged_factor)
-            for index, work in enumerate(batch.works):
-                work.gradient.copy_(
-                    unorient_matrix(
-                        reconstructed[index], work.parameter_state.orientation
-                    ).to(dtype=work.gradient.dtype)
+                offset : offset + work.local_factor.numel()
+            ].view_as(work.local_factor)
+            reconstructed = reconstruct_global(work.projector, averaged_factor)
+            work.gradient.copy_(
+                unorient_matrix(reconstructed, work.parameter_state.orientation).to(
+                    dtype=work.gradient.dtype
                 )
-    return matrix_batches[0].works[0].gradient.new_empty(0)
+            )
+    return matrix_work[0].gradient.new_empty(0)
 
 
 def _mark_future_complete(future: torch.futures.Future) -> torch.futures.Future:
@@ -1309,8 +1234,9 @@ def _launch_compressed_bucket(
     if not _matrix_entries(context):
         return _launch_dense_bucket(state, context)
 
-    score_plus_aux, matrix_batches, dense_ranges = (
-        _prepare_score_plus_aux_buffer(state, context)
+    score_plus_aux, matrix_work, dense_ranges = _prepare_score_plus_aux_buffer(
+        state,
+        context,
     )
     score_source = _all_reduce_future(
         state,
@@ -1332,7 +1258,7 @@ def _launch_compressed_bucket(
             factor_buffer = _prepare_factor_buffer(
                 state,
                 reduced_score_plus_aux,
-                matrix_batches,
+                matrix_work,
             )
             context.retained.append(factor_buffer)
             factor_source = _all_reduce_future(
@@ -1343,9 +1269,7 @@ def _launch_compressed_bucket(
 
             def after_factor(factor_completed: torch.futures.Future) -> Tensor:
                 reduced_factor = _future_tensor(factor_completed.value())
-                _reconstruct_compressed_matrices(
-                    state, reduced_factor, matrix_batches
-                )
+                _reconstruct_compressed_matrices(state, reduced_factor, matrix_work)
                 return context.buffer
 
             factor_completion = factor_source.then(

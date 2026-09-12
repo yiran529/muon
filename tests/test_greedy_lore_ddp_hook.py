@@ -256,7 +256,7 @@ def test_compressed_step_reduces_signed_scores_before_square_and_updates_local_e
     torch.testing.assert_close(bucket.gradients()[1], expected_dense)
 
 
-def test_compressed_step_batches_compatible_oriented_shapes():
+def test_compressed_step_keeps_compatible_oriented_shapes_on_per_matrix_path():
     first = torch.nn.Parameter(torch.zeros(3, 2))
     different = torch.nn.Parameter(torch.zeros(2, 4))
     second = torch.nn.Parameter(torch.zeros(2, 3))
@@ -288,15 +288,15 @@ def test_compressed_step_batches_compatible_oriented_shapes():
     operator_counts = {event.key: event.count for event in profiler.key_averages()}
     assert result is bucket.buffer()
     assert torch.isfinite(result).all()
-    # The (3, 2) and (2, 3) matrices share the canonical (2, 3) orientation.
-    # Each canonical-shape group performs batched score, factor, error, and
-    # final reconstruction matrix multiplies.
-    assert operator_counts["aten::bmm"] == 8
-    assert operator_counts["aten::sort"] == 2
-    assert operator_counts["aten::gather"] == 2
+    # The (3, 2) and (2, 3) matrices share the canonical (2, 3) orientation,
+    # but the ordinary compressed path deliberately avoids full-matrix stack
+    # materialization and performs four matrix multiplies per parameter.
+    assert operator_counts.get("aten::bmm", 0) == 0
+    assert operator_counts["aten::mm"] == 12
+    assert operator_counts["aten::sort"] == 3
 
 
-def test_batched_factors_are_direct_views_into_the_packed_collective_buffer():
+def test_per_matrix_factors_are_direct_views_into_the_packed_collective_buffer():
     first = torch.nn.Parameter(torch.zeros(3, 2))
     different = torch.nn.Parameter(torch.zeros(2, 4))
     second = torch.nn.Parameter(torch.zeros(3, 2))
@@ -321,23 +321,22 @@ def test_batched_factors_are_direct_views_into_the_packed_collective_buffer():
     state.committed_step = 1
     state.begin_step()
     context = state.note_bucket(bucket)
-    score_buffer, matrix_batches, _dense_ranges = (
+    score_buffer, matrix_work, _dense_ranges = (
         hook_module._prepare_score_plus_aux_buffer(state, context)
     )
 
     factor_buffer = hook_module._prepare_factor_buffer(
-        state, score_buffer, matrix_batches
+        state, score_buffer, matrix_work
     )
 
     factor_storage = factor_buffer.untyped_storage().data_ptr()
-    works = [work for batch in matrix_batches for work in batch.works]
-    assert [work.factor_offset for work in works] == [0, 3, 6]
+    assert [work.factor_offset for work in matrix_work] == [0, 3, 7]
     assert all(
         work.local_factor is not None
         and work.local_factor.untyped_storage().data_ptr() == factor_storage
         and work.factor_offset == work.local_factor.storage_offset()
         and work.local_factor.is_contiguous()
-        for work in works
+        for work in matrix_work
     )
 
 
@@ -440,8 +439,8 @@ def test_registered_hook_callback_path_avoids_forbidden_synchronization():
         hook_module._parameter_spec_for_dense,
         hook_module._ordered_compressed_entries,
         hook_module._prepare_score_plus_aux_buffer,
-        hook_module._select_projector_batch_profiled,
-        hook_module._compress_local_batch_profiled,
+        hook_module._select_projector_profiled,
+        hook_module._compress_local_profiled,
         hook_module._prepare_factor_buffer,
         hook_module._copy_averaged_dense_aux,
         hook_module._reconstruct_compressed_matrices,
