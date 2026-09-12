@@ -303,3 +303,21 @@ controller 于 01:55 获得 GPU 2–5，4/4 probes 与 4/4 formal cells 均 exit
 130M dense/M002 的 final val loss 为 `3.5749/3.6582`，perplexity 为 `35.69/38.79`（M002 `+8.69%`），step 为 `241.22/238.01 ms`（`-1.33%`），peak 为 `13048/13889 MiB`。两组 best val loss 都是 final loss，M002 均未在当前预算内达到 dense final quality，故没有 dense-final-quality time-to-quality。
 
 结论为 **quality-negative**：130M 的小幅 step 收益延续 CM049 方向，但单次差异小于 2%，且不能补偿约 8.7% perplexity 退化；60M 同时没有性能收益。暂不扩展多 seed，优先评估修改量小的 rank/start-step 敏感性，all-2D 仍须作为单独方法范围消融登记。W&B IDs：CM052a `80b662fz`、CM052b `ktl0jkfd`、CM053a `wda2zc6n`、CM053b `9rugk05n`。
+
+## 2026-09-12：普通 compressed step same-shape batching
+
+为减少普通 compressed step 的逐参数 Python 与小 kernel launch 开销，按稳定参数顺序将矩阵以 canonical oriented shape、gradient device/dtype、error dtype 和 basis dtype 分组。每组使用 batched score、稳定 Top-r gather、factor、error 与 reconstruction；相反原始方向但 canonical shape 相同的矩阵进入同一组。现有 `score+dense_aux -> factor` 两阶段 All-Reduce、每参数稳定 seed 和全局 cross-bucket Future 顺序保持不变。
+
+factor collective buffer 改为预先计算总大小并一次分配；每组 `torch.bmm(..., out=view)` 直接写入连续 packed view，移除原先逐参数 `.clone()` 后再 `torch.cat()` 的路径。首版未引入持久 workspace、refresh SVD batching、跨 bucket 并发或 collective 变更。
+
+TDD 新增 operator-count 与 storage-sharing 回归：同 canonical shape 的 `(3, 2)`/`(2, 3)` 矩阵按一个 batch 执行，local factor 的 storage pointer、offset 和连续性与 packed collective buffer 一致。canonical grouping mutation 会令 `bmm` 次数由 8 增至 12 并触发测试失败。相关 hook/Future/Gloo 聚焦回归为 `22 passed`；完整 GreedyLore CPU gate 为 `208 passed`；在用户允许与现有任务共享且显存充足的 GPU4/5 上，两卡 NCCL gate 为 `3 passed`。静态 `ruff` 工具在冻结环境中不存在，未修改环境安装；`py_compile` 与 `git diff --check` 通过。
+
+当前只完成实现与正确性验证，尚未产生正式性能数据，不更新 RESULTS 或作 wall-clock 改善声明。下一步是在相同 interval-200 paired timing 几何下先测 60M/130M，记录 compressed-step launch 数、完整周期 step time 与 peak allocated，再决定是否增加持久 workspace 或 batched refresh SVD。
+
+## 2026-09-12：CM054 batched 60M paired timing 计划
+
+CM054 严格复用 CM047 的 60M 几何与计时口径：dim512/4 layers/8 heads、4-rank DDP、BF16 compile、FineWeb10B、seq256、global/device batch512/128、GA1、rank32、interval200、bucket160 MiB、seed42；每个 cell 为 20 warmup + 200 measured updates，dense/local-SVD 做 3 次 rotated-order pairing。唯一方法实现差异是本日志上一节的 ordinary-step same-shape batching 与 factor direct-write。
+
+为避免现有共享任务污染 wall-clock，复用 `run_greedy_lore_profiler.sh` 的动态 GPU gate，等待任意四张 `memory.used < 1024 MiB` 的卡，并在每个 cell 前重新检查。正式实验设 `profile_modes=none`，只生成 6 个 timing cell，不采集 Kineto trace；完成后再依据 paired repeats 比较 CM054 内 dense/local-SVD，并把两者分别与 CM047 的同期旧实现结果作历史参考。跨实验差值只解释为实现优化信号，不替代 CM054 内配对统计。
+
+12:32 在 tmux `cm054_m002_60m_batched` 启动 controller；启动后 artifact plan 已核验为上述 6 个 rotated timing cells，首次 gate 记录 `idle_count=1 required=4`，当前处于自动等待。启动时 `dion/greedy_lore_ddp_hook.py` SHA-256 为 `8d4f9ac73bd9c40e4030617d19b2b0107d64159c2b852cbb6e0c8bd593f150ee`；状态日志为 `artifacts/compressed_muon/CM054-m002-gpt60m-batched-interval200-ddp-ws4-s42/status.log`。

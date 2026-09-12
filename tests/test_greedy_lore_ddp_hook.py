@@ -256,6 +256,91 @@ def test_compressed_step_reduces_signed_scores_before_square_and_updates_local_e
     torch.testing.assert_close(bucket.gradients()[1], expected_dense)
 
 
+def test_compressed_step_batches_compatible_oriented_shapes():
+    first = torch.nn.Parameter(torch.zeros(3, 2))
+    different = torch.nn.Parameter(torch.zeros(2, 4))
+    second = torch.nn.Parameter(torch.zeros(2, 3))
+    parameters = [first, different, second]
+    gradients = [
+        torch.tensor([[8.0, 1.0], [3.0, 7.0], [2.0, 9.0]]),
+        torch.tensor([[9.0, 2.0, 8.0, 1.0], [1.0, 7.0, 3.0, 6.0]]),
+        torch.tensor([[4.0, 12.0, 10.0], [5.0, 13.0, 6.0]]),
+    ]
+    bucket = FakeGradBucket(parameters, gradients)
+    state = _state(
+        [
+            (first, "first", "matrix"),
+            (different, "different", "matrix"),
+            (second, "second", "matrix"),
+        ],
+        start_compress_step=0,
+        update_interval=100,
+    )
+    state.committed_step = 1
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profiler:
+        state.begin_step()
+        result = greedy_lore_ddp_hook(state, bucket).wait()
+        state.finish_step()
+
+    operator_counts = {event.key: event.count for event in profiler.key_averages()}
+    assert result is bucket.buffer()
+    assert torch.isfinite(result).all()
+    # The (3, 2) and (2, 3) matrices share the canonical (2, 3) orientation.
+    # Each canonical-shape group performs batched score, factor, error, and
+    # final reconstruction matrix multiplies.
+    assert operator_counts["aten::bmm"] == 8
+    assert operator_counts["aten::sort"] == 2
+    assert operator_counts["aten::gather"] == 2
+
+
+def test_batched_factors_are_direct_views_into_the_packed_collective_buffer():
+    first = torch.nn.Parameter(torch.zeros(3, 2))
+    different = torch.nn.Parameter(torch.zeros(2, 4))
+    second = torch.nn.Parameter(torch.zeros(3, 2))
+    parameters = [first, different, second]
+    bucket = FakeGradBucket(
+        parameters,
+        [
+            torch.arange(6.0).view_as(first) + 1,
+            torch.arange(8.0).view_as(different) + 11,
+            torch.arange(6.0).view_as(second) + 21,
+        ],
+    )
+    state = _state(
+        [
+            (first, "first", "matrix"),
+            (different, "different", "matrix"),
+            (second, "second", "matrix"),
+        ],
+        start_compress_step=0,
+        update_interval=100,
+    )
+    state.committed_step = 1
+    state.begin_step()
+    context = state.note_bucket(bucket)
+    score_buffer, matrix_batches, _dense_ranges = (
+        hook_module._prepare_score_plus_aux_buffer(state, context)
+    )
+
+    factor_buffer = hook_module._prepare_factor_buffer(
+        state, score_buffer, matrix_batches
+    )
+
+    factor_storage = factor_buffer.untyped_storage().data_ptr()
+    works = [work for batch in matrix_batches for work in batch.works]
+    assert [work.factor_offset for work in works] == [0, 3, 6]
+    assert all(
+        work.local_factor is not None
+        and work.local_factor.untyped_storage().data_ptr() == factor_storage
+        and work.factor_offset == work.local_factor.storage_offset()
+        and work.local_factor.is_contiguous()
+        for work in works
+    )
+
+
 def test_compressed_dense_only_bucket_metadata_has_no_matrix_payload():
     dense = torch.nn.Parameter(torch.zeros(3))
     bucket = FakeGradBucket([dense], [torch.ones_like(dense)])
@@ -355,8 +440,8 @@ def test_registered_hook_callback_path_avoids_forbidden_synchronization():
         hook_module._parameter_spec_for_dense,
         hook_module._ordered_compressed_entries,
         hook_module._prepare_score_plus_aux_buffer,
-        hook_module._select_projector_profiled,
-        hook_module._compress_local_profiled,
+        hook_module._select_projector_batch_profiled,
+        hook_module._compress_local_batch_profiled,
         hook_module._prepare_factor_buffer,
         hook_module._copy_averaged_dense_aux,
         hook_module._reconstruct_compressed_matrices,
