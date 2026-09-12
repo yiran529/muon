@@ -321,3 +321,15 @@ CM054 严格复用 CM047 的 60M 几何与计时口径：dim512/4 layers/8 heads
 为避免现有共享任务污染 wall-clock，复用 `run_greedy_lore_profiler.sh` 的动态 GPU gate，等待任意四张 `memory.used < 1024 MiB` 的卡，并在每个 cell 前重新检查。正式实验设 `profile_modes=none`，只生成 6 个 timing cell，不采集 Kineto trace；完成后再依据 paired repeats 比较 CM054 内 dense/local-SVD，并把两者分别与 CM047 的同期旧实现结果作历史参考。跨实验差值只解释为实现优化信号，不替代 CM054 内配对统计。
 
 12:32 在 tmux `cm054_m002_60m_batched` 启动 controller；启动后 artifact plan 已核验为上述 6 个 rotated timing cells，首次 gate 记录 `idle_count=1 required=4`，当前处于自动等待。启动时 `dion/greedy_lore_ddp_hook.py` SHA-256 为 `8d4f9ac73bd9c40e4030617d19b2b0107d64159c2b852cbb6e0c8bd593f150ee`；状态日志为 `artifacts/compressed_muon/CM054-m002-gpt60m-batched-interval200-ddp-ws4-s42/status.log`。
+
+### CM054 完成结果
+
+controller 于 13:29 获得 GPU `2,4,6,7`，并于 13:35 完成。6/6 timing cells exit `0`，每个日志的末尾 `step_avg` 均为有限正值，只有 dense 日志 step0 的计时初始化 marker 为预期 `nan`；stderr 仅含 torchrun 的 OMP 提示和 tqdm 输出，无 OOM、timeout 或 traceback。`summary.json` 的 profile cells 为空，artifact 内 trace 数为 0。
+
+- dense：`109.86/112.36/110.70 ms`，mean `110.973 ms`，CV `1.15%`，peak `6865 MiB`。
+- batched local-SVD：`110.52/110.54/113.08 ms`，mean `111.380 ms`，CV `1.32%`，peak `7345 MiB`。
+- paired local-SVD minus dense：`+0.66/-1.82/+2.38 ms`，mean `+0.407 ms` / `+0.377%`，bootstrap mean-difference 95% interval `[-1.82,2.38] ms`。
+
+结果分类为 **null**。相对历史 CM047，CM054 dense 从 `113.167` 降至 `110.973 ms`（`-1.94%`），local-SVD 从 `113.360` 降至 `111.380 ms`（`-1.75%`）；两模式同向下降，且 CM054 内 local-SVD 相对 dense 的差值仍为零附近，因此不能把绝对下降归因于 batching。local-SVD peak 从历史 `7347` 变为 `7345 MiB`，2 MiB 差异无实用意义。当前证据表明 same-shape batching/direct-write 在 60M 上正确但没有可测的完整周期 wall-clock 收益；若继续性能诊断，应先采集单个普通 compressed step 的轻量算子/allocator 证据，确认 `stack` 临时量与 launch reduction 的实际抵消关系，再决定是否投入持久 workspace，或转向更可能受益的 130M/350M。
+
+artifact：`artifacts/compressed_muon/CM054-m002-gpt60m-batched-interval200-ddp-ws4-s42/`。

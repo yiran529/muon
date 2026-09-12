@@ -407,3 +407,18 @@ trace；保留的 trace 来自单独的 CM050 preflight，不能用来替代 CM0
 - `artifacts/compressed_muon/CM052b-m002-greedylore-muon-gpt60m-paper-aligned-ddp-ws4-s1234/`
 - `artifacts/compressed_muon/CM053a-dense-muon-gpt130m-paper-aligned-ddp-ws4-s1234/`
 - `artifacts/compressed_muon/CM053b-m002-greedylore-muon-gpt130m-paper-aligned-ddp-ws4-s1234/`
+
+## CM054：M002 ordinary-step batching 60M timing（2026-09-12）
+
+在 M002 普通 compressed step 加入 canonical same-shape batching，并让 batched factor 直接写入一次分配的 packed collective buffer 后，严格复用 CM047 的 60M timing 几何和 3 次 rotated-order pairing；本实验只运行 profiler-off timing，不生成 trace。
+
+| 模式 | repeats step ms | mean / median | sample SD / CV | throughput | peak allocated |
+|---|---|---:|---:|---:|---:|
+| dense | 109.86 / 112.36 / 110.70 | 110.973 / 110.700 ms | 1.272 ms / 1.15% | 1,181,216 tok/s | 6865 MiB |
+| batched local-SVD | 110.52 / 110.54 / 113.08 | 111.380 / 110.540 ms | 1.472 ms / 1.32% | 1,176,936 tok/s | 7345 MiB |
+
+按相同 repeat 配对，batched local-SVD 相对 dense 为 `+0.66/-1.82/+2.38 ms`，平均 `+0.407 ms` / `+0.377%`，paired bootstrap mean-difference 95% interval 为 `[-1.82,2.38] ms`，分类为 **null**。相对历史 CM047，dense/local-SVD 的绝对 step 分别下降 `1.94%/1.75%`，两者同步变化；local-SVD 相对 dense 的配对结果则从 CM047 的 `+0.17%` 变为 CM054 的 `+0.38%`，均接近零。因此没有证据表明 batching/direct-write 在 60M 上产生了可测的完整周期加速，也不能把跨实验的绝对下降归因于实现改动。peak allocated 相对 CM047 仅少 `2 MiB`，视为无实用差异。
+
+6/6 cells exit `0`，所有末尾 timing marker 均为有限正值，日志无 OOM/timeout/traceback；step0 的 `nan` 只出现在 dense 计时尚未开始的初始化 marker。实验使用动态空闲门禁选出的 GPU `2,4,6,7`，timing-only artifact 不含 profiler trace。该短程实验不提供新的质量或 time-to-quality 结论。
+
+原始产物：`artifacts/compressed_muon/CM054-m002-gpt60m-batched-interval200-ddp-ws4-s42/`。
