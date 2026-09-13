@@ -62,6 +62,7 @@ class Hyperparameters:
     model_dim: int = 768
     n_layer: int = 12
     n_head: int = 6
+    model_dtype: str = "float32"
 
     # Evaluation and logging
     val_loss_every: int = 125
@@ -348,6 +349,12 @@ def parse_cli_args(configure_parser=None):
     parser.add_argument("--model_dim", type=int, default=None)
     parser.add_argument("--n_layer", type=int, default=None)
     parser.add_argument("--n_head", type=int, default=None)
+    parser.add_argument(
+        "--model_dtype",
+        choices=("float32", "bfloat16"),
+        default=None,
+        help="Storage dtype for all trainable model parameters",
+    )
 
     # ---------- training hyperparameters ----------
     parser.add_argument(
@@ -527,6 +534,39 @@ def init_distributed(dp_size, fs_size, tp_size) -> Optional[DeviceMesh]:
         print0(device_mesh)
 
     return device_mesh
+
+
+def resolve_model_dtype(name: str) -> torch.dtype:
+    """Resolve the configured trainable parameter storage dtype."""
+
+    try:
+        return {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+        }[name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported model dtype: {name!r}") from exc
+
+
+def validate_model_dtype_parallelism(
+    name: str, device_mesh: Optional[DeviceMesh]
+) -> None:
+    """Reject ambiguous overlap with the existing FSDP precision policy."""
+
+    resolve_model_dtype(name)
+    if name == "bfloat16" and device_mesh is not None:
+        raise ValueError("bfloat16 model parameter storage is currently DDP only")
+
+
+def materialize_and_initialize_model(
+    model: GPT, *, device: str, dtype: torch.dtype
+) -> None:
+    """Materialize a meta GPT and initialize weights in the requested dtype."""
+
+    model.to_empty(device=device)
+    if any(parameter.dtype != dtype for parameter in model.parameters()):
+        model.to(dtype=dtype)
+    model.init_weights()
 
 
 def build_adamw_optimizer(
@@ -1018,6 +1058,8 @@ def main(
         fs_size=cli_args.fs_size,
         tp_size=cli_args.tp_size,
     )
+    validate_model_dtype_parallelism(hp.model_dtype, device_mesh)
+    model_dtype = resolve_model_dtype(hp.model_dtype)
     print0("=" * 80)
 
     # --- DataLoader Setup ---
@@ -1097,6 +1139,7 @@ def main(
     print0(f"Model dimension: {hp.model_dim}")
     print0(f"Number of layers: {hp.n_layer}")
     print0(f"Number of heads: {hp.n_head}")
+    print0(f"Model parameter dtype: {hp.model_dtype}")
 
     num_vocab = 50304  # nearest multiple of 128 for efficiency
     gpt_config = GPTConfig(
@@ -1124,8 +1167,7 @@ def main(
         raw_model = model
 
     # Move model to GPU
-    model.to_empty(device="cuda")
-    model.init_weights()
+    materialize_and_initialize_model(model, device="cuda", dtype=model_dtype)
     if not cli_args.no_compile:
         model.compile()
 
