@@ -372,3 +372,19 @@ artifact：`artifacts/compressed_muon/CM063-*-m002-gpt130m-phase-timing-*/`。
 `benchmark/compressed_muon/run_cm052c_cm053c_m002_rank_scaling_quality.sh` 先对两个模型执行覆盖 refresh/compressed 路径的 3-step probe，再按 CM052c→CM053c 串行正式训练；任一 probe 或正式 cell 失败即停止。controller 动态等待任意 4 张至少有 18 GiB 空闲显存的 GPU，不启用 Kineto trace，不设置基于历史 dense 的自动 quality gate。结果分别与已有 CM052a/CM053a dense 和 CM052b/CM053b rank32 进行历史对比。
 
 延时会话于 2026-09-13 00:40:25（Asia/Shanghai）创建为 tmux `cm052c_cm053c_high_rank`，目标启动时间为 01:32:01，与本次请求首次记录时间相隔一小时。创建时 W&B 已认证，数据、torchrun 和三个目标 artifact 路径均通过预检；GPU 2–7 各约有 24.1 GiB 空闲，GPU 0–1 上已有进程且不会被选择。到点后的实际资源仍由 controller 重新检查，不满足门槛时自动等待。
+
+## 2026-09-13：CM063b/CM063c bucket80 跨规模复测
+
+在原始逐矩阵 M002 local-SVD 上固定 rank32、interval200 和 seed42，以 80 MiB bucket 对 60M/350M 各做 3 组 dense/M002 rotated pairing。60M dense/M002 mean 为 `100.277/102.647 ms`，M002 慢 `2.37%`，peak `6865/7182 MiB`；350M M002 稳定在 `206.90–208.07 ms`，前两组相对 dense 快 `6.46%/6.15%`，第三组 dense 异常偏慢，因此只保留约 `6%–7%` 的稳健加速信号，不采用 `10.37%` 均值作 claim。80 MiB 不是跨规模通用默认值：60M 为负向，350M 也弱于 CM051 的 bucket160 结果。
+
+## 2026-09-13：CM064 130M bucket-cap 粗扫
+
+串行扫描 `80/160/256/384 MiB`，每点各跑一次 interval100/200、各覆盖 200 measured update，并交替两种 interval 顺序。8/8 cells exit0，无 OOM。interval200 分别为 `228.86/233.85/248.16/250.02 ms`；对应差分 ordinary 估计为 `223.75/224.49/238.95/242.73 ms`，refresh 摊销为 `5.11/9.36/9.21/7.29 ms/update`。单次扫描中 80 MiB 比 160 MiB 快 `4.99 ms`（`2.13%`），据此只把后续候选范围收窄到 `64–128 MiB`；不为单点粗扫赋予正式性能 claim，也不把该结论外推到 60M/350M。
+
+artifact：`artifacts/compressed_muon/CM064-m002-gpt130m-bucket-cap-sweep-ws4-s42/`。
+
+## 2026-09-13：CM049 ordinary trace 修正版聚焦重解析
+
+P0 parser 修复后，聚焦重解析 CM049 的 12 份 dense ordinary 与 12 份 GreedyLore ordinary trace。GreedyLore local GPU mean 为 score `4.675 ms`、Top-r `0.925 ms`、factor `0.578 ms`、error `0.960 ms`、reconstruction `0.603 ms`，合计约 `7.741 ms`；score 是 ordinary local 算术最大单项。dense/GreedyLore 的 exposed NCCL mean 为 `61.123/53.892 ms`，Muon-result collective 为 `8.834/8.694 ms`；GreedyLore score+dense-aux/factor collective 为 `41.535/3.817 ms`。
+
+这只是 12+12 trace 的内存聚焦样本，不冒充未完成的 48-trace 全量汇总。Kineto profile window 对 M002 扰动很大（dense/GreedyLore `240.719/283.761 ms`），所以端到端结论继续以 profiler-off CM049 timing 为准；修正版 trace 只用于热点排序和通信量级判断。结合 CM054/CM058–CM059，ordinary 的 batching/factor packing 已无收益证据；下一项 ordinary 优化若继续，应先围绕 score 收集 allocator 与 kernel-launch 证据。CM064 的 cap80 refresh 摊销约 `5.11 ms/update`，说明 refresh 优化仍是较低风险方向，但完整消除的理论上限也只有该点周期时间约 `2.2%`。

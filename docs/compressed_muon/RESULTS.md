@@ -571,3 +571,41 @@ CM058/CM059 共 12/12 cells exit `0`，所有末尾 timing marker 均为有限�
 
 - `artifacts/compressed_muon/CM063b-m002-gpt60m-bucket80-interval200-ddp-ws4-s42/`
 - `artifacts/compressed_muon/CM063c-m002-gpt350m-bucket80-interval200-ddp-ws4-s42/`
+
+## CM064：130M bucket-cap 粗扫与 refresh 分相（2026-09-13）
+
+固定 CM049/CM063 的 GPT-130M、4 卡、seq256、global/device batch512/128、rank32、seed42 和恢复后的原始 M002 local-SVD，只扫描 bucket cap `80/160/256/384 MiB`。每个 cap 各运行一次 interval100 和 interval200，两个窗口都覆盖 200 个 profiler-off measured update；为减轻固定顺序偏差，四组交替采用 `100→200` 与 `200→100`。8/8 cells exit `0`，无 OOM、timeout 或 traceback。
+
+| bucket cap | interval100 A | interval200 B | ordinary 估计 `2B-A` | refresh 估计 `199A-198B` | refresh 摊销 `(A-B)` | peak allocated |
+|---:|---:|---:|---:|---:|---:|---:|
+| 80 MiB | 233.97 ms | **228.86 ms** | 223.75 ms | 1245.75 ms | **5.11 ms/update** | 13841 MiB |
+| 160 MiB | 243.21 ms | 233.85 ms | 224.49 ms | 2096.49 ms | 9.36 ms/update | 13889 MiB |
+| 256 MiB | 257.37 ms | 248.16 ms | 238.95 ms | 2080.95 ms | 9.21 ms/update | 13937 MiB |
+| 384 MiB | 257.31 ms | 250.02 ms | 242.73 ms | 1700.73 ms | 7.29 ms/update | 13937 MiB |
+
+本次单次粗扫中，80 MiB 的 interval200 完整周期比 160 MiB 快 `4.99 ms/update`（`2.13%`），ordinary 估计也最低；因此 130M 下一轮候选范围收窄到约 `64–128 MiB`，没有证据支持继续测试 `>=256 MiB`。不过每个点只有一次运行，差分 refresh 数字会放大跨进程波动，只能用于选区间，不能作为精确分解或正式加速 claim。
+
+bucket 最优值不能跨规模直接复用：CM063b 的 60M bucket80 相对 dense 慢 `2.37%`；CM063c 的 350M bucket80 稳健信号约为快 `6%–7%`，弱于 bucket160 的 CM051 `15.97%`。因此当前结论是 **130M 值得围绕 80 MiB 复测，60M/350M 不应据此改默认值**。
+
+原始产物：`artifacts/compressed_muon/CM064-m002-gpt130m-bucket-cap-sweep-ws4-s42/`。
+
+## CM049 ordinary trace 修正版聚焦重解析（2026-09-13）
+
+在修复 profiler local GPU 归因后，从 CM049 历史 trace 中各取 12 份 dense ordinary 与 GreedyLore ordinary trace 做聚焦重解析。该样本不是尚未完成的 48-trace 全量汇总，也没有生成新的 artifact；用途是获得比旧时间窗归因更可信的热点量级。
+
+| 指标（12 traces mean） | dense ordinary | GreedyLore ordinary |
+|---|---:|---:|
+| profile window | 240.719 ms | 283.761 ms |
+| NCCL union | 82.443 ms | 54.046 ms |
+| compute overlap | 21.320 ms | 0.154 ms |
+| exposed NCCL | 61.123 ms | 53.892 ms |
+| exposed gradient-sync tail | 52.003 ms | 0 ms |
+| Muon result collective | 8.834 ms | 8.694 ms |
+
+GreedyLore ordinary 的修正版 local GPU 均值为：score `4.675 ms`、Top-r `0.925 ms`、factor `0.578 ms`、error `0.960 ms`、reconstruction `0.603 ms`，逐项合计约 `7.741 ms`。collective 均值为 score+dense-aux All-Reduce `41.535 ms`、factor All-Reduce `3.817 ms`；CM049 记录的逻辑 payload 为 score+dense-aux `294.891 MiB`、factor `9 MiB`，相对 dense gradient payload 减少约 `40.5%`。
+
+证据边界如下：
+
+- profiler-off 的 CM049 paired timing（dense/M002 `239.217/234.770 ms`）仍是 wall-clock 主证据；Kineto profile window 反而把 M002 显著拉慢，不能用其绝对窗口复算端到端收益。
+- 修正版 local range 可用于热点排序；score 明显是 ordinary local 算术的最大单项。通信暴露量与 local work 都约为数毫秒级差异，但存在并发，不能把两者直接相减当作因果分解。
+- 当前更精细的结论是：ordinary 并非没有优化空间，但此前尝试的 same-shape batching 和 factor direct-write 已在 CM054/CM058–CM059 显示无稳定收益；若继续优化 ordinary，应优先收集 score 的 allocator/kernel-launch 证据，再考虑融合或 workspace。refresh 在 cap80 下的平均摊销粗估降至 `5.11 ms/update`，理论上限约占该点完整周期的 `2.2%`，所以 refresh 优化仍低风险，但已不是可期待大幅加速的方向。
