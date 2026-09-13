@@ -413,4 +413,6 @@ CM066 登记四个全新 GPT-130M/seed1234/bucket80 MiB cell：CM066a/b 是 FP32
 
 在 CM066 完整质量矩阵之前先做 timing-only 检查。CM067 显式使用 BF16 整模型参数，因此 gradient、DDP bucket 以及默认 `bucket` 模式下的 GreedyLore dense_aux/score/factor/error/basis 均为 BF16。固定 4-rank DDP、seq256、global/device batch512/128、bucket80 MiB、rank32、interval200、seed42；每个 timing cell 为 20 warmup + 800 measured updates，覆盖四个完整 interval，并做 3 组 dense/GreedyLore rotated pairing。
 
-顺序为 60M（dim512/4 layers/8 heads）、130M（dim768/8 layers/12 heads），最后以完全相同 batch 尝试 350M（dim1024/20 layers/16 heads）。60M/130M 任一失败即停止；350M 的 OOM 或其他失败只记录，不令 controller 失败，并在主序列尚未触达 GreedyLore 时补一次 GreedyLore-only 尝试。通用 profiler launcher 新增默认 `float32` 的 `--model-dtype` 参数，既有调用保持不变；CM067 wrapper 才显式选择 `bfloat16`。运行前 shell/plan 与既有 launcher 回归为 `13 passed`，当前结果状态为 planned。
+顺序为 60M（dim512/4 layers/8 heads）、130M（dim768/8 layers/12 heads），最后以完全相同 batch 尝试 350M（dim1024/20 layers/16 heads）。60M/130M 任一失败即停止；350M 的 OOM 或其他失败只记录，不令 controller 失败，并在主序列尚未触达 GreedyLore 时补一次 GreedyLore-only 尝试。通用 profiler launcher 新增默认 `float32` 的 `--model-dtype` 参数，既有调用保持不变；CM067 wrapper 才显式选择 `bfloat16`。运行前 shell/plan 与既有 launcher 回归为 `13 passed`。
+
+22:03 在 GPU 2–5 启动 tmux `cm067_bf16_scale_timing`，启动时 commit 为 `79a3f32`；首个 60M dense cell 已进入执行。artifact 根目录为 `artifacts/compressed_muon/CM067-m002-bucket-native-bf16-scale-timing-ws4-s42/`。
