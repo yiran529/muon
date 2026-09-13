@@ -134,7 +134,7 @@ def test_transposed_orientation_uses_storage_aliasing_views():
 
 def test_corrected_gradient_handles_square_and_transposed_matrices():
     square_gradient = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
-    square_error = torch.tensor([[0.5, -0.5], [1.5, -1.0]], dtype=torch.float32)
+    square_error = torch.tensor([[0.5, -0.5], [1.5, -1.0]], dtype=torch.bfloat16)
     square_orientation = matrix_orientation(square_gradient.shape)
 
     square_corrected = corrected_gradient(
@@ -142,10 +142,10 @@ def test_corrected_gradient_handles_square_and_transposed_matrices():
     )
 
     assert square_orientation.transposed is False
-    assert square_corrected.dtype == torch.float32
+    assert square_corrected.dtype == torch.bfloat16
     assert torch.allclose(
         square_corrected,
-        torch.tensor([[1.5, 1.5], [4.5, 3.0]], dtype=torch.float32),
+        torch.tensor([[1.5, 1.5], [4.5, 3.0]], dtype=torch.bfloat16),
     )
 
     tall_gradient = torch.tensor(
@@ -215,10 +215,18 @@ def test_random_vectors_are_local_and_reproducible():
     )
 
     first = make_random_vectors(
-        rows=3, columns=4, seed=seed, device=torch.device("cpu")
+        rows=3,
+        columns=4,
+        seed=seed,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
     )
     second = make_random_vectors(
-        rows=3, columns=4, seed=seed, device=torch.device("cpu")
+        rows=3,
+        columns=4,
+        seed=seed,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
     )
 
     assert torch.equal(first, second)
@@ -230,9 +238,14 @@ def test_random_vectors_are_local_and_reproducible():
 
 def test_random_vectors_include_negative_standard_normal_values():
     vectors = make_random_vectors(
-        rows=8, columns=8, seed=42, device=torch.device("cpu")
+        rows=8,
+        columns=8,
+        seed=42,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
     )
 
+    assert vectors.dtype == torch.bfloat16
     assert (vectors < 0).any()
     assert (vectors > 0).any()
 
@@ -291,10 +304,18 @@ def test_full_rank_recurrence_round_trip_uses_projector_path():
     assert torch.allclose(reconstructed, corrected, atol=1e-5, rtol=1e-5)
 
 
-def test_recurrence_primitives_keep_fp32_state_after_bfloat16_gradient():
+def test_recurrence_primitives_keep_bucket_dtype_after_bfloat16_gradient(monkeypatch):
     gradient = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
-    error = torch.tensor([[0.125, -0.25], [0.5, -1.0]], dtype=torch.float32)
+    error = torch.tensor([[0.125, -0.25], [0.5, -1.0]], dtype=torch.bfloat16)
     orientation = matrix_orientation(gradient.shape)
+    original_svd = torch.linalg.svd
+    observed_svd_dtypes = []
+
+    def recording_svd(value, *args, **kwargs):
+        observed_svd_dtypes.append(value.dtype)
+        return original_svd(value, *args, **kwargs)
+
+    monkeypatch.setattr(torch.linalg, "svd", recording_svd)
 
     corrected = corrected_gradient(gradient, error, orientation)
     basis, projector, _ = refresh_basis(corrected, rank=1)
@@ -304,10 +325,11 @@ def test_recurrence_primitives_keep_fp32_state_after_bfloat16_gradient():
     local_factor, next_error = compress_local(corrected, projector)
     reconstructed = reconstruct_global(projector, local_factor)
 
-    assert corrected.dtype == torch.float32
-    assert basis.dtype == torch.float32
-    assert projector.dtype == torch.float32
-    assert signed_lambda.dtype == torch.float32
-    assert local_factor.dtype == torch.float32
-    assert next_error.dtype == torch.float32
-    assert reconstructed.dtype == torch.float32
+    assert observed_svd_dtypes == [torch.float32]
+    assert corrected.dtype == torch.bfloat16
+    assert basis.dtype == torch.bfloat16
+    assert projector.dtype == torch.bfloat16
+    assert signed_lambda.dtype == torch.bfloat16
+    assert local_factor.dtype == torch.bfloat16
+    assert next_error.dtype == torch.bfloat16
+    assert reconstructed.dtype == torch.bfloat16

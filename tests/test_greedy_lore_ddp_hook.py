@@ -47,7 +47,14 @@ class FakeGradBucket:
         return self._buffer
 
 
-def _state(parameters_and_roles, *, start_compress_step=1, update_interval=2):
+def _state(
+    parameters_and_roles,
+    *,
+    start_compress_step=1,
+    update_interval=2,
+    basis_sync="local_svd",
+    dense_aux_communication_dtype="bucket",
+):
     parameters = [item[0] for item in parameters_and_roles]
     return GreedyLoreDDPState(
         process_group=None,
@@ -61,6 +68,8 @@ def _state(parameters_and_roles, *, start_compress_step=1, update_interval=2):
             rank=1,
             start_compress_step=start_compress_step,
             update_interval=update_interval,
+            basis_sync=basis_sync,
+            dense_aux_communication_dtype=dense_aux_communication_dtype,
         ),
     )
 
@@ -204,6 +213,7 @@ def test_compressed_step_reduces_signed_scores_before_square_and_updates_local_e
                 stable_parameter_id=0,
             ),
             device=torch.device("cpu"),
+            dtype=corrected.dtype,
         ),
     )
     averaged_lambda = torch.tensor([0.0, 4.0])
@@ -294,6 +304,91 @@ def test_compressed_step_keeps_compatible_oriented_shapes_on_per_matrix_path():
     assert operator_counts.get("aten::bmm", 0) == 0
     assert operator_counts["aten::mm"] == 12
     assert operator_counts["aten::sort"] == 3
+
+
+@pytest.mark.parametrize(
+    ("communication_dtype", "expected_score_dtype"),
+    [("bucket", torch.bfloat16), ("float32", torch.float32)],
+)
+def test_bfloat16_compressed_bucket_keeps_factor_and_state_bucket_native(
+    monkeypatch,
+    communication_dtype,
+    expected_score_dtype,
+):
+    matrix = torch.nn.Parameter(torch.zeros(2, 3, dtype=torch.bfloat16))
+    dense = torch.nn.Parameter(torch.zeros(2, dtype=torch.bfloat16))
+    bucket = FakeGradBucket(
+        [matrix, dense],
+        [torch.ones_like(matrix), torch.tensor([2.0, 3.0], dtype=torch.bfloat16)],
+    )
+    state = _state(
+        [(matrix, "matrix", "matrix"), (dense, "dense", "dense_aux")],
+        start_compress_step=0,
+        update_interval=100,
+        dense_aux_communication_dtype=communication_dtype,
+    )
+    state.committed_step = 1
+    metadata_state = _state(
+        [(matrix, "matrix", "matrix"), (dense, "dense", "dense_aux")],
+        start_compress_step=0,
+        update_interval=100,
+        dense_aux_communication_dtype=communication_dtype,
+    )
+    metadata_state.committed_step = 1
+    metadata_state.begin_step()
+    metadata_context = metadata_state.note_bucket(bucket)
+    metadata = hook_module._bucket_profile_metadata(metadata_state, metadata_context)
+    metadata_context.completion_future.set_result(metadata_context.buffer)
+    metadata_state.finish_step()
+    payloads = []
+
+    def fake_all_reduce(current_state, tensor, category):
+        payloads.append((category, tensor.dtype))
+        future = torch.futures.Future()
+        future.set_result(tensor)
+        return future
+
+    monkeypatch.setattr(hook_module, "_all_reduce_future", fake_all_reduce)
+    state.begin_step()
+    result = greedy_lore_ddp_hook(state, bucket).wait()
+    state.finish_step()
+
+    parameter_state = state.parameter_state(matrix)
+    assert result.dtype == torch.bfloat16
+    assert parameter_state.error.dtype == torch.bfloat16
+    assert parameter_state.basis.dtype == torch.bfloat16
+    expected_score_bytes = 8 if communication_dtype == "bucket" else 16
+    assert metadata["score_bytes"] == expected_score_bytes
+    assert metadata["factor_bytes"] == 6
+    assert payloads == [
+        ("greedylore_hook/score_plus_aux_allreduce", expected_score_dtype),
+        ("greedylore_hook/factor_allreduce", torch.bfloat16),
+    ]
+
+
+def test_bfloat16_refresh_broadcasts_bucket_native_basis(monkeypatch):
+    matrix = torch.nn.Parameter(torch.zeros(2, 3, dtype=torch.bfloat16))
+    bucket = FakeGradBucket([matrix], [torch.ones_like(matrix)])
+    state = _state(
+        [(matrix, "matrix", "matrix")],
+        start_compress_step=0,
+        basis_sync="broadcast",
+    )
+    broadcasts = []
+
+    def fake_broadcast(current_state, tensor, category):
+        broadcasts.append((category, tensor.dtype))
+        future = torch.futures.Future()
+        future.set_result(tensor)
+        return future
+
+    monkeypatch.setattr(hook_module, "_broadcast_future", fake_broadcast)
+    state.begin_step()
+    greedy_lore_ddp_hook(state, bucket).wait()
+    state.finish_step()
+
+    assert state.parameter_state(matrix).basis.dtype == torch.bfloat16
+    assert broadcasts == [("greedylore_hook/basis_broadcast", torch.bfloat16)]
 
 
 def test_per_matrix_factors_are_cloned_into_the_packed_collective_buffer():

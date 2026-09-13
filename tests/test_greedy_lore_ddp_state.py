@@ -45,16 +45,18 @@ def _make_state(parameters, *, specs=None, rank=2, **kwargs):
     )
 
 
-def test_state_preallocates_matrix_state_in_compressed_orientation():
-    parameter = torch.nn.Parameter(torch.zeros(5, 3))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_state_preallocates_matrix_state_in_parameter_dtype(dtype):
+    parameter = torch.nn.Parameter(torch.zeros(5, 3, dtype=dtype))
     state = _make_state(((parameter, "matrix", "matrix"),), rank=2)
     item = state.parameter_state(parameter)
 
     assert item.orientation.original_shape == (5, 3)
     assert item.error.shape == (3, 5)
-    assert item.error.dtype == torch.float32
+    assert item.error.dtype == dtype
     assert item.basis.shape == (3, 3)
-    assert torch.equal(item.basis, torch.eye(3))
+    assert item.basis.dtype == dtype
+    assert torch.equal(item.basis, torch.eye(3, dtype=dtype))
     assert item.last_support.tolist() == [0, 1]
 
 
@@ -106,7 +108,11 @@ def test_specs_and_optimizer_parameters_require_exact_identity_coverage():
     "parameter,rank,match",
     [
         (torch.nn.Parameter(torch.zeros(4)), 1, "two-dimensional"),
-        (torch.nn.Parameter(torch.zeros(2, 3, dtype=torch.float64)), 1, "FP32"),
+        (
+            torch.nn.Parameter(torch.zeros(2, 3, dtype=torch.float64)),
+            1,
+            "FP32 or BF16",
+        ),
         (torch.nn.Parameter(torch.zeros(2, 3)), 3, "rank"),
     ],
 )

@@ -166,12 +166,21 @@ def _bucket_profile_metadata(state: "GreedyLoreDDPState", context: "BucketContex
     phase = "warmup"
     if context.phase is not None:
         phase = "refresh" if is_refresh_step(context.step, state.config) else "compressed"
+    score_element_size = {
+        "bucket": context.buffer.element_size(),
+        "float32": torch.empty((), dtype=torch.float32).element_size(),
+        "bfloat16": torch.empty((), dtype=torch.bfloat16).element_size(),
+    }[state.config.dense_aux_communication_dtype]
     return {
         "bucket_bytes": _tensor_bytes(context.buffer),
         "matrix_bytes": matrix_bytes,
         "dense_aux_bytes": dense_bytes,
-        "score_bytes": score_numel * 4 if phase == "compressed" else 0,
-        "factor_bytes": factor_numel * 4 if phase == "compressed" else 0,
+        "score_bytes": score_numel * score_element_size if phase == "compressed" else 0,
+        "factor_bytes": (
+            factor_numel * context.buffer.element_size()
+            if phase == "compressed"
+            else 0
+        ),
         "basis_bytes": basis_bytes,
         "parameter_count": len(context.parameters),
         "phase": phase,
@@ -221,8 +230,8 @@ class GreedyLoreDDPState:
                 continue
             if spec.parameter.ndim != 2:
                 raise ValueError("GreedyLore matrix parameters must be two-dimensional")
-            if spec.parameter.dtype != torch.float32:
-                raise ValueError("GreedyLore matrix parameters must be FP32")
+            if spec.parameter.dtype not in (torch.float32, torch.bfloat16):
+                raise ValueError("GreedyLore matrix parameters must be FP32 or BF16")
             if config.rank > min(spec.parameter.shape):
                 raise ValueError(
                     "GreedyLore rank must not exceed the smaller matrix dimension"
@@ -275,12 +284,12 @@ class GreedyLoreDDPState:
                 orientation=orientation,
                 error=torch.zeros(
                     (rows, columns),
-                    dtype=torch.float32,
+                    dtype=spec.parameter.dtype,
                     device=spec.parameter.device,
                 ),
                 basis=torch.eye(
                     rows,
-                    dtype=torch.float32,
+                    dtype=spec.parameter.dtype,
                     device=spec.parameter.device,
                 ),
                 last_support=torch.arange(
@@ -1085,7 +1094,7 @@ def _prepare_score_plus_aux_buffer(
             context,
         ):
             if parameter_state is None:
-                flat_dense = gradient.reshape(-1).to(dtype=torch.float32)
+                flat_dense = gradient.reshape(-1).to(dtype=communication_dtype)
                 chunks.append(flat_dense)
                 dense_ranges.append((gradient, offset, flat_dense.numel()))
                 offset += flat_dense.numel()
@@ -1105,6 +1114,7 @@ def _prepare_score_plus_aux_buffer(
                     stable_parameter_id=parameter_state.spec.stable_id,
                 ),
                 device=corrected.device,
+                dtype=corrected.dtype,
             )
             signed_lambda = approximate_signed_lambda(
                 corrected,
@@ -1124,7 +1134,11 @@ def _prepare_score_plus_aux_buffer(
             offset += signed_lambda.numel()
         if not chunks:
             return (
-                torch.empty(0, dtype=torch.float32, device=context.buffer.device),
+                torch.empty(
+                    0,
+                    dtype=communication_dtype,
+                    device=context.buffer.device,
+                ),
                 matrix_work,
                 dense_ranges,
             )

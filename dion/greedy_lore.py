@@ -122,9 +122,14 @@ def derive_greedy_lore_seed(
 
 
 def make_random_vectors(
-    *, rows: int, columns: int, seed: int, device: torch.device
+    *,
+    rows: int,
+    columns: int,
+    seed: int,
+    device: torch.device,
+    dtype: torch.dtype,
 ) -> Tensor:
-    """Sample standard-normal FP32 vectors using a device-local generator."""
+    """Sample reproducible vectors and return them in the bucket dtype."""
 
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
@@ -133,7 +138,7 @@ def make_random_vectors(
         dtype=torch.float32,
         device=device,
         generator=generator,
-    )
+    ).to(dtype=dtype)
 
 
 def canonicalize_svd_basis(basis: Tensor) -> Tensor:
@@ -154,18 +159,19 @@ def canonicalize_svd_basis(basis: Tensor) -> Tensor:
 def corrected_gradient(
     gradient: Tensor, error: Tensor, orientation: MatrixOrientation
 ) -> Tensor:
-    """Return the canonical FP32 gradient corrected by the local error."""
+    """Return the canonical bucket-native gradient corrected by local error."""
 
-    return orient_matrix(gradient, orientation).to(dtype=torch.float32) + error
+    return orient_matrix(gradient, orientation).to(dtype=error.dtype) + error
 
 
 def refresh_basis(global_corrected: Tensor, rank: int) -> tuple[Tensor, Tensor, Tensor]:
-    """Refresh the SVD basis and select the leading rank columns."""
+    """Refresh via FP32 SVD, then restore the bucket-native basis dtype."""
 
+    original_dtype = global_corrected.dtype
     basis, _, _ = torch.linalg.svd(
         global_corrected.to(dtype=torch.float32), full_matrices=False
     )
-    basis = canonicalize_svd_basis(basis)
+    basis = canonicalize_svd_basis(basis).to(dtype=original_dtype)
     support = torch.arange(rank, device=basis.device, dtype=torch.int64)
     projector = basis.index_select(1, support)
     return basis, projector, support
