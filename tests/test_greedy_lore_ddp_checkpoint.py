@@ -38,9 +38,9 @@ class _FakeBucket:
         return self._buffer
 
 
-def _state(*, config=None):
-    matrix = torch.nn.Parameter(torch.zeros(3, 4))
-    auxiliary = torch.nn.Parameter(torch.zeros(4))
+def _state(*, config=None, dtype=torch.float32):
+    matrix = torch.nn.Parameter(torch.zeros(3, 4, dtype=dtype))
+    auxiliary = torch.nn.Parameter(torch.zeros(4, dtype=dtype))
     config = config or GreedyLoreConfig(
         rank=2,
         update_interval=3,
@@ -77,6 +77,35 @@ def test_metadata_enumerates_exact_stable_name_tensor_schema():
             }
         },
     }
+
+
+def test_bfloat16_checkpoint_round_trip_preserves_bucket_native_state():
+    source, source_matrix = _state(dtype=torch.bfloat16)
+    source_state = source.parameter_state(source_matrix)
+    source_state.error.fill_(0.25)
+    source_state.basis.copy_(torch.eye(3, dtype=torch.bfloat16))
+    source.committed_step = 4
+    metadata = copy.deepcopy(source.checkpoint_metadata())
+    payload = copy.deepcopy(source.state_dict())
+
+    destination, destination_matrix = _state(dtype=torch.bfloat16)
+    destination.validate_checkpoint_metadata(metadata)
+    destination.load_state_dict(payload)
+
+    destination_state = destination.parameter_state(destination_matrix)
+    assert destination_state.error.dtype == torch.bfloat16
+    assert destination_state.basis.dtype == torch.bfloat16
+    assert destination.committed_step == 4
+    torch.testing.assert_close(destination_state.error, source_state.error)
+    torch.testing.assert_close(destination_state.basis, source_state.basis)
+
+
+def test_cross_dtype_checkpoint_restore_fails_before_payload_copy():
+    source, _ = _state(dtype=torch.bfloat16)
+    destination, _ = _state(dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="parameter table"):
+        destination.validate_checkpoint_metadata(source.checkpoint_metadata())
 
 
 @pytest.mark.parametrize(

@@ -232,12 +232,15 @@ def test_broadcast_refresh_future_exports_final_compressor_stream_write():
 
 
 class _BucketedCudaModel(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, dtype=torch.float32):
         super().__init__()
         self.layers = torch.nn.ModuleList(
-            [torch.nn.Linear(16, 16, bias=False) for _ in range(8)]
+            [
+                torch.nn.Linear(16, 16, bias=False, dtype=dtype)
+                for _ in range(8)
+            ]
         )
-        self.dense = torch.nn.Parameter(torch.zeros(16))
+        self.dense = torch.nn.Parameter(torch.zeros(16, dtype=dtype))
 
     def forward(self, value):
         for layer in self.layers:
@@ -245,7 +248,7 @@ class _BucketedCudaModel(torch.nn.Module):
         return value.sum() + (self.dense * value.sum(dim=0)).sum()
 
 
-def _compressed_stress_worker(rank, world_size, port):
+def _compressed_stress_worker(rank, world_size, port, dtype_name):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     torch.cuda.set_device(rank)
@@ -260,8 +263,9 @@ def _compressed_stress_worker(rank, world_size, port):
     original_all_reduce = hook_module._all_reduce_future
     try:
         device = torch.device("cuda", rank)
+        dtype = getattr(torch, dtype_name)
         torch.manual_seed(1234)
-        model = _BucketedCudaModel().to(device)
+        model = _BucketedCudaModel(dtype=dtype).to(device)
         ddp = DDP(
             model,
             device_ids=[rank],
@@ -313,6 +317,7 @@ def _compressed_stress_worker(rank, world_size, port):
                             (8, 16),
                             0.125 * (rank + 1),
                             device=device,
+                            dtype=dtype,
                         )
                     ).backward()
             state.begin_step()
@@ -320,6 +325,7 @@ def _compressed_stress_worker(rank, world_size, port):
                 (8, 16),
                 float(rank + iteration + 1) / 10,
                 device=device,
+                dtype=dtype,
             )
             if iteration == 3:
                 inputs.zero_()
@@ -361,6 +367,7 @@ def _compressed_stress_worker(rank, world_size, port):
             event.category == "greedylore_hook/factor_allreduce"
             for event in observer.events
         )
+        assert all(event.dtype == dtype_name for event in observer.events)
         assert all(event.category != "greedylore_hook/seed" for event in observer.events)
     finally:
         hook_module._all_reduce_future = original_all_reduce
@@ -374,7 +381,26 @@ def test_compressed_nccl_hook_survives_rebuild_accumulation_delay_and_allocator_
         pytest.skip("requires two CUDA devices")
     process_context = mp.spawn(
         _compressed_stress_worker,
-        args=(2, _free_port()),
+        args=(2, _free_port(), "float32"),
+        nprocs=2,
+        join=False,
+    )
+    try:
+        assert _join_with_timeout(process_context, timeout=75)
+    finally:
+        for process in process_context.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+
+
+@pytest.mark.multi_gpu
+def test_bfloat16_compressed_nccl_hook_keeps_all_payloads_bucket_native():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    process_context = mp.spawn(
+        _compressed_stress_worker,
+        args=(2, _free_port(), "bfloat16"),
         nprocs=2,
         join=False,
     )

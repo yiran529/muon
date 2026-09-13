@@ -36,11 +36,11 @@ from dion.greedy_lore_ddp_hook import (
 
 
 class _ControlledGradientModel(torch.nn.Module):
-    def __init__(self, *, second_shape=(3, 2), dense_dtype=torch.float32):
+    def __init__(self, *, second_shape=(3, 2), dtype=torch.float32):
         super().__init__()
-        self.first = torch.nn.Parameter(torch.zeros(2, 3))
-        self.dense = torch.nn.Parameter(torch.zeros(2, dtype=dense_dtype))
-        self.second = torch.nn.Parameter(torch.zeros(second_shape))
+        self.first = torch.nn.Parameter(torch.zeros(2, 3, dtype=dtype))
+        self.dense = torch.nn.Parameter(torch.zeros(2, dtype=dtype))
+        self.second = torch.nn.Parameter(torch.zeros(second_shape, dtype=dtype))
 
     def forward(self, first_source, dense_source, second_source):
         return (
@@ -329,6 +329,7 @@ def _sign_cancel_matrix(shape, *, phase, stable_id, scale, rank):
         columns=columns,
         seed=seed,
         device=torch.device("cpu"),
+        dtype=torch.float32,
     )
     oriented = torch.stack((vectors[0] * (4.0 * (-1.0 if rank else 1.0)), vectors[1] * scale))
     return unorient_matrix(oriented, orientation).clone()
@@ -386,6 +387,7 @@ def _compressed_oracle(config, expected_bases, expected_errors, all_gradients, s
                 stable_parameter_id=stable_id,
             ),
             device=corrected[0].device,
+            dtype=corrected[0].dtype,
         )
         signed_lambdas = [
             approximate_signed_lambda(value, expected_bases[name], random_vectors)
@@ -518,3 +520,78 @@ def _compressed_worker(rank, world_size, port):
 
 def test_two_rank_compressed_hook_matches_three_step_oracle_and_signature():
     mp.spawn(_compressed_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
+def _bfloat16_worker(rank, world_size, port):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world_size, timeout=timedelta(seconds=45)
+    )
+    observer = CollectiveObserver()
+    set_active_observer(observer)
+    try:
+        model = _ControlledGradientModel(dtype=torch.bfloat16)
+        ddp = DDP(model, gradient_as_bucket_view=True)
+        state = GreedyLoreDDPState(
+            process_group=dist.group.WORLD,
+            fingerprint="7" * 64,
+            parameter_specs=[
+                GreedyLoreDDPParameterSpec(model.first, "first", 0, "matrix"),
+                GreedyLoreDDPParameterSpec(model.dense, "dense", 1, "dense_aux"),
+                GreedyLoreDDPParameterSpec(model.second, "second", 2, "matrix"),
+            ],
+            optimizer_parameters=list(model.parameters()),
+            config=GreedyLoreConfig(
+                rank=1,
+                start_compress_step=0,
+                update_interval=100,
+                seed=23,
+                basis_sync="local_svd",
+            ),
+        )
+        ddp.register_comm_hook(state, greedy_lore_ddp_hook)
+
+        for step in (1, 2):
+            first = (
+                torch.arange(6, dtype=torch.bfloat16).reshape(2, 3) + rank + step
+            )
+            dense = torch.tensor(
+                [10 * step + rank, 20 - step - rank], dtype=torch.bfloat16
+            )
+            second = (
+                torch.arange(6, dtype=torch.bfloat16).reshape(3, 2) - rank + step
+            )
+            state.begin_step()
+            ddp(first, dense, second).backward()
+            state.finish_step()
+
+            for parameter in model.parameters():
+                assert parameter.grad is not None
+                assert parameter.grad.dtype == torch.bfloat16
+                gathered = [torch.empty_like(parameter.grad) for _ in range(world_size)]
+                dist.all_gather(gathered, parameter.grad)
+                for other in gathered[1:]:
+                    torch.testing.assert_close(gathered[0], other)
+            for parameter in (model.first, model.second):
+                parameter_state = state.parameter_state(parameter)
+                assert parameter_state.error.dtype == torch.bfloat16
+                assert parameter_state.basis.dtype == torch.bfloat16
+
+            state.commit_step()
+            ddp.zero_grad(set_to_none=True)
+
+        assert [
+            (event.category, event.dtype, event.bytes) for event in observer.events
+        ] == [
+            ("greedylore_hook/dense", "bfloat16", 28),
+            ("greedylore_hook/score_plus_aux_allreduce", "bfloat16", 12),
+            ("greedylore_hook/factor_allreduce", "bfloat16", 12),
+        ]
+    finally:
+        set_active_observer(None)
+        dist.destroy_process_group()
+
+
+def test_two_rank_bfloat16_hook_keeps_state_collectives_and_gradients_bucket_native():
+    mp.spawn(_bfloat16_worker, args=(2, _free_port()), nprocs=2, join=True)
