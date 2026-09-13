@@ -405,6 +405,6 @@ CM065 固定 GPT-130M、4卡、seq256、global/device batch512/128、rank32、in
 
 GreedyLore 的 error、basis、score、dense_aux 与 factor 默认全部跟随 bucket dtype；refresh SVD、符号规范化等数值敏感步骤临时升到 FP32，结果再转换回 bucket dtype。显式 `greedy_lore_dense_aux_communication_dtype` override 继续保留，默认 `bucket`。checkpoint metadata 记录模型 dtype，同 dtype continuation 可恢复，跨 dtype resume 在复制 payload 前明确失败，避免静默转换。
 
-TDD/验证覆盖整模型 materialization、BF16 Muon/Lion/AdamW state、FP32/BF16 GreedyLore core/hook/profiler、两 rank Gloo collective 与 checkpoint roundtrip、两卡 NCCL BF16 payload。阶段性结果分别为训练入口 `29 passed`、CUDA optimizer `109 passed, 17 skipped`、GreedyLore core/hook `70 passed`、distributed/checkpoint `40 passed`、NCCL BF16 `1 passed, 3 deselected`；最终综合 gate 与真实训练 smoke 尚待完成。
+TDD/验证覆盖整模型 materialization、BF16 Muon/Lion/AdamW state、FP32/BF16 GreedyLore core/hook/profiler、两 rank Gloo collective 与 checkpoint roundtrip、两卡 NCCL BF16 payload。分项结果分别为训练入口 `29 passed`、CUDA optimizer `109 passed, 17 skipped`、GreedyLore core/hook `70 passed`、distributed/checkpoint `40 passed`、NCCL BF16 `1 passed, 3 deselected`；最终覆盖训练入口、Muon、GreedyLore、layout、profiler、distributed、checkpoint 与 CM066 launcher 的 fresh 综合 gate 为 `307 passed`。按用户要求暂不执行真实训练 smoke 或正式实验。
 
 CM066 登记四个全新 GPT-130M/seed1234/bucket80 MiB cell：CM066a/b 是 FP32 dense/GreedyLore，CM066c/d 是 BF16 dense/GreedyLore。四者统一 20,000 updates、warmup2,000、rank32、interval200、step1000 开始压缩；controller 串行 fail-fast，先为每个 cell 跑覆盖 refresh/compressed 的 3-step probe。分析只允许 CM066a↔CM066b、CM066c↔CM066d 的同 dtype 配对，绝不把 BF16 参数结果与旧 FP32 dense 基线拼接。当前仅登记为 planned，尚无质量或性能结果，因此不更新 `RESULTS.md`。
