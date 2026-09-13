@@ -153,10 +153,14 @@ def _timing_summary_from_records(plan: dict, records: list[dict]) -> dict:
             plan.get("timing_warmup_steps", 0)
         )
         interval = int(plan.get("greedy_lore", {}).get("update_interval", 0))
-        if measured_updates > 0 and interval > 0:
+        if measured_updates > 0 and interval > 0 and measured_updates % interval == 0:
+            periods = measured_updates // interval
+            period_label = "period" if periods == 1 else "periods"
+            count_label = "one" if periods == 1 else str(periods)
             payload["timing_scope"] = (
                 "profiler-off, "
-                f"{measured_updates} measured updates = one complete interval-{interval} period"
+                f"{measured_updates} measured updates = {count_label} complete "
+                f"interval-{interval} {period_label}"
             )
 
     def percentile(values, fraction):

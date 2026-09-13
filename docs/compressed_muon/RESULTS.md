@@ -628,3 +628,24 @@ GreedyLore ordinary 的修正版 local GPU 均值为：score `4.675 ms`、Top-r 
 结论分类为 **preliminary-positive but below practical threshold**：结果方向一致，且 FP32 mean 与 CM064 bucket80 的 `228.86 ms` 相符，但总体收益低于预先关注的 `>=5%`（约 `11.44 ms/update`）门槛。BF16 packed communication 可保留为显式选项，不应仅凭本结果改默认值，也不值得作为单独优化方向继续投入；若后续推进，应与能产生十余毫秒级收益的跨 bucket Future/collective overlap 一起评估。
 
 原始产物：`artifacts/compressed_muon/CM065-m002-gpt130m-bf16-dense-aux-bucket80-ddp-ws4-s42-attempt2/`。首次未进入训练的失败产物保留在同名前缀的 attempt1 目录。
+
+## CM067：bucket-native BF16 参数的 60M / 130M / 350M timing（2026-09-13）
+
+固定 4×RTX 4090、BF16 整模型参数/gradient/DDP bucket、BF16 autocast、seq256、global/device batch512/128、bucket80 MiB、rank32、interval200、local-SVD 和 seed42。每个成功 cell 运行 20 warmup + 800 profiler-off measured updates，即四个完整 interval；60M/130M 各完成 3 组 dense/GreedyLore rotated pairing。
+
+| 模型 / repeat | dense step | M002 step | M002−dense | dense / M002 val loss |
+|---|---:|---:|---:|---:|
+| 60M / r1 | 92.06 ms | 94.33 ms | +2.27 ms (+2.47%) | 4.6618 / 4.9670 |
+| 60M / r2 | 92.04 ms | 94.49 ms | +2.45 ms (+2.66%) | 4.6618 / 4.9670 |
+| 60M / r3 | 92.03 ms | 94.21 ms | +2.18 ms (+2.37%) | 4.6618 / 4.9670 |
+| **60M / mean** | **92.043 ms** | **94.343 ms** | **+2.300 ms (+2.50%)** | **4.6618 / 4.9670** |
+| 130M / r1 | 199.25 ms | 203.94 ms | +4.69 ms (+2.35%) | 4.3641 / 4.7894 |
+| 130M / r2 | 199.70 ms | 204.22 ms | +4.52 ms (+2.26%) | 4.3641 / 4.7894 |
+| 130M / r3 | 199.68 ms | 204.45 ms | +4.77 ms (+2.39%) | 4.3641 / 4.7894 |
+| **130M / mean** | **199.543 ms** | **204.203 ms** | **+4.660 ms (+2.34%)** | **4.3641 / 4.7894** |
+
+60M dense/M002 CV 为 `0.017%/0.149%`，paired bootstrap mean-difference interval 为 `[2.18,2.45] ms`；吞吐从 `1.424M` 降至 `1.389M tokens/s`（约 `-2.44%`），peak allocated 从 `6058` 增至 `6303 MiB`（+245 MiB）。130M CV 为 `0.127%/0.125%`，paired interval `[4.52,4.77] ms`；吞吐从 `656.9K` 降至 `641.9K tokens/s`（约 `-2.28%`），peak 从 `11208` 增至 `11633 MiB`（+425 MiB）。结果波动很低且三组方向一致，分类为 **negative**：bucket-native BF16 下当前 GreedyLore 在两个可运行规模均稳定慢约 2%–3%。
+
+350M 严格保持 `512/128` 后两模式均 OOM：dense 在训练分配 256 MiB 时每卡只余约 62.56 MiB；GreedyLore fallback 分配 64 MiB 时只余约 40.56 MiB。两者都没有产生有效 timing，按预登记策略不调整 batch 或重试。
+
+本次短程 val loss 只用于运行健康检查，不能支持最终收敛质量结论。原始产物：`artifacts/compressed_muon/CM067-m002-bucket-native-bf16-scale-timing-ws4-s42/`。

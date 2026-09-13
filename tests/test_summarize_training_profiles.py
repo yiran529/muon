@@ -184,3 +184,23 @@ def test_plan_completeness_supports_timing_only_artifacts(tmp_path):
     assert summary == {"schema_version": 1, "cells": []}
     timing_summary = json.loads((tmp_path / "timing-summary.json").read_text())
     assert timing_summary["modes"]["dense"]["mean_step_ms"] == 10.0
+
+
+def test_timing_scope_reports_multiple_complete_intervals(tmp_path):
+    _write_plan(tmp_path, cells=(), timing_cells=("dense-timing-r1",))
+    plan_path = tmp_path / "plan.json"
+    plan = json.loads(plan_path.read_text())
+    plan.update({
+        "timing_num_iterations": 820,
+        "timing_warmup_steps": 20,
+        "greedy_lore": {"update_interval": 200},
+    })
+    plan_path.write_text(json.dumps(plan))
+    _write_timing_cell(tmp_path, "dense-timing-r1")
+
+    summarize_profile_root(tmp_path, require_plan=True)
+
+    timing_summary = json.loads((tmp_path / "timing-summary.json").read_text())
+    assert timing_summary["timing_scope"].endswith(
+        "800 measured updates = 4 complete interval-200 periods"
+    )

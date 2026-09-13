@@ -416,3 +416,11 @@ CM066 登记四个全新 GPT-130M/seed1234/bucket80 MiB cell：CM066a/b 是 FP32
 顺序为 60M（dim512/4 layers/8 heads）、130M（dim768/8 layers/12 heads），最后以完全相同 batch 尝试 350M（dim1024/20 layers/16 heads）。60M/130M 任一失败即停止；350M 的 OOM 或其他失败只记录，不令 controller 失败，并在主序列尚未触达 GreedyLore 时补一次 GreedyLore-only 尝试。通用 profiler launcher 新增默认 `float32` 的 `--model-dtype` 参数，既有调用保持不变；CM067 wrapper 才显式选择 `bfloat16`。运行前 shell/plan 与既有 launcher 回归为 `13 passed`。
 
 22:03 在 GPU 2–5 启动 tmux `cm067_bf16_scale_timing`，启动时 commit 为 `79a3f32`；首个 60M dense cell 已进入执行。artifact 根目录为 `artifacts/compressed_muon/CM067-m002-bucket-native-bf16-scale-timing-ws4-s42/`。
+
+### CM067 完成结果
+
+Controller 于 22:38 完成并 exit `0`。60M/130M 共 12/12 timing cells exit `0`；dense 与 GreedyLore 的 CV 均低于 `0.15%`。60M dense/M002 为 `92.043/94.343 ms`，逐组差 `+2.27/+2.45/+2.18 ms`，M002 mean 慢 `2.300 ms`（`+2.50%`），paired bootstrap mean-difference interval `[2.18,2.45] ms`；peak allocated `6058/6303 MiB`。130M dense/M002 为 `199.543/204.203 ms`，逐组差 `+4.69/+4.52/+4.77 ms`，M002 mean 慢 `4.660 ms`（`+2.34%`），paired interval `[4.52,4.77] ms`；peak `11208/11633 MiB`。
+
+350M 在同一 `512/128` batch 下两模式均 OOM。dense 完成初始 validation 后在训练分配 256 MiB 时每卡仅余约 62.56 MiB；GreedyLore fallback 在首次训练前分配 64 MiB 时仅余约 40.56 MiB。按预登记策略不继续重试，也不改变 batch。结论为 **negative**：整模型 BF16 明显降低绝对 step time 和显存，但在严格同 dtype 配对中，当前 bucket80/rank32/interval200 的 GreedyLore 在 60M/130M 都稳定慢约 2%–3%，没有速度收益。820-step 的 val loss 仅作健康检查，不作质量结论。
+
+汇总时发现 `timing-summary.json` 的 scope 文本把 800 updates 硬编码描述成 one period；根因是 summarizer 未根据 `measured_updates / interval` 生成周期数。新增多周期回归并修正为 `4 complete interval-200 periods`，相关 summarizer/launcher gate 为 `30 passed`，不改变任何原始 timing 数值。
