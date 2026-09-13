@@ -398,3 +398,13 @@ P0 parser 修复后，聚焦重解析 CM049 的 12 份 dense ordinary 与 12 份
 CM065 固定 GPT-130M、4卡、seq256、global/device batch512/128、rank32、interval200、bucket80 MiB，FP32/BF16 各三次。step time 分别为 FP32 `226.72/228.49/230.06 ms`、BF16 `221.08/221.07/218.76 ms`；全样本 mean 改善 `8.12 ms`（`3.55%`），严格相邻的 r1/r2 mean 改善 `6.53 ms`（`2.87%`），peak allocated 均为 `13841 MiB`。r3 因 controller 在 FP32 完成后遇到 launcher 编辑导致的 parse interruption，BF16 是同配置补跑，证据等级低于前两组。六个训练 cell 都 exit0，无 OOM/训练 traceback；短 val loss 仅为健康检查。
 
 该结果没有达到预设 `>=5%`（约 `11.44 ms`）实用门槛，因此保留 BF16 为可组合的显式实验选项，但不将其设为默认或作为独立高优先级方向。下一项若要满足十余毫秒收益目标，应把重点放在全局 Future/跨 bucket pipeline 与 exposed communication 的重叠，BF16 只作为组合变量；在没有新 profile 前不把 `8.12 ms` 端到端差值等同于 NCCL 时间下降。
+
+## 2026-09-13：bucket-native 模型参数 dtype 与 CM066 计划
+
+按 `/home/wyr/greedy_lore` 的 bucket-dtype 语义补齐整模型参数 dtype 开关。训练入口新增 `model_dtype={float32,bfloat16}`，默认 `float32`，因此普通 dense、其他压缩方法和既有配置均保持原行为；当前 BF16 参数模式只允许 DDP，不扩展到 DTensor/FSDP。模型在初始化权重前整体转换 dtype，覆盖 embedding、lm_head 和全部 Transformer 参数；由此 gradient 与 DDP bucket 自然同 dtype。Muon matrix state、Lion/AdamW scalar state 延续参数 dtype，学习率与 step 控制量保持 FP32。
+
+GreedyLore 的 error、basis、score、dense_aux 与 factor 默认全部跟随 bucket dtype；refresh SVD、符号规范化等数值敏感步骤临时升到 FP32，结果再转换回 bucket dtype。显式 `greedy_lore_dense_aux_communication_dtype` override 继续保留，默认 `bucket`。checkpoint metadata 记录模型 dtype，同 dtype continuation 可恢复，跨 dtype resume 在复制 payload 前明确失败，避免静默转换。
+
+TDD/验证覆盖整模型 materialization、BF16 Muon/Lion/AdamW state、FP32/BF16 GreedyLore core/hook/profiler、两 rank Gloo collective 与 checkpoint roundtrip、两卡 NCCL BF16 payload。阶段性结果分别为训练入口 `29 passed`、CUDA optimizer `109 passed, 17 skipped`、GreedyLore core/hook `70 passed`、distributed/checkpoint `40 passed`、NCCL BF16 `1 passed, 3 deselected`；最终综合 gate 与真实训练 smoke 尚待完成。
+
+CM066 登记四个全新 GPT-130M/seed1234/bucket80 MiB cell：CM066a/b 是 FP32 dense/GreedyLore，CM066c/d 是 BF16 dense/GreedyLore。四者统一 20,000 updates、warmup2,000、rank32、interval200、step1000 开始压缩；controller 串行 fail-fast，先为每个 cell 跑覆盖 refresh/compressed 的 3-step probe。分析只允许 CM066a↔CM066b、CM066c↔CM066d 的同 dtype 配对，绝不把 BF16 参数结果与旧 FP32 dense 基线拼接。当前仅登记为 planned，尚无质量或性能结果，因此不更新 `RESULTS.md`。
