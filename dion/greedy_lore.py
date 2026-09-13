@@ -16,6 +16,9 @@ class GreedyLoreConfig:
     seed: int = 42
     start_compress_step: int = 1000
     basis_sync: Literal["local_svd", "broadcast"] = "local_svd"
+    dense_aux_communication_dtype: Literal[
+        "bucket", "float32", "bfloat16"
+    ] = "bucket"
     seed_scheme_version: int = 1
 
     def __post_init__(self) -> None:
@@ -40,6 +43,15 @@ class GreedyLoreConfig:
             raise ValueError("start_compress_step must be non-negative")
         if self.basis_sync not in ("local_svd", "broadcast"):
             raise ValueError("basis_sync must be 'local_svd' or 'broadcast'")
+        if self.dense_aux_communication_dtype not in (
+            "bucket",
+            "float32",
+            "bfloat16",
+        ):
+            raise ValueError(
+                "dense_aux_communication_dtype must be 'bucket', 'float32', "
+                "or 'bfloat16'"
+            )
         if self.seed_scheme_version != 1:
             raise ValueError("seed_scheme_version must be 1")
 

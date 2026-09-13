@@ -10,3 +10,11 @@
 - 若未来启动首个 paper-oriented recipe：GPT-60M，global/device batch `512/128`、4 ranks、seq256、10,000 updates、1,000 warmup updates、rank32、interval200、Adam-style scalar settings；采用 Dion 已有 cosine-to-zero。它只是 paper-oriented comparison，不是 exact reproduction。
 - 必须显式记录 recipe deltas：作者 snapshot launcher 设置 `grad_clipping=0`，当前 CM039 staged Muon recipe 是 `grad_clip_norm=1.0`，因此 clipping 应做 paired ablation；snapshot scheduler warmup 是 200 steps，而 paper Table VII 报告 1,000。snapshot 又缺少所引用的 C4 training source，无法本地验证 cosine endpoint。
 - `/home/wyr/greedy_lore` 是 read-only/non-oracle snapshot：真实 greedy hook score helper 不完整，fake hook 通信 dense tensor。只能借鉴 dimensionally valid orientation、same-shape batching 与 cadence/packing 结构。
+
+## M002 / GreedyLore 的 dtype 口径（2026-09-13）
+
+- 必须分别报告 parameter storage dtype、forward/backward autocast dtype、gradient/DDP bucket dtype、显式 communication-buffer dtype 和 optimizer-state dtype；“BF16 training”本身不能推出 gradient communication 是 BF16。
+- 参考 snapshot 的 `subspace_hook.py` 以 `bucket.buffer()` 的 dtype 构造并 All-Reduce dense auxiliary 和低秩工作区，所以可验证的实现策略是 **通信跟随 bucket dtype**。launcher 虽设置 `dtype=bfloat16`，但 snapshot 缺少其引用的 C4 training source，不能据此断言作者实验的参数或实际通信一定为 BF16。
+- Dion 当前 M002 路径使用 FP32 参数与 FP32 DDP gradient bucket，BF16 仅用于 autocast 计算；因此 `bucket` 默认值产生 FP32 通信，并与参考 hook 的 dtype 策略一致。显式 `bfloat16` 是额外的通信压缩 ablation，不应称为“恢复作者 BF16 默认逻辑”。
+- CM065 只将普通 compressed step 的 packed `score+dense_aux` All-Reduce 从 FP32 改为 BF16；Top-r 前 score 转回 FP32，factor、refresh basis、dense-only bucket 和 Muon 语义不变。其 130M/bucket80 三次 mean 从 `228.423` 降至 `220.303 ms`，改善 `8.120 ms`（`3.55%`）；严格相邻 r1/r2 改善 `6.530 ms`（`2.87%`），低于项目关注的 5% 实用门槛。短程 val loss 仅作健康检查，不能给出最终质量结论。
+- 论文写作中可将 BF16 packed communication 报告为有效但幅度有限的系统 ablation；不能声称 payload 减半会等比例转化为 wall-clock，也不能在没有 profiler 的情况下把完整 step 差值直接归因给 NCCL collective。

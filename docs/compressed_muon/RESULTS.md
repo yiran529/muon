@@ -609,3 +609,22 @@ GreedyLore ordinary 的修正版 local GPU 均值为：score `4.675 ms`、Top-r 
 - profiler-off 的 CM049 paired timing（dense/M002 `239.217/234.770 ms`）仍是 wall-clock 主证据；Kineto profile window 反而把 M002 显著拉慢，不能用其绝对窗口复算端到端收益。
 - 修正版 local range 可用于热点排序；score 明显是 ordinary local 算术的最大单项。通信暴露量与 local work 都约为数毫秒级差异，但存在并发，不能把两者直接相减当作因果分解。
 - 当前更精细的结论是：ordinary 并非没有优化空间，但此前尝试的 same-shape batching 和 factor direct-write 已在 CM054/CM058–CM059 显示无稳定收益；若继续优化 ordinary，应优先收集 score 的 allocator/kernel-launch 证据，再考虑融合或 workspace。refresh 在 cap80 下的平均摊销粗估降至 `5.11 ms/update`，理论上限约占该点完整周期的 `2.2%`，所以 refresh 优化仍低风险，但已不是可期待大幅加速的方向。
+
+## CM065：130M score+dense_aux BF16 通信 timing（2026-09-13）
+
+固定 CM064 最优粗扫点的 GPT-130M、4×RTX 4090、seq256、global/device batch512/128、rank32、interval200、bucket80 MiB 和 seed42，只改变普通 compressed step 中 packed `score+dense_aux` All-Reduce 的显式通信 dtype。FP32/BF16 各运行 20 warmup + 200 measured update，采用 `FP32→BF16 / BF16→FP32 / FP32→BF16` 的交替顺序。模型参数与 DDP gradient bucket 仍为 FP32，前后向采用 BF16 autocast；factor、refresh basis 与 dense-only bucket 路径不变。
+
+| repeat | FP32 packed buffer | BF16 packed buffer | BF16−FP32 | FP32 / BF16 val loss |
+|---|---:|---:|---:|---:|
+| r1 | 226.72 ms | 221.08 ms | -5.64 ms (-2.49%) | 5.6823 / 5.6723 |
+| r2 | 228.49 ms | 221.07 ms | -7.42 ms (-3.25%) | 5.6715 / 5.6727 |
+| r3 | 230.06 ms | 218.76 ms | -11.30 ms (-4.91%) | 5.6749 / 5.6731 |
+| **mean** | **228.423 ms** | **220.303 ms** | **-8.120 ms (-3.55%)** | **5.6762 / 5.6727** |
+
+前两组为同一串行 controller 内的严格相邻配对，均值为 FP32/BF16 `227.605/221.075 ms`，BF16 快 `6.530 ms`（`2.87%`）。r3 的 FP32 cell 完成后，controller 因运行期间 launcher 被编辑而在子进程汇总阶段遇到 shell parse error；FP32 原始日志仍有 step220 最终 marker 且训练进程 exit `0`，BF16 r3 随后按相同配置单独补跑。因此六个训练 cell 都完成且没有 OOM/训练 traceback，但 r3 不是严格相邻配对，只作为较弱的补充证据。最初的 attempt1 还曾因 wrapper 局部变量初始化错误在启动训练前退出，不计入结果。
+
+`score+dense_aux` 的逻辑 payload 从 FP32 的 `294.891 MiB` 减半到约 `147.446 MiB`，但完整 interval200 周期只改善 `3.55%`；严格相邻证据为 `2.87%`。峰值 allocated 两种 dtype 都是 `13841 MiB`，没有可测显存收益。短程 val loss 只作运行健康检查，不能支持收敛质量结论。本次没有 Kineto trace，因此不能把端到端差值直接解释为 collective duration 的等量下降。
+
+结论分类为 **preliminary-positive but below practical threshold**：结果方向一致，且 FP32 mean 与 CM064 bucket80 的 `228.86 ms` 相符，但总体收益低于预先关注的 `>=5%`（约 `11.44 ms/update`）门槛。BF16 packed communication 可保留为显式选项，不应仅凭本结果改默认值，也不值得作为单独优化方向继续投入；若后续推进，应与能产生十余毫秒级收益的跨 bucket Future/collective overlap 一起评估。
+
+原始产物：`artifacts/compressed_muon/CM065-m002-gpt130m-bf16-dense-aux-bucket80-ddp-ws4-s42-attempt2/`。首次未进入训练的失败产物保留在同名前缀的 attempt1 目录。

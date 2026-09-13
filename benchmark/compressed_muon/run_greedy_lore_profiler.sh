@@ -23,6 +23,7 @@ timing_modes_csv="dense,greedylore_local_svd,greedylore_broadcast"
 training_seed=42
 greedy_lore_rank=32
 greedy_lore_update_interval=200
+greedy_lore_dense_aux_communication_dtype="bucket"
 gpu_list=""
 exclude_gpus=""
 artifact_root=""
@@ -48,6 +49,7 @@ while (($#)); do
         --training-seed) training_seed="$2"; shift 2 ;;
         --greedy-lore-rank) greedy_lore_rank="$2"; shift 2 ;;
         --greedy-lore-update-interval) greedy_lore_update_interval="$2"; shift 2 ;;
+        --greedy-lore-dense-aux-communication-dtype) greedy_lore_dense_aux_communication_dtype="$2"; shift 2 ;;
         --gpu-list) gpu_list="$2"; shift 2 ;;
         --exclude-gpus) exclude_gpus="$2"; shift 2 ;;
         --artifact-root) artifact_root="$2"; shift 2 ;;
@@ -82,6 +84,10 @@ validate_modes() {
 
 validate_modes "$profile_modes_csv" profile 1 || exit $?
 validate_modes "$timing_modes_csv" timing 1 || exit $?
+case "$greedy_lore_dense_aux_communication_dtype" in
+    bucket|float32|bfloat16) ;;
+    *) printf 'invalid GreedyLore dense auxiliary communication dtype: %s\n' "$greedy_lore_dense_aux_communication_dtype" >&2; exit 64 ;;
+esac
 if [[ "$profile_modes_csv" == "none" ]]; then
     profile_modes=()
 else
@@ -129,7 +135,8 @@ print_plan() {
     MD="$model_dim" NL="$layers" NH="$heads" SEQ="$sequence_length" REFRESH="$refresh_profile_step" \
     COMPRESSED="$compressed_profile_step" WARMUP="$timing_warmup_steps" PERIODS="$measured_full_periods" \
     TIMING_NI="$timing_num_iterations" BUCKET="$bucket_cap_mb" REPS="$repeats" GL_RANK="$greedy_lore_rank" \
-    GL_INTERVAL="$greedy_lore_update_interval" GPU_LIST_VALUE="${gpu_list:-dynamic}" EXCLUDED="$exclude_gpus" \
+    GL_INTERVAL="$greedy_lore_update_interval" GL_DENSE_AUX_DTYPE="$greedy_lore_dense_aux_communication_dtype" \
+    GPU_LIST_VALUE="${gpu_list:-dynamic}" EXCLUDED="$exclude_gpus" \
     PROFILE_MODES="$profile_modes_csv" TIMING_MODES="$timing_modes_csv" \
     ROOT="$artifact_root" "$python_bin" - <<'PY'
 import json
@@ -178,6 +185,7 @@ print(json.dumps({
     "greedy_lore": {
         "rank": int(os.environ["GL_RANK"]),
         "update_interval": int(os.environ["GL_INTERVAL"]),
+        "dense_aux_communication_dtype": os.environ["GL_DENSE_AUX_DTYPE"],
         "start_compress_step": int(os.environ["WARMUP"]),
         "refresh_profile_step": int(os.environ["REFRESH"]),
         "compressed_profile_step": int(os.environ["COMPRESSED"]),
@@ -291,7 +299,8 @@ run_cell() {
     if [[ "$mode_name" == greedylore_* ]]; then
         command+=(--greedy_lore_rank "$greedy_lore_rank"
             --greedy_lore_update_interval "$greedy_lore_update_interval"
-            --greedy_lore_start_compress_step "$timing_warmup_steps")
+            --greedy_lore_start_compress_step "$timing_warmup_steps"
+            --greedy_lore_dense_aux_communication_dtype "$greedy_lore_dense_aux_communication_dtype")
         if [[ "$mode_name" == "greedylore_broadcast" ]]; then
             command+=(--greedy_lore_basis_sync broadcast)
         else

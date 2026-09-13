@@ -1069,6 +1069,11 @@ def _prepare_score_plus_aux_buffer(
     context: BucketContext,
 ) -> tuple[Tensor, list[CompressedMatrixWork], list[tuple[Tensor, int, int]]]:
     with _profile_range("greedylore_hook/score"):
+        communication_dtype = {
+            "bucket": context.buffer.dtype,
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+        }[state.config.dense_aux_communication_dtype]
         chunks = []
         matrix_work = []
         dense_ranges = []
@@ -1123,7 +1128,9 @@ def _prepare_score_plus_aux_buffer(
                 matrix_work,
                 dense_ranges,
             )
-        score_plus_aux = torch.cat([chunk.reshape(-1) for chunk in chunks])
+        score_plus_aux = torch.cat([chunk.reshape(-1) for chunk in chunks]).to(
+            dtype=communication_dtype
+        )
         context.retained.extend([score_plus_aux, matrix_work, dense_ranges])
         return score_plus_aux, matrix_work, dense_ranges
 
@@ -1164,7 +1171,7 @@ def _prepare_factor_buffer(
     for work in matrix_work:
         averaged_lambda = score_plus_aux[
             work.score_offset : work.score_offset + work.signed_lambda.numel()
-        ]
+        ].to(dtype=work.signed_lambda.dtype)
         _select_projector_profiled(state, work, averaged_lambda)
         _compress_local_profiled(work)
         assert work.local_factor is not None

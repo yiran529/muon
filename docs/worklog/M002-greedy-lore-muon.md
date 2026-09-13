@@ -388,3 +388,13 @@ artifact：`artifacts/compressed_muon/CM064-m002-gpt130m-bucket-cap-sweep-ws4-s4
 P0 parser 修复后，聚焦重解析 CM049 的 12 份 dense ordinary 与 12 份 GreedyLore ordinary trace。GreedyLore local GPU mean 为 score `4.675 ms`、Top-r `0.925 ms`、factor `0.578 ms`、error `0.960 ms`、reconstruction `0.603 ms`，合计约 `7.741 ms`；score 是 ordinary local 算术最大单项。dense/GreedyLore 的 exposed NCCL mean 为 `61.123/53.892 ms`，Muon-result collective 为 `8.834/8.694 ms`；GreedyLore score+dense-aux/factor collective 为 `41.535/3.817 ms`。
 
 这只是 12+12 trace 的内存聚焦样本，不冒充未完成的 48-trace 全量汇总。Kineto profile window 对 M002 扰动很大（dense/GreedyLore `240.719/283.761 ms`），所以端到端结论继续以 profiler-off CM049 timing 为准；修正版 trace 只用于热点排序和通信量级判断。结合 CM054/CM058–CM059，ordinary 的 batching/factor packing 已无收益证据；下一项 ordinary 优化若继续，应先围绕 score 收集 allocator 与 kernel-launch 证据。CM064 的 cap80 refresh 摊销约 `5.11 ms/update`，说明 refresh 优化仍是较低风险方向，但完整消除的理论上限也只有该点周期时间约 `2.2%`。
+
+## 2026-09-13：通信 dtype 审计与 CM065
+
+对照 `/home/wyr/greedy_lore/comm_hooks/subspace_hook.py` 后确认：参考 hook 直接以 `bucket.buffer()` 的 dtype 构造并 All-Reduce dense auxiliary 与低秩工作区，即策略是“跟随 DDP bucket dtype”，而不是无条件 BF16。参考 launcher 虽写有 `dtype=bfloat16`，但本地 snapshot 缺失它引用的 C4 training source，无法仅凭 launcher 判断参数存储 dtype 或实际 bucket dtype。Dion 当前是 FP32 参数/gradient bucket 加 BF16 autocast，所以此前默认通信实际为 FP32。
+
+实现新增 `greedy_lore_dense_aux_communication_dtype={bucket,float32,bfloat16}`，默认 `bucket` 保持参考 hook 的 dtype 策略与现有行为；显式 `bfloat16` 只把普通 compressed step 的 packed `score+dense_aux` buffer 在 All-Reduce 前降为 BF16。score 在 Top-r 前转回原 FP32 dtype，dense auxiliary 写回 gradient view 时转回 bucket dtype；factor、refresh 和 dense-only 路径不变。训练入口、YAML 与通用 profiler launcher 都记录该选项，并新增 CM065 串行 timing wrapper。
+
+CM065 固定 GPT-130M、4卡、seq256、global/device batch512/128、rank32、interval200、bucket80 MiB，FP32/BF16 各三次。step time 分别为 FP32 `226.72/228.49/230.06 ms`、BF16 `221.08/221.07/218.76 ms`；全样本 mean 改善 `8.12 ms`（`3.55%`），严格相邻的 r1/r2 mean 改善 `6.53 ms`（`2.87%`），peak allocated 均为 `13841 MiB`。r3 因 controller 在 FP32 完成后遇到 launcher 编辑导致的 parse interruption，BF16 是同配置补跑，证据等级低于前两组。六个训练 cell 都 exit0，无 OOM/训练 traceback；短 val loss 仅为健康检查。
+
+该结果没有达到预设 `>=5%`（约 `11.44 ms`）实用门槛，因此保留 BF16 为可组合的显式实验选项，但不将其设为默认或作为独立高优先级方向。下一项若要满足十余毫秒收益目标，应把重点放在全局 Future/跨 bucket pipeline 与 exposed communication 的重叠，BF16 只作为组合变量；在没有新 profile 前不把 `8.12 ms` 端到端差值等同于 NCCL 时间下降。

@@ -29,6 +29,9 @@ class GreedyLoreHyperparameters(train.Hyperparameters):
     greedy_lore_seed: int = 42
     greedy_lore_start_compress_step: int = 1000
     greedy_lore_basis_sync: Literal["local_svd", "broadcast"] = "local_svd"
+    greedy_lore_dense_aux_communication_dtype: Literal[
+        "bucket", "float32", "bfloat16"
+    ] = "bucket"
 
 
 def configure_greedy_lore_parser(parser: argparse.ArgumentParser) -> None:
@@ -39,6 +42,11 @@ def configure_greedy_lore_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--greedy_lore_basis_sync",
         choices=("local_svd", "broadcast"),
+        default=None,
+    )
+    parser.add_argument(
+        "--greedy_lore_dense_aux_communication_dtype",
+        choices=("bucket", "float32", "bfloat16"),
         default=None,
     )
 
@@ -52,6 +60,7 @@ def validate_greedy_lore_hyperparameters(hp: GreedyLoreHyperparameters) -> None:
         seed=hp.greedy_lore_seed,
         start_compress_step=hp.greedy_lore_start_compress_step,
         basis_sync=hp.greedy_lore_basis_sync,
+        dense_aux_communication_dtype=hp.greedy_lore_dense_aux_communication_dtype,
     )
 
 
@@ -68,6 +77,7 @@ def _install_greedy_lore_ddp_hook(
         seed=hp.greedy_lore_seed,
         start_compress_step=hp.greedy_lore_start_compress_step,
         basis_sync=hp.greedy_lore_basis_sync,
+        dense_aux_communication_dtype=hp.greedy_lore_dense_aux_communication_dtype,
     )
     specs = tuple(
         GreedyLoreDDPParameterSpec(
@@ -157,6 +167,10 @@ def init_greedy_lore_optimizer(
         f"{hp.greedy_lore_start_compress_step}"
     )
     train.print0(f"GreedyLore basis sync: {hp.greedy_lore_basis_sync}")
+    train.print0(
+        "GreedyLore dense auxiliary communication dtype: "
+        f"{hp.greedy_lore_dense_aux_communication_dtype}"
+    )
     train.print0(f"Muon LR adjust method: {hp.adjust_lr}")
     train.print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
 
