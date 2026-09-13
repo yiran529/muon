@@ -364,3 +364,11 @@ P0 发现 `profiler_trace.py` 会把仅在时间上落入 GreedyLore local CPU r
 P1 不在训练循环插入每step同步或Kineto，而以两个等长profiler-off窗口差分：interval100的200 measured updates含2次refresh，interval200含1次，因而总时间差等于 `refresh - ordinary`。3组交替配对均exit0；A/B分别为 `239.06/232.15`、`239.51/232.99`、`244.66/231.25 ms`，推得ordinary `225.24/226.47/217.84 ms`、refresh `1607.24/1530.47/2899.84 ms`，均值 `223.18/2012.52 ms`。refresh相对ordinary按interval200摊销为 `6.91/6.52/13.41 ms/update`，mean `8.95 ms/update`。第三组差分波动较大，数字只用于确认refresh是主要量级瓶颈，不作精确wall-clock分解。
 
 artifact：`artifacts/compressed_muon/CM063-*-m002-gpt130m-phase-timing-*/`。
+
+## 2026-09-13：CM052c/CM053c high-rank 完整训练计划
+
+为检查 rank 是否是 CM052b/CM053b 约 8.7% perplexity 退化的主要来源，只运行两个 GreedyLore-Muon cell，不重复 dense。CM052c 严格复制 CM052b 并仅把 rank32 改为 rank128；CM053c 严格复制 CM053b 并仅把 rank32 改为 rank256。两者继续使用 local-SVD、interval200、step1000 开始压缩、error feedback、bucket160 MiB、seed1234，以及各自原有的 10,000/20,000 updates 和 1,000/2,000 warmup。
+
+`benchmark/compressed_muon/run_cm052c_cm053c_m002_rank_scaling_quality.sh` 先对两个模型执行覆盖 refresh/compressed 路径的 3-step probe，再按 CM052c→CM053c 串行正式训练；任一 probe 或正式 cell 失败即停止。controller 动态等待任意 4 张至少有 18 GiB 空闲显存的 GPU，不启用 Kineto trace，不设置基于历史 dense 的自动 quality gate。结果分别与已有 CM052a/CM053a dense 和 CM052b/CM053b rank32 进行历史对比。
+
+延时会话于 2026-09-13 00:40:25（Asia/Shanghai）创建为 tmux `cm052c_cm053c_high_rank`，目标启动时间为 01:32:01，与本次请求首次记录时间相隔一小时。创建时 W&B 已认证，数据、torchrun 和三个目标 artifact 路径均通过预检；GPU 2–7 各约有 24.1 GiB 空闲，GPU 0–1 上已有进程且不会被选择。到点后的实际资源仍由 controller 重新检查，不满足门槛时自动等待。

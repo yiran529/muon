@@ -408,6 +408,38 @@ trace；保留的 trace 来自单独的 CM050 preflight，不能用来替代 CM0
 - `artifacts/compressed_muon/CM053a-dense-muon-gpt130m-paper-aligned-ddp-ws4-s1234/`
 - `artifacts/compressed_muon/CM053b-m002-greedylore-muon-gpt130m-paper-aligned-ddp-ws4-s1234/`
 
+## CM052c–CM053c：M002 high-rank 质量消融（2026-09-13）
+
+针对 CM052/CM053 中 rank32 的约 `8.7%` perplexity 退化，严格复用同一
+paper-aligned 配方和 seed1234，只将 60M 的 GreedyLore rank 从 32 提高到
+128、130M 的 rank 提高到 256。本次不重跑 dense，与 CM052a/CM053a
+的历史 dense 基线及 CM052b/CM053b 的 rank32 结果对照。两个强制
+压缩 probe 和两组正式训练均 exit `0`。
+
+| 模型/实验 | dense / high-rank val loss | dense / high-rank ppl | high-rank 相对 dense ppl | high-rank 相对 rank32 ppl | dense / high-rank step | dense / high-rank peak | 判断 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 60M / CM052c rank128 | 4.0003 / 4.0140 | 54.61 / 55.37 | **+1.38%** | **-6.73%** | 112.61 / 117.52 ms (`+4.36%`) | 6865 / 7363 MiB | quality substantially recovered；performance-negative |
+| 130M / CM053c rank256 | 3.5749 / 3.5821 | 35.69 / 35.95 | **+0.72%** | **-7.33%** | 241.22 / 249.68 ms (`+3.51%`) | 13048 / 13889 MiB | quality substantially recovered；performance-negative |
+
+提高 rank 将 60M/130M 相对 dense 的 perplexity 差距从
+`+8.70%/+8.69%` 缩小到 `+1.38%/+0.72%`，说明 rank32 是先前质量损失
+的重要因素。代价是相对 dense 的平均 step 变慢 `4.36%/3.51%`，peak
+memory 增加 `7.25%/6.45%`。相对各自 rank32 运行，high-rank step 也分别
+变慢 `2.86%/4.90%`；因此这两个配方不再保留 CM053 中的小幅性能正向
+信号。
+
+结论分类为 **quality substantially recovered, not equivalence established**：高 rank
+在单一 seed 上大幅缓解了质量退化，但两组最终质量仍低于 dense，
+且没有多 seed 置信区间，不能据此宣称质量等价。这一结果也表明，
+后续若追求接近 dense 的质量，需要将 rank 提升带来的额外计算/通信开销
+与质量收益一并评估，而不能沿用 rank32 的性能结论。
+
+原始产物：
+
+- `artifacts/compressed_muon/CM052c-CM053c-m002-rank-scaling-quality-controller/`
+- `artifacts/compressed_muon/CM052c-m002-greedylore-muon-gpt60m-paper-aligned-r128-ddp-ws4-s1234/`
+- `artifacts/compressed_muon/CM053c-m002-greedylore-muon-gpt130m-paper-aligned-r256-ddp-ws4-s1234/`
+
 ## CM054：M002 ordinary-step batching 60M timing（2026-09-12）
 
 在 M002 普通 compressed step 加入 canonical same-shape batching，并让 batched factor 直接写入一次分配的 packed collective buffer 后，严格复用 CM047 的 60M timing 几何和 3 次 rotated-order pairing；本实验只运行 profiler-off timing，不生成 trace。
@@ -473,3 +505,27 @@ CM058/CM059 共 12/12 cells exit `0`，所有末尾 timing marker 均为有限�
 同期修复 profiler local GPU 归因：GPU kernel 不再仅因执行时间落入 hook CPU annotation 就被归为 local work，而必须关联到同 pid/tid 且嵌套在该 annotation 中的 CPU launch/op。新反例覆盖并发 backward kernel 落入 score 时间窗的情形；CM049 完整历史 trace 的修正版汇总仍作为后台派生产物，不用未完成数据更新本节数值。
 
 原始产物：`artifacts/compressed_muon/CM063-*-m002-gpt130m-phase-timing-*/`。
+
+## CM063b–CM063c：bucket 80 MiB 的 60M / 350M timing（2026-09-13）
+
+固定原始 M002 local-SVD、4×RTX 4090、seq256、rank32、interval200 和 seed42，将 DDP bucket 从 CM049 系列的 160 MiB 降至 80 MiB；60M 使用 global/device batch 512/128，350M 使用 32/8。每个 cell 运行 20 warmup + 200 profiler-off measured update，dense 与 M002 各完成 3 次交替顺序配对。12/12 cells exit `0`，无 OOM、timeout 或 traceback。
+
+| 模型 / repeat | dense step | M002 step | M002 相对 dense | dense / M002 val loss |
+|---|---:|---:|---:|---:|
+| 60M / r1 | 99.54 ms | 102.17 ms | +2.64% | 5.4918 / 5.7988 |
+| 60M / r2 | 101.22 ms | 102.64 ms | +1.40% | 5.4914 / 5.7872 |
+| 60M / r3 | 100.07 ms | 103.13 ms | +3.06% | 5.4927 / 5.7934 |
+| **60M / mean** | **100.277 ms** | **102.647 ms** | **+2.37%** | **5.4920 / 5.7931** |
+| 350M / r1 | 222.44 ms | 208.07 ms | -6.46% | 6.3974 / 6.7630 |
+| 350M / r2 | 220.45 ms | 206.90 ms | -6.15% | 6.3968 / 6.7768 |
+| 350M / r3 | 254.69 ms | 207.57 ms | -18.50% | 6.3961 / 6.7731 |
+| **350M / mean** | **232.527 ms** | **207.513 ms** | **-10.37%** | **6.3968 / 6.7710** |
+
+60M 的三组配对均为负向：M002 平均慢 `2.37 ms/update`（`+2.37%`），吞吐从 1.307M 降至 1.277M tokens/s，peak allocated 从 6865 增至 7182 MiB。因此 bucket80 在 60M 上没有产生 wall-clock 加速。
+
+350M 的 M002 三次结果稳定在 `206.90–208.07 ms`，但 dense r3 从前两次的 `220.45–222.44 ms` 抬升到 `254.69 ms`，使 dense CV 达 `8.27%`，并将均值加速放大到 `10.37%`。前两组配对加速为 `6.46%/6.15%`，中位数比较为 `6.69%`；因此只将其记为 **约 6%–7% 的稳定加速信号**，不将 `10.37%` 视为稳健 claim。代价是 peak allocated 从 7062 增至 9707 MiB（+2645 MiB）。
+
+本次是仅 220 update 的短程 timing，最终 val loss 只用于运行健康检查，不支持最终收敛质量结论。原始产物：
+
+- `artifacts/compressed_muon/CM063b-m002-gpt60m-bucket80-interval200-ddp-ws4-s42/`
+- `artifacts/compressed_muon/CM063c-m002-gpt350m-bucket80-interval200-ddp-ws4-s42/`
