@@ -408,3 +408,9 @@ GreedyLore 的 error、basis、score、dense_aux 与 factor 默认全部跟随 b
 TDD/验证覆盖整模型 materialization、BF16 Muon/Lion/AdamW state、FP32/BF16 GreedyLore core/hook/profiler、两 rank Gloo collective 与 checkpoint roundtrip、两卡 NCCL BF16 payload。分项结果分别为训练入口 `29 passed`、CUDA optimizer `109 passed, 17 skipped`、GreedyLore core/hook `70 passed`、distributed/checkpoint `40 passed`、NCCL BF16 `1 passed, 3 deselected`；最终覆盖训练入口、Muon、GreedyLore、layout、profiler、distributed、checkpoint 与 CM066 launcher 的 fresh 综合 gate 为 `307 passed`。按用户要求暂不执行真实训练 smoke 或正式实验。
 
 CM066 登记四个全新 GPT-130M/seed1234/bucket80 MiB cell：CM066a/b 是 FP32 dense/GreedyLore，CM066c/d 是 BF16 dense/GreedyLore。四者统一 20,000 updates、warmup2,000、rank32、interval200、step1000 开始压缩；controller 串行 fail-fast，先为每个 cell 跑覆盖 refresh/compressed 的 3-step probe。分析只允许 CM066a↔CM066b、CM066c↔CM066d 的同 dtype 配对，绝不把 BF16 参数结果与旧 FP32 dense 基线拼接。当前仅登记为 planned，尚无质量或性能结果，因此不更新 `RESULTS.md`。
+
+## 2026-09-13：CM067 bucket-native BF16 跨规模 timing 计划
+
+在 CM066 完整质量矩阵之前先做 timing-only 检查。CM067 显式使用 BF16 整模型参数，因此 gradient、DDP bucket 以及默认 `bucket` 模式下的 GreedyLore dense_aux/score/factor/error/basis 均为 BF16。固定 4-rank DDP、seq256、global/device batch512/128、bucket80 MiB、rank32、interval200、seed42；每个 timing cell 为 20 warmup + 800 measured updates，覆盖四个完整 interval，并做 3 组 dense/GreedyLore rotated pairing。
+
+顺序为 60M（dim512/4 layers/8 heads）、130M（dim768/8 layers/12 heads），最后以完全相同 batch 尝试 350M（dim1024/20 layers/16 heads）。60M/130M 任一失败即停止；350M 的 OOM 或其他失败只记录，不令 controller 失败，并在主序列尚未触达 GreedyLore 时补一次 GreedyLore-only 尝试。通用 profiler launcher 新增默认 `float32` 的 `--model-dtype` 参数，既有调用保持不变；CM067 wrapper 才显式选择 `bfloat16`。运行前 shell/plan 与既有 launcher 回归为 `13 passed`，当前结果状态为 planned。

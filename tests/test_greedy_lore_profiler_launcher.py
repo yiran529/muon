@@ -29,6 +29,7 @@ def test_print_plan_rotates_greedylore_modes_and_parameterizes_resources(tmp_pat
         "--layers", "3",
         "--heads", "4",
         "--sequence-length", "64",
+        "--model-dtype", "bfloat16",
         "--bucket-cap-mb", "7",
         "--timing-warmup-steps", "5",
         "--measured-full-periods", "3",
@@ -46,6 +47,7 @@ def test_print_plan_rotates_greedylore_modes_and_parameterizes_resources(tmp_pat
     assert plan["gradient_accumulation_steps"] == 4
     assert plan["model"] == {"dim": 128, "layers": 3, "heads": 4}
     assert plan["sequence_length"] == 64
+    assert plan["model_dtype"] == "bfloat16"
     assert plan["bucket_cap_mb"] == 7
     assert plan["timing_warmup_steps"] == 5
     assert plan["measured_full_periods"] == 3

@@ -14,6 +14,7 @@ model_dim=1024
 layers=20
 heads=16
 sequence_length=1024
+model_dtype="float32"
 timing_warmup_steps=20
 measured_full_periods=1
 bucket_cap_mb=160
@@ -40,6 +41,7 @@ while (($#)); do
         --layers) layers="$2"; shift 2 ;;
         --heads) heads="$2"; shift 2 ;;
         --sequence-length) sequence_length="$2"; shift 2 ;;
+        --model-dtype) model_dtype="$2"; shift 2 ;;
         --bucket-cap-mb) bucket_cap_mb="$2"; shift 2 ;;
         --timing-warmup-steps) timing_warmup_steps="$2"; shift 2 ;;
         --measured-full-periods) measured_full_periods="$2"; shift 2 ;;
@@ -88,6 +90,10 @@ case "$greedy_lore_dense_aux_communication_dtype" in
     bucket|float32|bfloat16) ;;
     *) printf 'invalid GreedyLore dense auxiliary communication dtype: %s\n' "$greedy_lore_dense_aux_communication_dtype" >&2; exit 64 ;;
 esac
+case "$model_dtype" in
+    float32|bfloat16) ;;
+    *) printf 'invalid model dtype: %s\n' "$model_dtype" >&2; exit 64 ;;
+esac
 if [[ "$profile_modes_csv" == "none" ]]; then
     profile_modes=()
 else
@@ -132,7 +138,7 @@ fi
 
 print_plan() {
     WS="$world_size" GBS="$global_batch_size" DBS="$device_batch_size" GA="$grad_accum_steps" \
-    MD="$model_dim" NL="$layers" NH="$heads" SEQ="$sequence_length" REFRESH="$refresh_profile_step" \
+    MD="$model_dim" NL="$layers" NH="$heads" SEQ="$sequence_length" MODEL_DTYPE="$model_dtype" REFRESH="$refresh_profile_step" \
     COMPRESSED="$compressed_profile_step" WARMUP="$timing_warmup_steps" PERIODS="$measured_full_periods" \
     TIMING_NI="$timing_num_iterations" BUCKET="$bucket_cap_mb" REPS="$repeats" GL_RANK="$greedy_lore_rank" \
     GL_INTERVAL="$greedy_lore_update_interval" GL_DENSE_AUX_DTYPE="$greedy_lore_dense_aux_communication_dtype" \
@@ -176,6 +182,7 @@ print(json.dumps({
         "heads": int(os.environ["NH"]),
     },
     "sequence_length": int(os.environ["SEQ"]),
+    "model_dtype": os.environ["MODEL_DTYPE"],
     "bucket_cap_mb": float(os.environ["BUCKET"]),
     "timing_warmup_steps": int(os.environ["WARMUP"]),
     "measured_full_periods": int(os.environ["PERIODS"]),
@@ -292,6 +299,7 @@ run_cell() {
         "$torchrun_bin" --standalone "--nproc_per_node=$world_size" "$entry"
         --config "$config" --data_dir "$data_dir" --no_wandb --use_polar_express
         --model_dim "$model_dim" --n_layer "$layers" --n_head "$heads"
+        --model_dtype "$model_dtype"
         --sequence_length "$sequence_length" --batch_size "$global_batch_size"
         --device_batch_size "$device_batch_size" --val_tokens "$val_tokens"
         --num_iterations "$run_iterations" --training-seed "$training_seed"
