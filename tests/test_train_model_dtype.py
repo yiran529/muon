@@ -99,3 +99,57 @@ def test_float32_parameter_storage_remains_valid_for_device_mesh_training():
     train = _import_train()
 
     train.validate_model_dtype_parallelism("float32", object())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_muon_and_scalar_optimizer_states_follow_bfloat16_parameters():
+    from dion import Muon
+
+    device = torch.device("cuda")
+    matrix = torch.nn.Parameter(torch.randn(8, 8, device=device, dtype=torch.bfloat16))
+    lion_parameter = torch.nn.Parameter(
+        torch.randn(16, 8, device=device, dtype=torch.bfloat16)
+    )
+    adamw_parameter = torch.nn.Parameter(
+        torch.randn(8, 16, device=device, dtype=torch.bfloat16)
+    )
+    optimizer = Muon(
+        [
+            {"params": [matrix]},
+            {
+                "params": [lion_parameter],
+                "algorithm": "lion",
+                "lr": 1e-3,
+                "beta1": 0.9,
+                "beta2": 0.95,
+                "weight_decay": 0.0,
+            },
+            {
+                "params": [adamw_parameter],
+                "algorithm": "adamw",
+                "lr": 1e-3,
+                "beta1": 0.9,
+                "beta2": 0.95,
+                "epsilon": 1e-8,
+                "weight_decay": 0.0,
+            },
+        ],
+        distributed_mesh=None,
+        lr=0.01,
+        use_triton=False,
+        newton_schulz_func=lambda value, epsilon: value,
+    )
+    for parameter in (matrix, lion_parameter, adamw_parameter):
+        parameter.grad = torch.randn_like(parameter)
+
+    optimizer.step()
+
+    assert optimizer.state[matrix]["momentum"].dtype == torch.bfloat16
+    assert optimizer.state[lion_parameter]["momentum"].dtype == torch.bfloat16
+    assert optimizer.state[adamw_parameter]["momentum"].dtype == torch.bfloat16
+    assert optimizer.state[adamw_parameter]["variance"].dtype == torch.bfloat16
+    assert optimizer.state[adamw_parameter]["step_dev"].dtype == torch.float32
+    assert all(group["lr"].dtype == torch.float32 for group in optimizer.param_groups)
+    for parameter in (matrix, lion_parameter, adamw_parameter):
+        assert parameter.dtype == torch.bfloat16
+        assert torch.isfinite(parameter).all()
