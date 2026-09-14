@@ -333,3 +333,26 @@ def test_recurrence_primitives_keep_bucket_dtype_after_bfloat16_gradient(monkeyp
     assert local_factor.dtype == torch.bfloat16
     assert next_error.dtype == torch.bfloat16
     assert reconstructed.dtype == torch.bfloat16
+
+
+def test_refresh_basis_uses_left_gram_path_for_very_wide_matrix(monkeypatch):
+    corrected = torch.tensor(
+        [
+            [4.0, 0.0, 1.0, 0.0, 2.0, 0.0, 1.0, 0.0, 3.0, 0.0, 1.0, 0.0, 2.0],
+            [0.0, 3.0, 0.0, 1.0, 0.0, 2.0, 0.0, 1.0, 0.0, 2.0, 0.0, 1.0, 0.0],
+            [1.0, 0.0, 2.0, 0.0, 1.0, 0.0, 2.0, 0.0, 1.0, 0.0, 2.0, 0.0, 1.0],
+        ]
+    )
+
+    def reject_svd(*_args, **_kwargs):
+        raise AssertionError("very wide refresh must not materialize an SVD Vh")
+
+    monkeypatch.setattr(torch.linalg, "svd", reject_svd)
+
+    basis, projector, support = refresh_basis(corrected, rank=2)
+
+    assert torch.equal(support, torch.tensor([0, 1]))
+    assert torch.equal(projector, basis[:, :2])
+    assert torch.allclose(basis.T @ basis, torch.eye(3), atol=1e-5, rtol=1e-5)
+    pivot_rows = basis.abs().argmax(dim=0)
+    assert torch.all(basis[pivot_rows, torch.arange(3)] >= 0)

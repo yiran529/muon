@@ -14,7 +14,7 @@ rank-local accumulated gradient
 
 因此 M002 是新的近似 Muon 变体，不是 dense Muon 的等价通信实现。GreedyLore 论文对 MSGD/Adam 的收敛分析不会自动迁移到 Muon：Muon 在动量之后应用非线性正交化，通常有 `Ortho(Average(G)) != Average(Ortho(G))`。在完成专门理论之前，不宣称 M002 具有论文给出的收敛保证。
 
-首版只支持固定 process group 的 DDP、`find_unused_parameters=False`、FP32 Muon 矩阵 bucket 和同构软件/硬件栈。FSDP/HSDP、DDP join、unused parameters、动态参数组、world-size-changing resume、三维 matrix batch、AMP GradScaler skip/retry 与异构 accelerator stack 不在范围内。矩阵资格由 `train.build_muon_param_groups()` 的第一个 Muon group 决定；二维 embedding/lm-head 与其他参数保持 exact dense auxiliary sync。
+首版只支持固定 process group 的 DDP、`find_unused_parameters=False`、FP32 Muon 矩阵 bucket 和同构软件/硬件栈。FSDP/HSDP、DDP join、unused parameters、动态参数组、world-size-changing resume、三维 matrix batch、AMP GradScaler skip/retry 与异构 accelerator stack 不在范围内。默认矩阵资格由 `train.build_muon_param_groups()` 的第一个 Muon group 决定；启用 `greedy_lore_compress_embedding_lm_head` 后，二维 embedding 与 lm-head 同时加入通信压缩集合，但继续由原 AdamW 参数组更新。其他 auxiliary 参数保持 exact dense sync。
 
 ## 算法状态与通信
 

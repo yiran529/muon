@@ -144,6 +144,37 @@ def test_factory_builds_ordinary_muon_with_one_greedylore_hook_and_muon_group_ro
     assert optimizer.param_groups[2]["weight_decay"] == pytest.approx(0.04)
 
 
+def test_factory_combined_switch_compresses_embedding_and_lm_head_but_keeps_adamw():
+    module = _module()
+
+    model = _StubModel()
+    ddp = _DDPStub()
+    hp = module.GreedyLoreHyperparameters(
+        greedy_lore_rank=8,
+        greedy_lore_compress_embedding_lm_head=True,
+        scalar_opt="adamw",
+    )
+
+    optimizer, _runtime = module.init_greedy_lore_optimizer(
+        model=model,
+        device_mesh=None,
+        ddp_model=ddp,
+        hp=hp,
+        cli_args=_cli(),
+    )
+
+    state, _hook = ddp.registrations[0]
+    roles = {spec.stable_name: spec.role for spec in state.parameter_specs}
+    assert roles == {
+        "transformer.h.0.weight": "matrix",
+        "transformer.h.1.weight": "matrix",
+        "transformer.wte.weight": "matrix",
+        "lm_head.weight": "matrix",
+    }
+    assert optimizer.param_groups[1]["algorithm"] == "adamw"
+    assert optimizer.param_groups[2]["algorithm"] == "adamw"
+
+
 @pytest.mark.parametrize(
     "kwargs, match",
     [

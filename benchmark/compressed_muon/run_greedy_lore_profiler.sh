@@ -25,6 +25,7 @@ training_seed=42
 greedy_lore_rank=32
 greedy_lore_update_interval=200
 greedy_lore_dense_aux_communication_dtype="bucket"
+greedy_lore_compress_embedding_lm_head=0
 gpu_list=""
 exclude_gpus=""
 artifact_root=""
@@ -52,6 +53,7 @@ while (($#)); do
         --greedy-lore-rank) greedy_lore_rank="$2"; shift 2 ;;
         --greedy-lore-update-interval) greedy_lore_update_interval="$2"; shift 2 ;;
         --greedy-lore-dense-aux-communication-dtype) greedy_lore_dense_aux_communication_dtype="$2"; shift 2 ;;
+        --greedy-lore-compress-embedding-lm-head) greedy_lore_compress_embedding_lm_head=1; shift ;;
         --gpu-list) gpu_list="$2"; shift 2 ;;
         --exclude-gpus) exclude_gpus="$2"; shift 2 ;;
         --artifact-root) artifact_root="$2"; shift 2 ;;
@@ -142,6 +144,7 @@ print_plan() {
     COMPRESSED="$compressed_profile_step" WARMUP="$timing_warmup_steps" PERIODS="$measured_full_periods" \
     TIMING_NI="$timing_num_iterations" BUCKET="$bucket_cap_mb" REPS="$repeats" GL_RANK="$greedy_lore_rank" \
     GL_INTERVAL="$greedy_lore_update_interval" GL_DENSE_AUX_DTYPE="$greedy_lore_dense_aux_communication_dtype" \
+    GL_COMPRESS_EMBEDDING_LM_HEAD="$greedy_lore_compress_embedding_lm_head" \
     GPU_LIST_VALUE="${gpu_list:-dynamic}" EXCLUDED="$exclude_gpus" \
     PROFILE_MODES="$profile_modes_csv" TIMING_MODES="$timing_modes_csv" \
     ROOT="$artifact_root" "$python_bin" - <<'PY'
@@ -193,6 +196,7 @@ print(json.dumps({
         "rank": int(os.environ["GL_RANK"]),
         "update_interval": int(os.environ["GL_INTERVAL"]),
         "dense_aux_communication_dtype": os.environ["GL_DENSE_AUX_DTYPE"],
+        "compress_embedding_lm_head": bool(int(os.environ["GL_COMPRESS_EMBEDDING_LM_HEAD"])),
         "start_compress_step": int(os.environ["WARMUP"]),
         "refresh_profile_step": int(os.environ["REFRESH"]),
         "compressed_profile_step": int(os.environ["COMPRESSED"]),
@@ -309,6 +313,9 @@ run_cell() {
             --greedy_lore_update_interval "$greedy_lore_update_interval"
             --greedy_lore_start_compress_step "$timing_warmup_steps"
             --greedy_lore_dense_aux_communication_dtype "$greedy_lore_dense_aux_communication_dtype")
+        if ((greedy_lore_compress_embedding_lm_head)); then
+            command+=(--greedy_lore_compress_embedding_lm_head)
+        fi
         if [[ "$mode_name" == "greedylore_broadcast" ]]; then
             command+=(--greedy_lore_basis_sync broadcast)
         else

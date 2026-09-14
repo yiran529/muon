@@ -32,6 +32,7 @@ class GreedyLoreHyperparameters(train.Hyperparameters):
     greedy_lore_dense_aux_communication_dtype: Literal[
         "bucket", "float32", "bfloat16"
     ] = "bucket"
+    greedy_lore_compress_embedding_lm_head: bool = False
 
 
 def configure_greedy_lore_parser(parser: argparse.ArgumentParser) -> None:
@@ -48,6 +49,12 @@ def configure_greedy_lore_parser(parser: argparse.ArgumentParser) -> None:
         "--greedy_lore_dense_aux_communication_dtype",
         choices=("bucket", "float32", "bfloat16"),
         default=None,
+    )
+    parser.add_argument(
+        "--greedy_lore_compress_embedding_lm_head",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Compress both embedding and LM-head gradients with GreedyLore",
     )
 
 
@@ -69,7 +76,7 @@ def _install_greedy_lore_ddp_hook(
     ddp_model: DDP,
     optimizer: torch.optim.Optimizer,
     hp: GreedyLoreHyperparameters,
-    matrix_parameters: set[int],
+    compressed_parameters: set[int],
 ) -> train.GradientSyncRuntime:
     config = GreedyLoreConfig(
         rank=hp.greedy_lore_rank,
@@ -84,7 +91,7 @@ def _install_greedy_lore_ddp_hook(
             parameter=parameter,
             stable_name=name,
             stable_id=stable_id,
-            role="matrix" if id(parameter) in matrix_parameters else "dense_aux",
+            role="matrix" if id(parameter) in compressed_parameters else "dense_aux",
         )
         for stable_id, (name, parameter) in enumerate(model.named_parameters())
     )
@@ -158,7 +165,14 @@ def init_greedy_lore_optimizer(
         )
 
     param_groups = train.build_muon_param_groups(model, hp)
-    matrix_parameters = {id(parameter) for parameter in param_groups[0]["params"]}
+    compressed_parameters = {id(parameter) for parameter in param_groups[0]["params"]}
+    if hp.greedy_lore_compress_embedding_lm_head:
+        compressed_parameters.update(
+            {
+                id(model.transformer.wte.weight),
+                id(model.lm_head.weight),
+            }
+        )
 
     train.print0(f"GreedyLore rank: {hp.greedy_lore_rank}")
     train.print0(f"GreedyLore update interval: {hp.greedy_lore_update_interval}")
@@ -170,6 +184,10 @@ def init_greedy_lore_optimizer(
     train.print0(
         "GreedyLore dense auxiliary communication dtype: "
         f"{hp.greedy_lore_dense_aux_communication_dtype}"
+    )
+    train.print0(
+        "GreedyLore compress embedding and LM head: "
+        f"{hp.greedy_lore_compress_embedding_lm_head}"
     )
     train.print0(f"Muon LR adjust method: {hp.adjust_lr}")
     train.print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
@@ -191,7 +209,7 @@ def init_greedy_lore_optimizer(
         ddp_model,
         optimizer,
         hp,
-        matrix_parameters,
+        compressed_parameters,
     )
     return optimizer, runtime
 

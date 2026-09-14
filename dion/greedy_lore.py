@@ -165,12 +165,17 @@ def corrected_gradient(
 
 
 def refresh_basis(global_corrected: Tensor, rank: int) -> tuple[Tensor, Tensor, Tensor]:
-    """Refresh via FP32 SVD, then restore the bucket-native basis dtype."""
+    """Refresh the left basis in FP32, then restore the bucket-native dtype."""
 
     original_dtype = global_corrected.dtype
-    basis, _, _ = torch.linalg.svd(
-        global_corrected.to(dtype=torch.float32), full_matrices=False
-    )
+    rows, columns = global_corrected.shape
+    corrected_fp32 = global_corrected.to(dtype=torch.float32)
+    if columns > 4 * rows:
+        gram = corrected_fp32 @ corrected_fp32.mT
+        _, basis = torch.linalg.eigh(gram)
+        basis = basis.flip(dims=(1,))
+    else:
+        basis, _, _ = torch.linalg.svd(corrected_fp32, full_matrices=False)
     basis = canonicalize_svd_basis(basis).to(dtype=original_dtype)
     support = torch.arange(rank, device=basis.device, dtype=torch.int64)
     projector = basis.index_select(1, support)
