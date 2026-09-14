@@ -485,3 +485,11 @@ artifact：`artifacts/compressed_muon/CM072-m002-gpt130m-bf16-ordinary-pipeline-
 直接检查四个 rank 的 GPU event 区间后，reconstruction 与任何 BF16 AllReduce 的实际交集均为 `0 ms`；score preparation 与 reconstruction 仅在 rank0/rank2 有 `0.549/0.457 ms` 交集，rank1/rank3 为0。说明实现虽然解除了“下一 bucket collective 必须等待前一 bucket reconstruction”的依赖，但当前 bucket readiness、约2 ms的 score preparation 与亚毫秒 reconstruction 时长没有给下一次 score AllReduce 留出实际重叠窗口。CM073 与 CM069 卡组不同且 collective 时长波动较大，不能用两次 exposed NCCL 的绝对差异归因流水化回退；本轮主要结论是目标 collective overlap 未发生。
 
 artifact：`artifacts/compressed_muon/CM073-m002-gpt130m-bf16-ordinary-pipeline-targeted-profile-ws4-s42/`。
+
+#### mixed bucket 与 embedding/head 压缩评估
+
+进一步审计 CM073 bucket metadata：三个 bucket 中 A/C 为 mixed，分别含 `77.27 MiB dense_aux + 7.08 MiB matrix` 与 `77.27 MiB dense_aux + 21.23 MiB matrix`；B 为 `84.93 MiB` matrix-only。mixed bucket 占总 gradient bytes `68.28%`，dense_aux 占 `57.71%`。两个77.27 MiB张量对应 `transformer.wte.weight` 与 `lm_head.weight`，因当前通信 role 直接取自 Muon param group，它们由 AdamW 更新并走 dense AllReduce。DDP 不理解优化器/压缩角色，只按注册顺序和 soft cap 聚合不可切分的参数，因此形成 mixed bucket。cap40 历史 trace 能隔离其中一个大参数，但另一个仍与28.31 MiB matrix组成105.58 MiB mixed bucket，说明只调 cap 不足以稳定控制 composition。
+
+记录的后续优先级为：先用参数名审计和注册顺序配合40/64 MiB cap，把两个大参数尽量变成 dense-only bucket；hook 内拆分 score/dense_aux 在单 communicator 下只能隐藏本地 factor preparation，不能消除 dense_aux 对 collective/Future 尾部的阻塞；跨 bucket score/factor 交错只在所有 rank 的下一 bucket 都足够早 ready 后再实现。
+
+embedding/head 也进行 GreedyLore 通信压缩在接口上可行：解耦 optimizer role 与 communication role，继续用 AdamW 更新，只让 hook 压缩其二维梯度。两者为约 `50304×768`，rank32 ordinary factor 合计约 `6.44 MB`，相对当前 `154.53 MB` dense payload 有很大通信缩减潜力；代价是约147 MiB额外 full-size error state、宽矩阵 corrected/factor 临时量，以及每次refresh新增两次 `768×50304` FP32 SVD。该路径还直接扰动 embedding/logit 梯度，质量风险高；若推进，应以 embedding-only、head-only、both 三个显式消融开关开始，并先将宽矩阵 refresh 改为只求左子空间的 Gram-eigh 或受控 randomized SVD，再决定是否进入完整质量实验。

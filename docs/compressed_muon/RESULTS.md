@@ -763,3 +763,13 @@ M002 的 CV 为 `0.060%`，三次稳定在 `203.18–203.40 ms`；dense CV 为 `
 CM073 的 M002 exposed NCCL 比 CM069 旧实现的 bucket80 profile `35.043 ms` 更高，但两次使用不同 GPU 组合（CM069 为 `2,3,4,5`），且 score/factor collective 本身也从 `21.609/6.934` 波动到 `31.422/9.244 ms`；这项跨实验差异不能解释成流水化导致通信回退。可确定的结论是：**第一阶段放宽了依赖，但在当前 bucket 几何下没有把 reconstruction 与下一 bucket collective 实际叠起来**，与 CM072 只有约 `0.43%` 历史绝对改善信号相符。
 
 原始产物：`artifacts/compressed_muon/CM073-m002-gpt130m-bf16-ordinary-pipeline-targeted-profile-ws4-s42/`。
+
+### CM073 mixed-bucket 组成审计与后续方向
+
+CM073 bucket80 的三个 DDP bucket 中有两个同时包含 GreedyLore matrix 与未压缩 dense auxiliary，属于 mixed bucket：A 为 `84.34 MiB = 77.27 MiB dense_aux + 7.08 MiB matrix`，B 为 `84.93 MiB` matrix-only，C 为 `98.50 MiB = 77.27 MiB dense_aux + 21.23 MiB matrix`。mixed bucket 占全部 gradient bytes 的 `68.28%`，dense auxiliary 本身占 `57.71%`。两个 `77.27 MiB` dense auxiliary 分别来自 `transformer.wte.weight` 与 `lm_head.weight`；它们由 scalar AdamW 参数组更新，当前 hook 因而不压缩其通信。DDP 只按参数注册/遍历顺序、dtype/device 和 soft bucket cap 分桶，不知道 Muon/AdamW 或压缩角色；单个参数又不能切开，因此接近80 MiB的 embedding/head 会与邻近 transformer matrix 落入同一 bucket。
+
+这也说明仅在 mixed bucket 内把 packed buffer 拆成 `score` 与 `dense_aux` 不能消除主要阻塞：单 process group 下若顺序为 `score→dense_aux→factor`，只能让本地 factor preparation 与 dense_aux AllReduce 重叠，factor collective 和 bucket Future 仍等待约77 MiB通信；若改为 `score→factor→dense_aux`，factor可提前，但最终 bucket/后续 collective 仍受 dense_aux 尾部约束。cap40 的历史 trace 已把一个77.27 MiB参数隔离成 dense-only，并形成两个约42.47 MiB matrix-only bucket，但另一个参数仍与28.31 MiB matrix 混成105.58 MiB bucket；mixed-byte占比从 `68.28%` 降到 `39.43%`，证明减小cap有帮助但不能单独保证完全隔离。后续较低风险顺序是：先记录稳定参数名并通过参数注册顺序加 `40/64 MiB` cap 尝试形成两个 embedding/head dense-only bucket，再评估 hook 内逻辑拆分；只有在下一 bucket 已稳定提前 ready 后，才值得实现固定的两-bucket `score(A)→score(B)→factor(A)→factor(B)` 调度。
+
+将 embedding/lm_head 也做 GreedyLore 通信压缩在工程上可行，并不要求把它们改用 Muon：应把“optimizer role”和“communication compression role”解耦，保留它们的 AdamW param group，只让 hook 为这两个二维梯度建立 basis/error 并写回重建后的全局平均梯度。两者形状约为 `50304×768`，canonical orientation 为 `768×50304`；rank32 时每个 ordinary factor 约 `3.22 MB`，两个合计约 `6.44 MB`，而当前每步 dense payload 合计 `154.53 MB`。连同每200步一次的 dense refresh 粗略摊销，embedding/head 的平均通信量理论上仍可下降约95%，并可使当前 ordinary 总 payload 从约159 MB降到约11 MB量级。
+
+但该方向风险高于分桶：每个参数新增一个全尺寸 error buffer，两个合计约 `147 MiB`（MiB口径），并增加 basis/factor/临时 corrected-gradient；现有 `torch.linalg.svd(..., full_matrices=False)` refresh 还会对两个极宽的 `768×50304` FP32矩阵求SVD并产生很大的 `Vh` 临时量，可能显著放大当前约1.52秒的 refresh。更重要的是 embedding/head 直接决定词表示与 logits，rank32 重建误差会进入 AdamW；当前只压缩 transformer matrix 的 rank32 配方已经有明显质量退化，不能假设扩大压缩范围仍保持质量。若推进，应先新增独立的 `compress_embedding`/`compress_lm_head` 开关并分别消融，同时为宽矩阵把 full SVD 改成只求左子空间的 Gram-eigh 或受控 randomized SVD；通过短程稳定性、refresh显存/耗时和 profiler-off收益门禁后，再进行完整质量训练。
