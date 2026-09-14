@@ -649,3 +649,56 @@ GreedyLore ordinary 的修正版 local GPU 均值为：score `4.675 ms`、Top-r 
 350M 严格保持 `512/128` 后两模式均 OOM：dense 在训练分配 256 MiB 时每卡只余约 62.56 MiB；GreedyLore fallback 分配 64 MiB 时只余约 40.56 MiB。两者都没有产生有效 timing，按预登记策略不调整 batch 或重试。
 
 本次短程 val loss 只用于运行健康检查，不能支持最终收敛质量结论。原始产物：`artifacts/compressed_muon/CM067-m002-bucket-native-bf16-scale-timing-ws4-s42/`。
+
+## CM068：130M bucket-native BF16 bucket-cap 粗扫（2026-09-14）
+
+为检查 CM067 直接沿用 80 MiB 是否因 BF16 每元素字节减半而改变有效 bucket 几何，固定 GPT-130M、4卡、BF16 参数/gradient/bucket、seq256、global/device batch512/128、rank32、interval200 和 seed42，串行扫描 `24/32/40/48/64/80 MiB`。每点运行一次 dense 和 local-SVD GreedyLore，采用交替顺序、20 warmup + 200 profiler-off measured update。12/12 cells 与 controller 均 exit `0`。
+
+| bucket cap | dense step | GreedyLore step | GreedyLore−dense | dense / GreedyLore peak |
+|---:|---:|---:|---:|---:|
+| 24 MiB | **188.84 ms** | 201.23 ms | +12.39 ms (+6.56%) | 11207 / 11633 MiB |
+| 32 MiB | 194.15 ms | 203.10 ms | +8.95 ms (+4.61%) | 11207 / 11632 MiB |
+| 40 MiB | 192.42 ms | **200.99 ms** | +8.57 ms (+4.45%) | 11206 / 11632 MiB |
+| 48 MiB | 193.98 ms | 205.11 ms | +11.13 ms (+5.74%) | 11207 / 11632 MiB |
+| 64 MiB | 194.20 ms | 203.02 ms | +8.82 ms (+4.54%) | 11206 / 11632 MiB |
+| 80 MiB | 200.28 ms | 204.57 ms | **+4.29 ms (+2.14%)** | 11207 / 11632 MiB |
+
+40 MiB 使 GreedyLore 相对 80 MiB 快 `3.58 ms`，说明按元素规模匹配 FP32 bucket80 有局部收益；但 dense 对较小 bucket 的收益更大，所有点上的 GreedyLore 都慢于同 cap dense。80 MiB 与 CM067 的 `199.543/204.203 ms` 基本复现。每点仅一次，尤其 24 MiB dense 低值不能作为稳定最优 claim；本次足以否定“CM067 负结果主要由 bucket80 过大造成”的单一解释。
+
+原始产物：`artifacts/compressed_muon/CM068-m002-gpt130m-bf16-bucket-cap-sweep-ws4-s42/`。
+
+## CM069：130M bucket-native BF16 bucket40/80 targeted profile（2026-09-14）
+
+对 CM068 的 GreedyLore 绝对最优点 40 MiB 和相对差距最小点 80 MiB，各采一个 dense/GreedyLore refresh 与 ordinary targeted step；共 8 cells、32 份 rank trace，全部 exit `0` 并完成 summary。以下采用每个 cell 的 rank-max；Kineto 显著放大 GreedyLore CPU callback range，因此 profile window 不替代 CM067/CM068 的 profiler-off wall-clock。
+
+| bucket | 模式 | NCCL union | exposed NCCL | exposed grad tail | 主要 collective |
+|---:|---|---:|---:|---:|---|
+| 40 MiB | dense ordinary | 48.117 ms | 20.701 ms | 13.091 ms | gradient 40.727；Muon 7.405 ms |
+| 40 MiB | GL ordinary | 48.760 ms | 29.400 ms | 0 ms | dense-only 14.151；score+aux 18.060；factor 8.456；Muon 8.173 ms |
+| 80 MiB | dense ordinary | 50.377 ms | 32.525 ms | 24.635 ms | gradient 42.641；Muon 7.986 ms |
+| 80 MiB | GL ordinary | 35.728 ms | 35.043 ms | 0 ms | score+aux 21.609；factor 6.934；Muon 7.311 ms |
+
+GreedyLore ordinary local GPU 在 40/80 MiB 分别为：score `3.020/2.293 ms`、Top-r `1.032/0.763 ms`、factor `0.389/0.344 ms`、error `0.813/0.764 ms`、reconstruction `0.608/0.505 ms`，合计 `5.862/4.669 ms`。refresh local-SVD GPU 为 `1508.717/1503.761 ms`，按 interval200 的简单摊销约 `7.54/7.52 ms/update`。
+
+诊断显示较小 bucket 并未让 GreedyLore 的暴露通信低于 dense：40 MiB 多 `8.699 ms`，且因 bucket composition 出现单独的 `14.151 ms` dense-only collective；80 MiB 仍多 `2.518 ms`。parser 的 GreedyLore targeted-collective/backward overlap 指标在两点均为 `0`，而 ordinary 本地算术和 refresh 成本继续存在。这支持 CM067/CM068 的结构性解释：BF16 已使 dense gradient payload 减半，当前两阶段串行 Future 没有把压缩 collective 有效藏入 backward，剩余通信收益不足以覆盖本地压缩与 refresh。各项存在并发，不能把 exposed、local 和 refresh 摊销直接相加复算 step 差值。
+
+原始产物：`artifacts/compressed_muon/CM069-m002-gpt130m-bf16-bucket{40,80}-targeted-profile-ws4-s42/`。
+
+## CM070：CM052/CM053/CM052c/CM053c 的 BF16 参数完整训练（2026-09-14）
+
+六个 cell 除整模型 `model_dtype=bfloat16` 和实验/W&B 名称外，分别复用 CM052a/b、CM053a/b、CM052c、CM053c 的完整 YAML：4卡、FineWeb10B、seq256、global/device batch512/128、bucket160 MiB、seed1234、cosine to 10%、clip1；60M 运行 10,000 updates/1,000 warmup，130M 运行 20,000/2,000 warmup。GreedyLore 从 step1000 开始、interval200、local-SVD；rank32 与 high-rank 分别为 60M rank128、130M rank256。六个 formal cell 和 best-effort controller 均 exit `0`。
+
+| 模型 / 方法 | val loss | 相对同 dtype dense perplexity | step average | 相对同 dtype dense | peak allocated |
+|---|---:|---:|---:|---:|---:|
+| 60M BF16 dense | 4.1079 | baseline | 93.05 ms | baseline | 6058 MiB |
+| 60M BF16 GL rank32 | 4.2119 | +10.96% | 94.82 ms | +1.77 ms (+1.90%) | 6303 MiB |
+| 60M BF16 GL rank128 | 4.1230 | +1.52% | 95.53 ms | +2.48 ms (+2.67%) | 6311 MiB |
+| 130M BF16 dense | 3.6530 | baseline | 210.56 ms | baseline | 11208 MiB |
+| 130M BF16 GL rank32 | 3.7645 | +11.80% | 215.04 ms | +4.48 ms (+2.13%) | 11633 MiB |
+| 130M BF16 GL rank256 | 3.6618 | +0.88% | 219.71 ms | +9.15 ms (+4.35%) | 11633 MiB |
+
+提高 rank 基本消除了相对同 dtype dense 的质量差距，但扩大了性能负担；因此当前不存在同时满足质量和 wall-clock 的 BF16 GreedyLore 点。与历史 FP32 参数的 CM052a/CM053a 相比，BF16 dense 的 perplexity 分别高约 `11.36%/8.12%`；该跨 dtype 比较只用于判断无 FP32 master weights 的整模型 BF16 数值代价，不能与同 dtype 配对混为一谈。rank32 BF16 相对对应历史 FP32 rank32 的 perplexity 也分别高约 `13.68%/11.22%`。
+
+结论分类为 **quality/performance trade-off negative**：rank32 慢约 2% 且质量差约 11%；high-rank 质量接近 BF16 dense，但慢约 3%–4%。整模型 BF16 明显降低绝对 step time 和显存，却不应替代当前 FP32 参数的 paper-aligned 主配方。W&B run IDs 依次为 `1sg0ag69/rlrmb6ug/zsv0lnte/jfbm84g5/3e63ukpn/31vbzafp`。
+
+原始产物：`artifacts/compressed_muon/CM070{a,b,c,d,e,f}-*/`；controller：`artifacts/compressed_muon/CM069-CM070-m002-bf16-profile-and-quality-controller/`。

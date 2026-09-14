@@ -424,3 +424,26 @@ Controller 于 22:38 完成并 exit `0`。60M/130M 共 12/12 timing cells exit `
 350M 在同一 `512/128` batch 下两模式均 OOM。dense 完成初始 validation 后在训练分配 256 MiB 时每卡仅余约 62.56 MiB；GreedyLore fallback 在首次训练前分配 64 MiB 时仅余约 40.56 MiB。按预登记策略不继续重试，也不改变 batch。结论为 **negative**：整模型 BF16 明显降低绝对 step time 和显存，但在严格同 dtype 配对中，当前 bucket80/rank32/interval200 的 GreedyLore 在 60M/130M 都稳定慢约 2%–3%，没有速度收益。820-step 的 val loss 仅作健康检查，不作质量结论。
 
 汇总时发现 `timing-summary.json` 的 scope 文本把 800 updates 硬编码描述成 one period；根因是 summarizer 未根据 `measured_updates / interval` 生成周期数。新增多周期回归并修正为 `4 complete interval-200 periods`，相关 summarizer/launcher gate 为 `30 passed`，不改变任何原始 timing 数值。
+
+## 2026-09-14：CM068 BF16 bucket 粗扫
+
+在 GPT-130M bucket-native BF16、4卡、seq256、global/device batch512/128、rank32、interval200、seed42 下，以单次交替顺序扫描 `24/32/40/48/64/80 MiB`；每个 cap 各跑 dense/M002 的 20 warmup + 200 measured update。12/12 cells exit0。dense 为 `188.84/194.15/192.42/193.98/194.20/200.28 ms`，M002 为 `201.23/203.10/200.99/205.11/203.02/204.57 ms`，对应 M002 相对差为 `+6.56/+4.61/+4.45/+5.74/+4.54/+2.14%`。
+
+40 MiB 是 M002 绝对最快点，比 80 MiB 快 `3.58 ms`，但所有 cap 下 M002 仍慢于同 cap dense；80 MiB 又复现 CM067。由此排除“只需把 BF16 bucket80 按元素数折半至40即可恢复加速”的解释。每点只有一次，24 MiB dense 低值仅作粗扫信号。
+
+## 2026-09-14：CM069 BF16 targeted profile
+
+对 bucket40/80 各采 dense/M002 refresh 与 ordinary，共 8 cells、32 traces，全部成功。ordinary dense/M002 exposed NCCL 分别为 `20.701/29.400 ms`（40 MiB）和 `32.525/35.043 ms`（80 MiB）；40 MiB M002 另有 `14.151 ms` dense-only collective。M002 ordinary local GPU 合计为 `5.862/4.669 ms`，其中 score `3.020/2.293 ms`；refresh SVD GPU 为 `1508.717/1503.761 ms`，interval200 简单摊销约 `7.5 ms/update`。M002 targeted-collective/backward overlap 指标两点均为0。
+
+这解释了 BF16 的相对回退：dense payload 已减半且仍能利用 backward overlap，M002 两阶段串行 Future 没有把剩余 collective 有效隐藏，暴露通信没有低于 dense，同时继续支付 ordinary local 与 refresh 成本。Kineto 对 M002 callback CPU range 扰动显著，profile 仅用于上述热点/重叠诊断；端到端仍以 CM067/CM068 profiler-off timing 为准，各分量不可直接相加。
+
+## 2026-09-14：CM070 BF16 参数 paper-aligned 完整训练
+
+单一 best-effort controller 先完成 CM069，再依次运行 CM052a/b、CM053a/b、CM052c、CM053c 的 BF16 参数副本。无 probe、无60M自动 quality gate；任一 cell 失败不阻断后续。实际六个 formal cell 均 exit0。除 `model_dtype=bfloat16` 与 artifact/W&B 名称外，训练参数读取原 YAML，继续使用 bucket160 MiB。
+
+- 60M：dense `loss4.1079, 93.05 ms, 6058 MiB`；rank32 `4.2119, 94.82 ms, 6303 MiB`，相对 dense perplexity `+10.96%`、step `+1.90%`；rank128 `4.1230, 95.53 ms, 6311 MiB`，perplexity `+1.52%`、step `+2.67%`。
+- 130M：dense `loss3.6530, 210.56 ms, 11208 MiB`；rank32 `3.7645, 215.04 ms, 11633 MiB`，相对 dense perplexity `+11.80%`、step `+2.13%`；rank256 `3.6618, 219.71 ms, 11633 MiB`，perplexity `+0.88%`、step `+4.35%`。
+
+high-rank 基本恢复相对 BF16 dense 的质量，却进一步牺牲速度。BF16 dense 相对历史 FP32 CM052a/CM053a 的 perplexity 也高约 `11.36%/8.12%`，表明没有 FP32 master weights 的整模型 BF16 本身存在不可忽略的质量代价。当前 BF16 路径只适合作为 dtype ablation，不替代 FP32 paper-aligned 主结果。
+
+artifacts：`CM068-m002-gpt130m-bf16-bucket-cap-sweep-ws4-s42/`、`CM069-m002-gpt130m-bf16-bucket{40,80}-targeted-profile-ws4-s42/`、`CM070{a,b,c,d,e,f}-*/`。
