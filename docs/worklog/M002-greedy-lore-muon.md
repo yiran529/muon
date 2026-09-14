@@ -447,3 +447,17 @@ Controller 于 22:38 完成并 exit `0`。60M/130M 共 12/12 timing cells exit `
 high-rank 基本恢复相对 BF16 dense 的质量，却进一步牺牲速度。BF16 dense 相对历史 FP32 CM052a/CM053a 的 perplexity 也高约 `11.36%/8.12%`，表明没有 FP32 master weights 的整模型 BF16 本身存在不可忽略的质量代价。当前 BF16 路径只适合作为 dtype ablation，不替代 FP32 paper-aligned 主结果。
 
 artifacts：`CM068-m002-gpt130m-bf16-bucket-cap-sweep-ws4-s42/`、`CM069-m002-gpt130m-bf16-bucket{40,80}-targeted-profile-ws4-s42/`、`CM070{a,b,c,d,e,f}-*/`。
+
+## 2026-09-14：CM071 论文 micro-batch/GA 口径跨规模 timing
+
+为消除 CM067 将每卡 effective batch128 直接作为单次 physical batch 的口径差异，CM071 固定 micro-batch/device `32`、gradient accumulation `4`，从而保持 effective/device `128`、4卡 global batch `512`。其余复用 CM067：BF16 参数/gradient/DDP bucket、seq256、bucket80 MiB、rank32、interval200、local-SVD、seed42；60M/130M/350M 各做 3 组 dense/GreedyLore rotated pairing，每个 cell 为 20 warmup + 800 measured optimizer updates。
+
+当前空闲 GPU 为 2,3,6,7，0/1 与 4/5 上有其他用户进程，因此 controller 显式选择 `2,3,6,7`。60M/130M fail-fast，350M best-effort；不启用 profiler/W&B，不运行额外脚本测试，先用 `--print-plan` 核对批量口径后在 tmux `cm071_paper_ga4_timing` 启动。
+
+### CM071 完成结果
+
+Controller 于 13:53 完成并 exit `0`，18/18 timing cells exit `0`，350M 在 micro-batch32/GA4 下不再 OOM。60M dense/M002 mean 为 `92.050/95.670 ms`，M002 慢 `3.620 ms`（`+3.94%`）；130M 为 `216.103/219.147 ms`，慢 `3.043 ms`（`+1.41%`）；350M 为 `597.190/632.520 ms`，慢 `35.330 ms`（`+5.92%`）。三个规模的逐组配对差值均为正，结论为 negative。
+
+GA4 将 60M dense/M002 peak 降至 `2036/2281 MiB`、130M 降至 `3827/4250 MiB`，350M 为 `9627/11023 MiB`。相对 CM067 GA1，60M dense step 几乎不变，130M dense 慢约 `8.3%`；但两次实验卡组不同（CM067 GPU2–5，CM071 GPU2,3,6,7），不把差值解释为纯 GA 效应。核心结论不依赖这项跨实验比较：按论文 micro-batch `32 × GA4` 运行后，本地 step time 仍远低于论文 Table V，batch 口径不足以解释接近十倍的绝对差异，GreedyLore 也仍未快于 dense。
+
+artifact：`artifacts/compressed_muon/CM071-m002-paper-microbatch-ga4-bf16-scale-timing-ws4-s42/`。

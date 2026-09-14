@@ -702,3 +702,28 @@ GreedyLore ordinary local GPU 在 40/80 MiB 分别为：score `3.020/2.293 ms`�
 结论分类为 **quality/performance trade-off negative**：rank32 慢约 2% 且质量差约 11%；high-rank 质量接近 BF16 dense，但慢约 3%–4%。整模型 BF16 明显降低绝对 step time 和显存，却不应替代当前 FP32 参数的 paper-aligned 主配方。W&B run IDs 依次为 `1sg0ag69/rlrmb6ug/zsv0lnte/jfbm84g5/3e63ukpn/31vbzafp`。
 
 原始产物：`artifacts/compressed_muon/CM070{a,b,c,d,e,f}-*/`；controller：`artifacts/compressed_muon/CM069-CM070-m002-bf16-profile-and-quality-controller/`。
+
+## CM071：论文 micro-batch `32 × GA4` 的 60M / 130M / 350M timing（2026-09-14）
+
+为修正 CM067 将每卡 effective batch128 直接作为 physical batch 的口径差异，固定 4×RTX 4090、BF16 整模型参数/gradient/DDP bucket、BF16 autocast、seq256、micro-batch/device `32`、GA`4`、effective/device `128`、global batch `512`、bucket80 MiB、rank32、interval200、local-SVD 和 seed42。每个 cell 运行 20 warmup + 800 profiler-off measured optimizer updates，即四个完整 interval；三个规模各完成 3 组 dense/GreedyLore rotated pairing。运行使用当时空闲的 GPU `2,3,6,7`，controller 和 18/18 cells 均 exit `0`，350M 不再 OOM。
+
+| 模型 / repeat | dense step | M002 step | M002−dense | dense / M002 val loss |
+|---|---:|---:|---:|---:|
+| 60M / r1 | 92.27 ms | 94.80 ms | +2.53 ms (+2.74%) | 4.6650 / 4.9749 |
+| 60M / r2 | 92.24 ms | 95.79 ms | +3.55 ms (+3.85%) | 4.6650 / 4.9749 |
+| 60M / r3 | 91.64 ms | 96.42 ms | +4.78 ms (+5.22%) | 4.6650 / 4.9749 |
+| **60M / mean** | **92.050 ms** | **95.670 ms** | **+3.620 ms (+3.94%)** | **4.6650 / 4.9749** |
+| 130M / r1 | 214.69 ms | 221.64 ms | +6.95 ms (+3.24%) | 4.3780 / 4.8242 |
+| 130M / r2 | 217.03 ms | 217.34 ms | +0.31 ms (+0.14%) | 4.3780 / 4.8242 |
+| 130M / r3 | 216.59 ms | 218.46 ms | +1.87 ms (+0.86%) | 4.3780 / 4.8242 |
+| **130M / mean** | **216.103 ms** | **219.147 ms** | **+3.043 ms (+1.41%)** | **4.3780 / 4.8242** |
+| 350M / r1 | 592.20 ms | 629.27 ms | +37.07 ms (+6.26%) | 4.1758 / 4.7278 |
+| 350M / r2 | 597.34 ms | 639.36 ms | +42.02 ms (+7.03%) | 4.1758 / 4.7278 |
+| 350M / r3 | 602.03 ms | 628.93 ms | +26.90 ms (+4.47%) | 4.1758 / 4.7278 |
+| **350M / mean** | **597.190 ms** | **632.520 ms** | **+35.330 ms (+5.92%)** | **4.1758 / 4.7278** |
+
+60M dense/M002 CV 为 `0.386%/0.854%`，paired bootstrap mean-difference interval 为 `[2.53,4.78] ms`；吞吐从 `1.424M` 降至 `1.370M tokens/s`（约 `-3.78%`），peak allocated 从 `2036` 增至 `2281 MiB`（+245 MiB）。130M CV 为 `0.575%/1.018%`，paired interval `[0.31,6.95] ms`；吞吐从 `606.5K` 降至 `598.1K tokens/s`（约 `-1.38%`），peak 从 `3827` 增至 `4250 MiB`（+423 MiB）。350M CV 为 `0.823%/0.937%`，paired interval `[26.90,42.02] ms`；吞吐从 `219.5K` 降至 `207.2K tokens/s`（约 `-5.59%`），peak 从 `9627` 增至 `11023 MiB`（+1396 MiB）。三个规模的每组配对方向均为负，分类为 **negative**；其中 130M 差值波动较大，但没有 GreedyLore 加速样本。
+
+与 CM067 的 physical batch128/GA1 相比，GA4 的 60M dense 几乎不变（`92.043→92.050 ms`），130M dense 变慢约 `8.3%`（`199.543→216.103 ms`）；60M/130M peak 显存则显著降低，并使 350M global batch512 可运行。由于 CM067 使用 GPU `2–5`，CM071 使用 GPU `2,3,6,7`，两次绝对时间比较同时包含卡组/系统负载差异，不能作为纯 GA 因果估计。尽管如此，改成论文的 micro-batch/GA 口径没有产生数量级的 step-time 增长，因此不能解释本地结果与论文 Table V 接近十倍的绝对时间差异。
+
+短程 val loss 只用于运行健康检查，不能支持最终收敛质量结论。原始产物：`artifacts/compressed_muon/CM071-m002-paper-microbatch-ga4-bf16-scale-timing-ws4-s42/`。
