@@ -772,4 +772,31 @@ CM073 bucket80 的三个 DDP bucket 中有两个同时包含 GreedyLore matrix �
 
 将 embedding/lm_head 也做 GreedyLore 通信压缩在工程上可行，并不要求把它们改用 Muon：应把“optimizer role”和“communication compression role”解耦，保留它们的 AdamW param group，只让 hook 为这两个二维梯度建立 basis/error 并写回重建后的全局平均梯度。两者形状约为 `50304×768`，canonical orientation 为 `768×50304`；rank32 时每个 ordinary factor 约 `3.22 MB`，两个合计约 `6.44 MB`，而当前每步 dense payload 合计 `154.53 MB`。连同每200步一次的 dense refresh 粗略摊销，embedding/head 的平均通信量理论上仍可下降约95%，并可使当前 ordinary 总 payload 从约159 MB降到约11 MB量级。
 
-但该方向风险高于分桶：每个参数新增一个全尺寸 error buffer，两个合计约 `147 MiB`（MiB口径），并增加 basis/factor/临时 corrected-gradient；现有 `torch.linalg.svd(..., full_matrices=False)` refresh 还会对两个极宽的 `768×50304` FP32矩阵求SVD并产生很大的 `Vh` 临时量，可能显著放大当前约1.52秒的 refresh。更重要的是 embedding/head 直接决定词表示与 logits，rank32 重建误差会进入 AdamW；当前只压缩 transformer matrix 的 rank32 配方已经有明显质量退化，不能假设扩大压缩范围仍保持质量。若推进，应先新增独立的 `compress_embedding`/`compress_lm_head` 开关并分别消融，同时为宽矩阵把 full SVD 改成只求左子空间的 Gram-eigh 或受控 randomized SVD；通过短程稳定性、refresh显存/耗时和 profiler-off收益门禁后，再进行完整质量训练。
+但该方向风险高于分桶：每个参数新增一个全尺寸 error buffer，两个合计约 `147 MiB`（MiB口径），并增加 basis/factor/临时 corrected-gradient；现有 `torch.linalg.svd(..., full_matrices=False)` refresh 还会对两个极宽的 `768×50304` FP32矩阵求SVD并产生很大的 `Vh` 临时量，可能显著放大当前约1.52秒的 refresh。更重要的是 embedding/head 直接决定词表示与 logits，rank32 重建误差会进入 AdamW；当前只压缩 transformer matrix 的 rank32 配方已经有明显质量退化，不能假设扩大压缩范围仍保持质量。实际推进时按后续决策只提供同时控制两者的 combined 开关，并为宽矩阵把 full SVD 改成只求左子空间的 Gram-eigh；CM074/CM075 的速度与质量结果见下文。
+
+## CM074：M002 embedding+lm-head 同时压缩 timing（2026-09-14）
+
+实现单一 `greedy_lore_compress_embedding_lm_head` 开关，将 `transformer.wte.weight` 和 `lm_head.weight` 同时加入 GreedyLore 通信压缩集合，但保留两者原有 AdamW optimizer param groups。为避免宽矩阵 refresh 生成巨大 `Vh`，canonical columns 大于 rows 四倍时改用 FP32 left-Gram `eigh`；其他矩阵仍使用原 SVD。
+
+测速复用 CM072 的 GPT-130M BF16/GA1、bucket80、rank32、interval200、seed42 口径，在 GPU 4–7 完成3组 rotated dense/both pairing；每 cell 为20 warmup + 800 measured updates，6/6 cells exit `0`。
+
+| repeat | dense step | M002 both step | both−dense |
+|---|---:|---:|---:|
+| r1 | 200.25 ms | 203.63 ms | +3.38 ms (+1.69%) |
+| r2 | 195.48 ms | 201.94 ms | +6.46 ms (+3.30%) |
+| r3 | 196.84 ms | 202.09 ms | +5.25 ms (+2.67%) |
+| **mean** | **197.523 ms** | **202.553 ms** | **+5.030 ms (+2.55%)** |
+
+M002 both 的 CV 为 `0.462%`，dense CV 为 `1.244%`，paired mean-difference interval 为 `[+3.38,+6.46] ms`。吞吐为 dense/both `663.6K/647.1K tokens/s`，peak allocated 为 `11207/11782 MiB`。因此 CM074 为明确 **negative**：理论 ordinary payload 虽从约159 MB降至约11 MB，但同期端到端仍比 dense 慢 `2.55%`。从代码计算量看，两个宽矩阵新增的 full-basis score 以及 factor/error/reconstruction GEMM 是首要怀疑对象；CM074 没有 profiler trace，因此这只是待 targeted profile 验证的解释。
+
+原始产物：`artifacts/compressed_muon/CM074-m002-greedylore-both-gpt130m-bf16-timing-ws4-s42/`。
+
+## CM075：M002 embedding+lm-head 同时压缩 GPT-60M 完整训练（2026-09-14）
+
+在 GPU 2–5 完成 BF16 GPT-60M paper-aligned 10,000-step 训练：FineWeb10B、seq256、global/device batch512/128、bucket160、rank32、interval200、step1000后压缩、seed1234。实验 exit `0`，最终 val loss `4.2622`、ppl `70.97`、step `90.27 ms`、peak allocated `6318 MiB`，W&B run 为 `ueijo55s`。
+
+历史同配方、同 GPU 组合的 CM070a BF16 dense 与 CM070b block-only M002 分别为 loss `4.1079/4.2119`、ppl `60.82/67.48`；both 相对它们的 perplexity 分别高 `16.68%/5.16%`。step1000开始压缩后，val loss 在 step1500 短暂升至 `5.1938`，随后重新下降，最终没有发散，但质量比 block-only 进一步退化。CM075 的绝对 step 比历史 dense/block-only 快约 `2.99%/4.80%`，但这是跨日期、跨代码版本比较，而且与 CM074 同期 paired timing 的负结果相反，不能据此声称加速。
+
+因此本方向在 rank32 下分类为 **quality-negative 且无同期 wall-clock 收益**，不应原样扩展到130M完整训练。若继续研究，应先 profile 两个宽矩阵的 score与重建计算，并提高 embedding/head rank或减少其压缩频率后做短质量筛选。
+
+原始产物：`artifacts/compressed_muon/CM075-m002-greedylore-both-gpt60m-bf16-ddp-ws4-s1234/`。

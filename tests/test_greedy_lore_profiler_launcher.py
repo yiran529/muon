@@ -56,6 +56,7 @@ def test_print_plan_rotates_greedylore_modes_and_parameterizes_resources(tmp_pat
         "rank": 2,
         "update_interval": 4,
         "dense_aux_communication_dtype": "bucket",
+        "compress_embedding_lm_head": False,
         "start_compress_step": 5,
         "refresh_profile_step": 5,
         "compressed_profile_step": 6,

@@ -30,10 +30,10 @@
 - Consumes: `train.build_muon_param_groups(model, hp)` and stable model parameter names.
 - Produces: `GreedyLoreHyperparameters.greedy_lore_compress_embedding_lm_head: bool` and an all-three-groups compression-role set when enabled.
 
-- [ ] Add a failing entry-point test that enables the switch and expects block, `transformer.wte.weight`, and `lm_head.weight` specs to have role `matrix`, while asserting optimizer groups 1 and 2 still use AdamW.
-- [ ] Run the focused test and confirm it fails because the hyperparameter/switch behavior is absent.
-- [ ] Add the dataclass field, CLI argument, logging, and role-set union; keep the default false.
-- [ ] Run the focused test and existing train-greedylore tests.
+- [x] Add a failing entry-point test that enables the switch and expects block, `transformer.wte.weight`, and `lm_head.weight` specs to have role `matrix`, while asserting optimizer groups 1 and 2 still use AdamW.
+- [x] Run the focused test and confirm it fails because the hyperparameter/switch behavior is absent.
+- [x] Add the dataclass field, CLI argument, logging, and role-set union; keep the default false.
+- [x] Run the focused test and existing train-greedylore tests.
 
 ### Task 2: Wide-matrix refresh without full Vh
 
@@ -45,10 +45,10 @@
 - Consumes: `refresh_basis(global_corrected: Tensor, rank: int)`.
 - Produces: the same `(basis, projector, support)` contract, using FP32 `eigh(X @ X.T)` for sufficiently wide canonical matrices and the existing SVD path otherwise.
 
-- [ ] Add a failing wide-matrix test that monkeypatches SVD to reject the wide case and verifies an orthonormal, deterministically signed left basis and initial rank support.
-- [ ] Run the focused test and confirm it fails through the current SVD path.
-- [ ] Implement the minimal aspect-ratio dispatch and left-Gram eigendecomposition, sorting eigenvectors by descending eigenvalue and reusing sign canonicalization.
-- [ ] Run tensor-level and DDP-hook CPU tests.
+- [x] Add a failing wide-matrix test that monkeypatches SVD to reject the wide case and verifies an orthonormal, deterministically signed left basis and initial rank support.
+- [x] Run the focused test and confirm it fails through the current SVD path.
+- [x] Implement the minimal aspect-ratio dispatch and left-Gram eigendecomposition, sorting eigenvectors by descending eigenvalue and reusing sign canonicalization.
+- [x] Run tensor-level and DDP-hook CPU tests.
 
 ### Task 3: CM074 timing and CM075 full-training controller
 
@@ -63,10 +63,10 @@
 - Consumes: `benchmark/compressed_muon/run_greedy_lore_profiler.sh`, the CM070b GPT-60M BF16 paper-aligned recipe, and the new CLI switch.
 - Produces: CM074 profiler-off GPT-130M dense/both timing artifacts and CM075 GPT-60M BF16 10,000-step GreedyLore-both training artifacts.
 
-- [ ] Extend the generic GreedyLore launcher so M002 cells can forward the combined switch; do not apply it to dense cells.
-- [ ] Create CM075 by copying the CM052b paper-aligned recipe, adding BF16 model storage, the combined switch, and CM075 W&B identity.
-- [ ] Create a controller that waits for four GPUs with at least 18 GiB free, runs CM074 as three rotated dense/both pairs with 20 warmup plus 800 measured updates at GPT-130M/bucket80/rank32/interval200/seed42, then runs CM075 for 10,000 updates at GPT-60M/bucket160/seed1234.
-- [ ] Validate shell syntax and inspect both printed plans/config parsing; do not add script unit tests.
-- [ ] Run focused Python tests, then a two-rank NCCL smoke if two free GPUs are available without disturbing other jobs.
-- [ ] Register CM074/CM075 as planned, commit code/config/controller/docs, launch the controller in tmux, and let the script own all waiting and sequencing.
-- [ ] After completion, summarize timing/training artifacts and append evidence-backed results and worklog entries.
+- [x] Extend the generic GreedyLore launcher so M002 cells can forward the combined switch; do not apply it to dense cells.
+- [x] Create CM075 by copying the CM052b paper-aligned recipe, adding BF16 model storage, the combined switch, and CM075 W&B identity.
+- [x] Create a controller that waits for four GPUs with at least 18 GiB free, runs CM074 as three rotated dense/both pairs with 20 warmup plus 800 measured updates at GPT-130M/bucket80/rank32/interval200/seed42, then runs CM075 for 10,000 updates at GPT-60M/bucket160/seed1234.
+- [x] Validate shell syntax and inspect both printed plans/config parsing; do not add script unit tests.
+- [x] Run focused Python tests, then a two-rank NCCL smoke if two free GPUs are available without disturbing other jobs.
+- [x] Register CM074/CM075 as planned, commit code/config/controller/docs, launch the controller in tmux, and let the script own all waiting and sequencing.
+- [x] After completion, summarize timing/training artifacts and append evidence-backed results and worklog entries.
