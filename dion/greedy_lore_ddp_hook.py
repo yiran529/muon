@@ -72,7 +72,10 @@ class BucketContext:
     entry_stream: torch.cuda.Stream | None
     bucket_ready_event: torch.cuda.Event | None
     previous_tail: torch.futures.Future
+    previous_collective_tail: torch.futures.Future
+    collective_completion_future: torch.futures.Future
     completion_future: torch.futures.Future
+    prepared: "PreparedCompressedBucket | None" = None
     retained: list[Any] = field(default_factory=list)
 
 
@@ -89,6 +92,41 @@ class CompressedMatrixWork:
     local_factor: Tensor | None = None
 
 
+@dataclass
+class PreparedCompressedBucket:
+    score_plus_aux: Tensor
+    matrix_work: list[CompressedMatrixWork]
+    dense_ranges: list[tuple[Tensor, int, int]]
+    prepare_done: torch.cuda.Event | None
+
+
+def _record_prepared_tensors_on_stream(
+    prepared: PreparedCompressedBucket,
+    stream: torch.cuda.Stream,
+) -> None:
+    """Keep preparation-stream allocations live on their consumer stream."""
+
+    prepared.score_plus_aux.record_stream(stream)
+    for work in prepared.matrix_work:
+        work.corrected.record_stream(stream)
+        work.signed_lambda.record_stream(stream)
+
+
+def _record_reconstruction_tensors_on_stream(
+    context: BucketContext,
+    factor_buffer: Tensor,
+    matrix_work: list[CompressedMatrixWork],
+    stream: torch.cuda.Stream,
+) -> None:
+    """Keep execution-stream allocations live through reconstruction."""
+
+    context.buffer.record_stream(stream)
+    factor_buffer.record_stream(stream)
+    for work in matrix_work:
+        assert work.projector is not None
+        work.projector.record_stream(stream)
+
+
 def _future_devices(device: torch.device) -> list[torch.device]:
     return [device] if device.type == "cuda" else []
 
@@ -97,6 +135,19 @@ def _completed_future(device: torch.device) -> torch.futures.Future:
     future = torch.futures.Future(devices=_future_devices(device))
     future.set_result(None)
     return future
+
+
+def _join_completion_futures(
+    previous: torch.futures.Future,
+    current: torch.futures.Future,
+) -> torch.futures.Future:
+    """Complete after both inputs and propagate either input exception."""
+
+    def finish(completed: torch.futures.Future) -> None:
+        for future in completed.value():
+            future.value()
+
+    return torch.futures.collect_all([previous, current]).then(finish)
 
 
 def _profile_range(name: str, **metadata: Any):
@@ -301,6 +352,7 @@ class GreedyLoreDDPState:
 
         device = self.parameter_specs[0].parameter.device
         self.tail_future = _completed_future(device)
+        self.collective_tail = _completed_future(device)
         self.committed_step = 0
         self._active_step: int | None = None
         self._finished_step = False
@@ -309,6 +361,8 @@ class GreedyLoreDDPState:
         self._next_context_id = 0
         self._context_lock = threading.Lock()
         self._execution_streams: dict[torch.device, torch.cuda.Stream] = {}
+        self._preparation_streams: dict[torch.device, torch.cuda.Stream] = {}
+        self._reconstruction_streams: dict[torch.device, torch.cuda.Stream] = {}
         self._validated_checkpoint_committed_step: int | None = None
 
     def _ordered_parameter_table(self) -> list[dict[str, Any]]:
@@ -450,6 +504,28 @@ class GreedyLoreDDPState:
             self._execution_streams[device] = stream
         return stream
 
+    def preparation_stream(self, device: torch.device) -> torch.cuda.Stream:
+        if device.type != "cuda":
+            raise ValueError(
+                "GreedyLore preparation streams are only defined for CUDA devices"
+            )
+        stream = self._preparation_streams.get(device)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._preparation_streams[device] = stream
+        return stream
+
+    def reconstruction_stream(self, device: torch.device) -> torch.cuda.Stream:
+        if device.type != "cuda":
+            raise ValueError(
+                "GreedyLore reconstruction streams are only defined for CUDA devices"
+            )
+        stream = self._reconstruction_streams.get(device)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._reconstruction_streams[device] = stream
+        return stream
+
     def begin_step(self) -> int:
         if self._active_step is not None:
             raise GreedyLoreStateError(
@@ -523,7 +599,22 @@ class GreedyLoreDDPState:
             bucket_ready_event.record(entry_stream)
 
         previous_tail = self.tail_future
+        previous_collective_tail = self.collective_tail
         completion_future = torch.futures.Future(devices=_future_devices(buffer.device))
+        is_pipelined_compressed_bucket = (
+            compressed_phase(self._active_step, self.config.start_compress_step)
+            is not None
+            and not is_refresh_step(self._active_step, self.config)
+            and any(
+                self._parameter_states.get(id(parameter)) is not None
+                for parameter in parameters
+            )
+        )
+        collective_completion_future = (
+            torch.futures.Future(devices=_future_devices(buffer.device))
+            if is_pipelined_compressed_bucket
+            else completion_future
+        )
         context_id = self._next_context_id
         self._next_context_id += 1
         context = BucketContext(
@@ -540,11 +631,17 @@ class GreedyLoreDDPState:
             entry_stream=entry_stream,
             bucket_ready_event=bucket_ready_event,
             previous_tail=previous_tail,
+            previous_collective_tail=previous_collective_tail,
+            collective_completion_future=collective_completion_future,
             completion_future=completion_future,
         )
         with self._context_lock:
             self._active_contexts[context_id] = context
-            self.tail_future = completion_future
+            self.tail_future = _join_completion_futures(
+                previous_tail,
+                completion_future,
+            )
+            self.collective_tail = collective_completion_future
 
         def release(_future: torch.futures.Future) -> None:
             with self._context_lock:
@@ -813,6 +910,56 @@ def enqueue_bucket_chain(
             destination.set_exception(exc)
 
     context.previous_tail.add_done_callback(after_previous)
+    return destination
+
+
+def enqueue_collective_bucket_chain(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+    launch: Callable[[BucketContext], torch.futures.Future],
+) -> torch.futures.Future:
+    """Launch one bucket after prior collectives, independently of reconstruction."""
+
+    destination = context.completion_future
+
+    def export_completion(value: Any) -> Tensor:
+        if context.buffer.device.type == "cuda":
+            device = context.buffer.device
+            callback_stream = torch.cuda.current_stream(device)
+            execution_stream = state.execution_stream(device)
+            callback_stream.wait_stream(execution_stream)
+        return _future_tensor(value)
+
+    def after_previous(previous: torch.futures.Future) -> None:
+        try:
+            previous.value()
+            if context.buffer.device.type == "cuda":
+                execution_stream = state.execution_stream(context.buffer.device)
+                ready_event = (
+                    context.prepared.prepare_done
+                    if context.prepared is not None
+                    else context.bucket_ready_event
+                )
+                assert ready_event is not None
+                execution_stream.wait_event(ready_event)
+                context.buffer.record_stream(execution_stream)
+                if context.prepared is not None:
+                    _record_prepared_tensors_on_stream(
+                        context.prepared,
+                        execution_stream,
+                    )
+                with torch.cuda.stream(execution_stream):
+                    launched = launch(context)
+            else:
+                launched = launch(context)
+            bridge_future(launched, destination, export_completion)
+        except BaseException as exc:
+            if not destination.done():
+                destination.set_exception(exc)
+            if not context.collective_completion_future.done():
+                context.collective_completion_future.set_exception(exc)
+
+    context.previous_collective_tail.add_done_callback(after_previous)
     return destination
 
 
@@ -1149,6 +1296,45 @@ def _prepare_score_plus_aux_buffer(
         return score_plus_aux, matrix_work, dense_ranges
 
 
+def _prepare_compressed_bucket(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+) -> None:
+    """Queue ordinary score preparation independently of prior buckets."""
+
+    if context.prepared is not None:
+        raise GreedyLoreStateError("compressed bucket was prepared more than once")
+    if context.buffer.device.type != "cuda":
+        score_plus_aux, matrix_work, dense_ranges = _prepare_score_plus_aux_buffer(
+            state,
+            context,
+        )
+        context.prepared = PreparedCompressedBucket(
+            score_plus_aux=score_plus_aux,
+            matrix_work=matrix_work,
+            dense_ranges=dense_ranges,
+            prepare_done=None,
+        )
+        return
+
+    preparation_stream = state.preparation_stream(context.buffer.device)
+    assert context.bucket_ready_event is not None
+    preparation_stream.wait_event(context.bucket_ready_event)
+    with torch.cuda.stream(preparation_stream):
+        score_plus_aux, matrix_work, dense_ranges = _prepare_score_plus_aux_buffer(
+            state,
+            context,
+        )
+        prepare_done = torch.cuda.Event()
+        prepare_done.record(preparation_stream)
+    context.prepared = PreparedCompressedBucket(
+        score_plus_aux=score_plus_aux,
+        matrix_work=matrix_work,
+        dense_ranges=dense_ranges,
+        prepare_done=prepare_done,
+    )
+
+
 def _select_projector_profiled(
     state: GreedyLoreDDPState,
     work: CompressedMatrixWork,
@@ -1230,6 +1416,37 @@ def _reconstruct_compressed_matrices(
     return matrix_work[0].gradient.new_empty(0)
 
 
+def _launch_compressed_reconstruction(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+    factor_buffer: Tensor,
+    matrix_work: list[CompressedMatrixWork],
+) -> torch.futures.Future:
+    """Reconstruct independently and export its writes through a CUDA Future."""
+
+    if context.buffer.device.type != "cuda":
+        _reconstruct_compressed_matrices(state, factor_buffer, matrix_work)
+        completed = torch.futures.Future()
+        completed.set_result(context.buffer)
+        return completed
+
+    device = context.buffer.device
+    callback_stream = torch.cuda.current_stream(device)
+    reconstruction_stream = state.reconstruction_stream(device)
+    reconstruction_stream.wait_stream(callback_stream)
+    _record_reconstruction_tensors_on_stream(
+        context,
+        factor_buffer,
+        matrix_work,
+        reconstruction_stream,
+    )
+    completed = torch.futures.Future(devices=_future_devices(device))
+    with torch.cuda.stream(reconstruction_stream):
+        _reconstruct_compressed_matrices(state, factor_buffer, matrix_work)
+        completed.set_result(context.buffer)
+    return completed
+
+
 def _mark_future_complete(future: torch.futures.Future) -> torch.futures.Future:
     def mark(_completed: torch.futures.Future) -> None:
         with _profile_range("greedylore_hook/future_complete"):
@@ -1246,20 +1463,25 @@ def _launch_compressed_bucket(
     if not _matrix_entries(context):
         return _launch_dense_bucket(state, context)
 
-    score_plus_aux, matrix_work, dense_ranges = _prepare_score_plus_aux_buffer(
-        state,
-        context,
-    )
+    if context.prepared is None:
+        _prepare_compressed_bucket(state, context)
+    assert context.prepared is not None
+    score_plus_aux = context.prepared.score_plus_aux
+    matrix_work = context.prepared.matrix_work
+    dense_ranges = context.prepared.dense_ranges
     score_source = _all_reduce_future(
         state,
         score_plus_aux,
         "greedylore_hook/score_plus_aux_allreduce",
     )
     completion = torch.futures.Future(devices=_future_devices(context.buffer.device))
+    collective_completion = context.collective_completion_future
 
     def fail(exc: BaseException) -> None:
         if not completion.done():
             completion.set_exception(exc)
+        if not collective_completion.done():
+            collective_completion.set_exception(exc)
 
     def after_score(completed: torch.futures.Future) -> None:
         try:
@@ -1279,15 +1501,31 @@ def _launch_compressed_bucket(
                 "greedylore_hook/factor_allreduce",
             )
 
-            def after_factor(factor_completed: torch.futures.Future) -> Tensor:
-                reduced_factor = _future_tensor(factor_completed.value())
-                _reconstruct_compressed_matrices(state, reduced_factor, matrix_work)
-                return context.buffer
+            def after_factor(factor_completed: torch.futures.Future) -> None:
+                try:
+                    reduced_factor = _future_tensor(factor_completed.value())
+                except BaseException as exc:
+                    fail(exc)
+                    return
+                try:
+                    reconstruction = _launch_compressed_reconstruction(
+                        state,
+                        context,
+                        reduced_factor,
+                        matrix_work,
+                    )
+                    if not collective_completion.done():
+                        collective_completion.set_result(None)
+                    bridge_future(reconstruction, completion, lambda value: value)
+                except BaseException as exc:
+                    if not collective_completion.done():
+                        collective_completion.set_result(None)
+                    if not completion.done():
+                        completion.set_exception(exc)
 
-            factor_completion = factor_source.then(
-                _on_bucket_execution_stream_result(state, context, after_factor)
+            factor_source.add_done_callback(
+                _on_bucket_execution_stream(state, context, after_factor)
             )
-            bridge_future(factor_completion, completion, lambda value: value)
         except BaseException as exc:
             fail(exc)
 
@@ -1325,8 +1563,20 @@ def greedy_lore_ddp_hook(
             context,
             lambda current: _launch_refresh_bucket(state, current),
         ))
-    return _mark_future_complete(enqueue_bucket_chain(
+    if _matrix_entries(context):
+        try:
+            _prepare_compressed_bucket(state, context)
+        except BaseException as exc:
+            context.collective_completion_future.set_exception(exc)
+            context.completion_future.set_exception(exc)
+            return _mark_future_complete(context.completion_future)
+        return _mark_future_complete(enqueue_collective_bucket_chain(
+            state,
+            context,
+            lambda current: _launch_compressed_bucket(state, current),
+        ))
+    return _mark_future_complete(enqueue_collective_bucket_chain(
         state,
         context,
-        lambda current: _launch_compressed_bucket(state, current),
+        lambda current: _launch_dense_bucket(state, current),
     ))

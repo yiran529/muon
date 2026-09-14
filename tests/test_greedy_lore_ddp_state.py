@@ -201,6 +201,25 @@ def test_next_step_waits_for_tail_even_if_previous_step_is_not_active():
         state.begin_step()
 
 
+def test_finish_step_waits_for_every_bucket_completion_not_only_latest():
+    first = torch.nn.Parameter(torch.zeros(3, 4))
+    second = torch.nn.Parameter(torch.zeros(3, 4))
+    state = _make_state(
+        ((first, "first", "matrix"), (second, "second", "matrix"))
+    )
+    state.begin_step()
+    first_context = state.note_bucket(FakeGradBucket((first,)))
+    second_context = state.note_bucket(FakeGradBucket((second,)))
+
+    second_context.completion_future.set_result(second_context.buffer)
+
+    with pytest.raises(RuntimeError, match="bucket tail is still in flight"):
+        state.finish_step()
+
+    first_context.completion_future.set_result(first_context.buffer)
+    state.finish_step()
+
+
 def test_basis_validation_requires_a_committed_step_boundary():
     matrix = torch.nn.Parameter(torch.zeros(3, 4))
     state = _make_state(((matrix, "matrix", "matrix"),))

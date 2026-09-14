@@ -461,3 +461,27 @@ Controller 于 13:53 完成并 exit `0`，18/18 timing cells exit `0`，350M 在
 GA4 将 60M dense/M002 peak 降至 `2036/2281 MiB`、130M 降至 `3827/4250 MiB`，350M 为 `9627/11023 MiB`。相对 CM067 GA1，60M dense step 几乎不变，130M dense 慢约 `8.3%`；但两次实验卡组不同（CM067 GPU2–5，CM071 GPU2,3,6,7），不把差值解释为纯 GA 效应。核心结论不依赖这项跨实验比较：按论文 micro-batch `32 × GA4` 运行后，本地 step time 仍远低于论文 Table V，batch 口径不足以解释接近十倍的绝对差异，GreedyLore 也仍未快于 dense。
 
 artifact：`artifacts/compressed_muon/CM071-m002-paper-microbatch-ga4-bf16-scale-timing-ws4-s42/`。
+
+## 2026-09-14：ordinary bucket 第一阶段流水化实现
+
+针对 CM069 中 ordinary compressed bucket 的两阶段 collective 暴露问题，实现了不改变数学结果与跨 rank collective 顺序的第一阶段流水线。长期存在的 `GreedyLoreDDPState` 现在分别维护 collective 提交尾部与全部 bucket 完成尾部；每次 hook 调用的 `BucketContext` 则快照本 bucket 的 ready event、独立准备结果、collective completion 和 DDP completion。ordinary bucket 在 ready 后立即于 preparation stream 计算 corrected gradient、score 与 packing，collective 仍严格按 `score(A) → factor(A) → score(B) → factor(B)` 排序，但 A 的 factor collective 完成后即可在 reconstruction stream 重建，同时通信路径开始 B 的 score All-Reduce。warmup、refresh 与 dense fallback 保留原串行路径。
+
+实现同时补齐了跨 stream tensor 生命周期与失败语义：准备、通信、重建之间使用 CUDA event/stream wait，不引入设备级 synchronize；相关 tensor 通过 `record_stream` 防止 allocator 提前复用；collective 失败会毒化后续 collective 链并完成对应 DDP Future，而重建启动或异步重建失败只令该 bucket 的 DDP Future 失败，不阻断后续 rank 一致的 collective 提交。step 结束等待的是所有 bucket completion 的聚合 Future，而不是仅等待最后一个 bucket。
+
+正确性回归覆盖 eager preparation、A 重建与 B score overlap、collective/reconstruction 失败传播、stream lifetime、collective 签名及原有 checkpoint/distributed 路径。CPU/Gloo 综合测试为 `148 passed`，两卡 NCCL smoke 为 `4 passed`；代码审查发现的同步重建异常导致 collective 链中断与缺少 `record_stream` 两项问题均已修复。按本阶段要求未运行正式 timing 或 profiler，因此当前只确认调度与正确性，不对 step time、暴露通信或峰值显存作性能 claim；正式对照实验留待后续。
+
+### CM072 第一阶段流水化 timing
+
+随后以 CM067 的 GPT-130M BF16/GA1 口径直接运行 profiler-off timing：4-rank DDP、GPU 2,3,6,7、seq256、global/device batch512/128、bucket80 MiB、rank32、interval200、seed42；dense/M002 做 3 组 rotated pairing，每 cell 为 20 warmup + 800 measured updates。6/6 cells exit0。dense 为 `197.20/203.37/201.71 ms`，mean `200.76 ms`、CV `1.59%`；流水化 M002 为 `203.18/203.38/203.40 ms`，mean `203.32 ms`、CV `0.06%`。逐组 M002-dense 差为 `+5.98/+0.01/+1.69 ms`，paired mean 为 `+2.56 ms`（`+1.29%`），bootstrap mean-difference interval `[+0.01,+5.98] ms`。peak allocated 为 dense/M002 `11207/11632 MiB`。
+
+当前 M002 仍未快于同轮 dense。与旧 CM067 同配置的历史值相比，M002 绝对均值从 `204.20` 降至 `203.32 ms`（约 `0.88 ms`, `0.43%`），dense gap 从 `4.66` 缩至 `2.56 ms`（约 `2.10 ms`）；但 CM072 dense 自身波动明显高于 CM067，且 GPU 组合不同，因此这里只记为“小幅改善信号”，不能把历史差分全部归因于流水化。若要判断 exposed communication 是否真正下降，需要另做 targeted profiler 或同环境 A/B 旧实现复测。
+
+artifact：`artifacts/compressed_muon/CM072-m002-gpt130m-bf16-ordinary-pipeline-timing-ws4-s42/`。
+
+### CM073 第一阶段流水化 targeted profile
+
+在 CM072 同一 130M BF16/GA1、bucket80 MiB 配置上，以 GPU 2,3,6,7 串行采集 dense/M002 refresh 与 ordinary，共 4 cells、16 traces，全部成功。流水化 M002 ordinary 的 profile window/NCCL union/exposed NCCL 为 `268.732/49.103/47.766 ms`，dense ordinary 为 `194.772/45.731/29.234 ms`；标准 targeted-collective/backward overlap 仍为0。M002 score+dense_aux/factor collective 为 `31.422/9.244 ms`，本地 reconstruction 为 `0.454 ms`。
+
+直接检查四个 rank 的 GPU event 区间后，reconstruction 与任何 BF16 AllReduce 的实际交集均为 `0 ms`；score preparation 与 reconstruction 仅在 rank0/rank2 有 `0.549/0.457 ms` 交集，rank1/rank3 为0。说明实现虽然解除了“下一 bucket collective 必须等待前一 bucket reconstruction”的依赖，但当前 bucket readiness、约2 ms的 score preparation 与亚毫秒 reconstruction 时长没有给下一次 score AllReduce 留出实际重叠窗口。CM073 与 CM069 卡组不同且 collective 时长波动较大，不能用两次 exposed NCCL 的绝对差异归因流水化回退；本轮主要结论是目标 collective overlap 未发生。
+
+artifact：`artifacts/compressed_muon/CM073-m002-gpt130m-bf16-ordinary-pipeline-targeted-profile-ws4-s42/`。

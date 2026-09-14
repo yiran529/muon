@@ -367,6 +367,24 @@ def _compressed_stress_worker(rank, world_size, port, dtype_name):
             event.category == "greedylore_hook/factor_allreduce"
             for event in observer.events
         )
+        compressed_categories = [
+            event.category
+            for event in observer.events
+            if event.category
+            in (
+                "greedylore_hook/score_plus_aux_allreduce",
+                "greedylore_hook/factor_allreduce",
+            )
+        ]
+        assert len(compressed_categories) % 2 == 0
+        assert compressed_categories == [
+            category
+            for _ in range(len(compressed_categories) // 2)
+            for category in (
+                "greedylore_hook/score_plus_aux_allreduce",
+                "greedylore_hook/factor_allreduce",
+            )
+        ]
         assert all(event.dtype == dtype_name for event in observer.events)
         assert all(event.category != "greedylore_hook/seed" for event in observer.events)
     finally:

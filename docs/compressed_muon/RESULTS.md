@@ -727,3 +727,39 @@ GreedyLore ordinary local GPU 在 40/80 MiB 分别为：score `3.020/2.293 ms`�
 与 CM067 的 physical batch128/GA1 相比，GA4 的 60M dense 几乎不变（`92.043→92.050 ms`），130M dense 变慢约 `8.3%`（`199.543→216.103 ms`）；60M/130M peak 显存则显著降低，并使 350M global batch512 可运行。由于 CM067 使用 GPU `2–5`，CM071 使用 GPU `2,3,6,7`，两次绝对时间比较同时包含卡组/系统负载差异，不能作为纯 GA 因果估计。尽管如此，改成论文的 micro-batch/GA 口径没有产生数量级的 step-time 增长，因此不能解释本地结果与论文 Table V 接近十倍的绝对时间差异。
 
 短程 val loss 只用于运行健康检查，不能支持最终收敛质量结论。原始产物：`artifacts/compressed_muon/CM071-m002-paper-microbatch-ga4-bf16-scale-timing-ws4-s42/`。
+
+## CM072：M002 ordinary bucket 第一阶段流水化 timing（2026-09-14）
+
+在 ordinary compressed hook 中拆分 collective ordering tail 与 DDP completion tail：bucket ready 后可提前在 preparation stream 计算 corrected gradient、score 和 packing；collective 仍严格按 `score(A)→factor(A)→score(B)→factor(B)` 排序，但 A 的 factor 完成后，A 的 reconstruction 可与 B 的 score All-Reduce 并行。warmup、refresh 和 dense fallback 保持原串行路径。
+
+测速严格复用 CM067 的 GPT-130M BF16/GA1 口径：4-rank DDP、seq256、global/device batch512/128、bucket80 MiB、rank32、interval200、local-SVD、seed42；每 cell 为 20 warmup + 800 profiler-off measured updates，共四个完整 interval。使用 GPU `2,3,6,7`，完成 3 组 rotated dense/M002 pairing，6/6 cells exit `0`。
+
+| repeat | dense step | 流水化 M002 step | M002−dense | dense / M002 val loss |
+|---|---:|---:|---:|---:|
+| r1 | 197.20 ms | 203.18 ms | +5.98 ms (+3.03%) | 4.3641 / 4.7894 |
+| r2 | 203.37 ms | 203.38 ms | +0.01 ms (+0.00%) | 4.3641 / 4.7894 |
+| r3 | 201.71 ms | 203.40 ms | +1.69 ms (+0.84%) | 4.3641 / 4.7894 |
+| **mean** | **200.760 ms** | **203.320 ms** | **+2.560 ms (+1.29%)** | **4.3641 / 4.7894** |
+
+M002 的 CV 为 `0.060%`，三次稳定在 `203.18–203.40 ms`；dense CV 为 `1.590%`，导致 paired bootstrap mean-difference interval 较宽，为 `[+0.01,+5.98] ms`。吞吐为 dense/M002 `653.0K/644.7K tokens/s`，peak allocated 为 `11207/11632 MiB`。因此本轮仍分类为 **negative**：流水化 M002 没有超过同轮 dense，平均慢 `1.29%`。
+
+与旧 CM067 同配置但不同 GPU 组合的历史结果相比，M002 绝对均值从 `204.203` 降至 `203.320 ms`（`-0.883 ms`, `-0.43%`），M002−dense gap 从 `+4.660` 缩至 `+2.560 ms`。这可记为小幅改善信号，但 CM067 使用 GPU `2,3,4,5`，CM072 使用 `2,3,6,7`，且 CM072 dense 波动明显较高；因此跨实验差值不能作为流水化的严格因果收益。要确认暴露通信是否下降，需要在同环境保留旧实现作 A/B，或补 targeted profiler。
+
+原始产物：`artifacts/compressed_muon/CM072-m002-gpt130m-bf16-ordinary-pipeline-timing-ws4-s42/`。
+
+## CM073：M002 ordinary bucket 流水化 targeted profile（2026-09-14）
+
+为检查 CM072 的调度改动是否真正形成 GPU overlap，在同一 GPT-130M BF16/GA1、bucket80 MiB、rank32、interval200 配置上，以 GPU `2,3,6,7` 串行采集 dense/M002 的 refresh 与 ordinary targeted step。4/4 cells 均成功，共生成 16 份 rank trace；Kineto profile 只用于时间线诊断，不替代 CM072 profiler-off timing。
+
+| 模式 | profile window | NCCL union | exposed NCCL | exposed gradient tail |
+|---|---:|---:|---:|---:|
+| dense ordinary | 194.772 ms | 45.731 ms | 29.234 ms | 21.648 ms |
+| 流水化 M002 ordinary | 268.732 ms | 49.103 ms | 47.766 ms | 0 ms |
+
+流水化 M002 ordinary 的 score+dense_aux/factor/Muon-result collective 分别为 `31.422/9.244/8.709 ms`；本地 GPU score/Top-r/factor/error/reconstruction 分别为 `2.385/0.766/0.348/0.777/0.454 ms`。标准 parser 的 targeted-collective/backward overlap 仍为 `0`。
+
+进一步直接检查四份 ordinary trace 的 GPU event 区间：每个 rank 的 reconstruction 与任何 BF16 AllReduce kernel 的交集均为 `0 ms`，因此本次没有实际形成预期的 `reconstruct(A) ∥ score-AllReduce(B)`。局部 score preparation 与 reconstruction 只在 rank0/rank2 分别重叠约 `0.549/0.457 ms`，rank1/rank3 为 `0`，不足以构成稳定的 rank-wide critical-path 收益。时间线上主要原因是 reconstruction 仅约亚毫秒：有的后续 bucket 尚未 ready；即使已开始准备下一 bucket，score preparation 结束并提交 AllReduce 时，前一 bucket reconstruction 已完成。
+
+CM073 的 M002 exposed NCCL 比 CM069 旧实现的 bucket80 profile `35.043 ms` 更高，但两次使用不同 GPU 组合（CM069 为 `2,3,4,5`），且 score/factor collective 本身也从 `21.609/6.934` 波动到 `31.422/9.244 ms`；这项跨实验差异不能解释成流水化导致通信回退。可确定的结论是：**第一阶段放宽了依赖，但在当前 bucket 几何下没有把 reconstruction 与下一 bucket collective 实际叠起来**，与 CM072 只有约 `0.43%` 历史绝对改善信号相符。
+
+原始产物：`artifacts/compressed_muon/CM073-m002-gpt130m-bf16-ordinary-pipeline-targeted-profile-ws4-s42/`。
