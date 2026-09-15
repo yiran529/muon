@@ -8,6 +8,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import unquote
 
 
 _CATEGORY_NAMES = {
@@ -56,6 +57,8 @@ _CATEGORY_NAMES = {
     "greedylore_hook/error": "greedylore_hook_error",
     "greedylore_hook/reconstruction": "greedylore_hook_reconstruction",
     "greedylore_hook/future_complete": "greedylore_hook_future_complete",
+    "greedylore_hook/collective_unblocked": "greedylore_hook_collective_unblocked",
+    "greedylore_hook/collective_launch": "greedylore_hook_collective_launch",
 }
 
 _OPERATION_BY_CATEGORY = {
@@ -201,10 +204,42 @@ def _numeric_arg(event: dict[str, Any], key: str) -> int:
                 continue
             if key in decoded:
                 return int(decoded[key])
-    match = re.search(rf"(?:^|[ /]){re.escape(key)}=(\d+)(?:$| )", str(event.get("name", "")))
+    match = re.search(rf"(?:^|[ /]){re.escape(key)}=(-?\d+)(?:$| )", str(event.get("name", "")))
     if match:
         return int(match.group(1))
     return 0
+
+
+def _string_arg(event: dict[str, Any], key: str) -> str | None:
+    args = _args(event)
+    if key in args:
+        return str(args[key])
+    for value in args.values():
+        candidates = value if isinstance(value, list) else [value]
+        for candidate in candidates:
+            if not isinstance(candidate, str) or not candidate.startswith("{"):
+                continue
+            try:
+                decoded = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if key in decoded:
+                return str(decoded[key])
+    match = re.search(
+        rf"(?:^|[ /]){re.escape(key)}=([^ ]+)(?:$| )",
+        str(event.get("name", "")),
+    )
+    return unquote(match.group(1)) if match else None
+
+
+def _optional_int_arg(event: dict[str, Any], key: str) -> int | None:
+    value = _string_arg(event, key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _is_nccl(event: dict[str, Any]) -> bool:
@@ -219,6 +254,11 @@ def _is_nccl(event: dict[str, Any]) -> bool:
 def _is_cpu_annotation(event: dict[str, Any]) -> bool:
     """Exclude Kineto's GPU mirror of a record_function annotation."""
     return str(event.get("cat", "")).lower() != "gpu_user_annotation"
+
+
+def _has_range_name(event: dict[str, Any], name: str) -> bool:
+    actual = str(event.get("name", ""))
+    return actual == name or actual.startswith(name + " ")
 
 
 def attribute_trace(trace: Any) -> dict[str, Any]:
@@ -582,7 +622,13 @@ def summarize_training_trace(trace: Any) -> dict[str, Any]:
         float(event.get("ts", 0.0)) + _duration(event)
         for event in events
         if event.get("ph") == "X"
-        and event.get("name") == "arc_hook/future_complete"
+        and any(
+            _has_range_name(event, name)
+            for name in (
+                "arc_hook/future_complete",
+                "greedylore_hook/future_complete",
+            )
+        )
         and _is_cpu_annotation(event)
     ]
     backward_start = min(
@@ -602,6 +648,92 @@ def summarize_training_trace(trace: Any) -> dict[str, Any]:
         (max(future_completion_ends) - backward_end) / 1000.0
         if future_completion_ends and backward_end is not None
         else None
+    )
+    greedylore_markers = [
+        event for event in events
+        if event.get("ph") == "X"
+        and any(
+            _has_range_name(event, name)
+            for name in (
+                "greedylore_hook/collective_unblocked",
+                "greedylore_hook/collective_launch",
+                "greedylore_hook/future_complete",
+            )
+        )
+        and _is_cpu_annotation(event)
+    ]
+    bucket_timelines = []
+    for bucket_event in greedylore_bucket_events:
+        context_id = _optional_int_arg(bucket_event, "context_id")
+        if context_id is None:
+            continue
+        ready_start = float(bucket_event.get("ts", 0.0))
+        matching = [
+            event for event in greedylore_markers
+            if _optional_int_arg(event, "context_id") == context_id
+        ]
+        unblocked = [
+            event for event in matching
+            if _has_range_name(event, "greedylore_hook/collective_unblocked")
+        ]
+        launches = [
+            event for event in matching
+            if _has_range_name(event, "greedylore_hook/collective_launch")
+        ]
+        completions = [
+            event for event in matching
+            if _has_range_name(event, "greedylore_hook/future_complete")
+        ]
+        completion_end = max(
+            (
+                float(event.get("ts", 0.0)) + _duration(event)
+                for event in completions
+            ),
+            default=None,
+        )
+        bucket_timelines.append({
+            "context_id": context_id,
+            "bucket_index": _optional_int_arg(bucket_event, "bucket_index"),
+            "phase": _string_arg(bucket_event, "phase"),
+            "parameter_names": _string_arg(bucket_event, "parameter_names"),
+            "parameter_roles": _string_arg(bucket_event, "parameter_roles"),
+            "bucket_bytes": _numeric_arg(bucket_event, "bucket_bytes"),
+            "matrix_bytes": _numeric_arg(bucket_event, "matrix_bytes"),
+            "dense_aux_bytes": _numeric_arg(bucket_event, "dense_aux_bytes"),
+            "ready_start_us": ready_start,
+            "ready_from_backward_start_ms": (
+                (ready_start - backward_start) / 1000.0
+                if backward_start is not None else None
+            ),
+            "collective_unblocked_from_ready_ms": (
+                (min(float(event.get("ts", 0.0)) for event in unblocked) - ready_start)
+                / 1000.0
+                if unblocked else None
+            ),
+            "collective_launches": [
+                {
+                    "category": _string_arg(event, "collective_category"),
+                    "operation": _string_arg(event, "operation"),
+                    "message_bytes": _numeric_arg(event, "bytes"),
+                    "from_bucket_ready_ms": (
+                        float(event.get("ts", 0.0)) - ready_start
+                    ) / 1000.0,
+                }
+                for event in sorted(
+                    launches, key=lambda item: float(item.get("ts", 0.0))
+                )
+            ],
+            "future_complete_from_ready_ms": (
+                (completion_end - ready_start) / 1000.0
+                if completion_end is not None else None
+            ),
+            "future_complete_from_backward_end_ms": (
+                (completion_end - backward_end) / 1000.0
+                if completion_end is not None and backward_end is not None else None
+            ),
+        })
+    result["bucket_timelines"] = sorted(
+        bucket_timelines, key=lambda item: item["ready_start_us"]
     )
     return result
 

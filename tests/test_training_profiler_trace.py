@@ -164,6 +164,54 @@ def test_training_summary_reports_greedylore_bucket_payload_totals():
     assert result["cpu_ranges_ms"]["greedylore_hook_bucket_ready"] == pytest.approx(0.002)
 
 
+def test_greedylore_bucket_timeline_reports_queue_launch_and_completion_offsets():
+    trace = {"traceEvents": [
+        {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 2000},
+        {"ph": "X", "name": "train/final_backward", "cat": "cpu_op", "ts": 100, "dur": 1000},
+        {"ph": "X", "name": "greedylore_hook/bucket_ready "
+         "bucket_bytes=128 bucket_index=-1 context_id=0 dense_aux_bytes=128 "
+         "matrix_bytes=0 parameter_names=embedding%20weight "
+         "parameter_roles=dense_aux phase=compressed", "cat": "user_annotation",
+         "ts": 200, "dur": 2},
+        {"ph": "X", "name": "greedylore_hook/collective_unblocked",
+         "cat": "user_annotation", "ts": 210, "dur": 1},
+        {"ph": "X", "name": "greedylore_hook/collective_unblocked "
+         "bucket_index=-1 context_id=0", "cat": "user_annotation",
+         "ts": 260, "dur": 1},
+        {"ph": "X", "name": "greedylore_hook/collective_launch bytes=128 "
+         "bucket_index=-1 collective_category=greedylore_hook%2Fdense context_id=0 "
+         "operation=all_reduce", "cat": "user_annotation", "ts": 300, "dur": 1},
+        {"ph": "X", "name": "greedylore_hook/future_complete "
+         "bucket_index=-1 context_id=0", "cat": "user_annotation",
+         "ts": 1250, "dur": 2},
+    ]}
+
+    result = summarize_training_trace(trace)
+
+    assert result["last_hook_future_completion_from_backward_end_ms"] == pytest.approx(0.152)
+    assert result["bucket_timelines"] == [{
+        "context_id": 0,
+        "bucket_index": -1,
+        "phase": "compressed",
+        "parameter_names": "embedding weight",
+        "parameter_roles": "dense_aux",
+        "bucket_bytes": 128,
+        "matrix_bytes": 0,
+        "dense_aux_bytes": 128,
+        "ready_start_us": 200.0,
+        "ready_from_backward_start_ms": pytest.approx(0.1),
+        "collective_unblocked_from_ready_ms": pytest.approx(0.06),
+        "collective_launches": [{
+            "category": "greedylore_hook/dense",
+            "operation": "all_reduce",
+            "message_bytes": 128,
+            "from_bucket_ready_ms": pytest.approx(0.1),
+        }],
+        "future_complete_from_ready_ms": pytest.approx(1.052),
+        "future_complete_from_backward_end_ms": pytest.approx(0.152),
+    }]
+
+
 def test_training_summary_normalizes_legacy_dense_only_score_payload():
     trace = {"traceEvents": [
         {"ph": "X", "name": "train/profile_window", "cat": "cpu_op", "ts": 0, "dur": 2000},

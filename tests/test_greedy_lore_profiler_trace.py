@@ -230,7 +230,7 @@ def test_hook_emits_bucket_collective_and_local_record_function_ranges(monkeypat
         process_group=None,
         fingerprint="f" * 64,
         parameter_specs=[
-            GreedyLoreDDPParameterSpec(matrix, "matrix", 0, "matrix"),
+            GreedyLoreDDPParameterSpec(matrix, "matrix one", 0, "matrix"),
             GreedyLoreDDPParameterSpec(dense, "dense", 1, "dense_aux"),
         ],
         optimizer_parameters=[matrix, dense],
@@ -266,11 +266,21 @@ def test_hook_emits_bucket_collective_and_local_record_function_ranges(monkeypat
     assert "matrix_bytes=" in bucket_ready[0]
     assert "dense_aux_bytes=" in bucket_ready[0]
     assert "phase=" in bucket_ready[0]
+    assert "parameter_names=matrix%20one%2Cdense" in bucket_ready[0]
     assert "greedylore_hook/score" in entered
     assert "greedylore_hook/topr" in entered
     assert "greedylore_hook/factor" in entered
     assert "greedylore_hook/error" in entered
     assert "greedylore_hook/reconstruction" in entered
+    assert any(
+        name.startswith("greedylore_hook/collective_unblocked ") for name in entered
+    )
+    assert any(
+        name.startswith("greedylore_hook/collective_launch ") for name in entered
+    )
+    assert any(
+        name.startswith("greedylore_hook/future_complete ") for name in entered
+    )
     assert "greedylore_hook/score_plus_aux_allreduce/payload bytes=16" in entered
     assert "greedylore_hook/factor_allreduce/payload bytes=12" in entered
     assert observer.signature() == [

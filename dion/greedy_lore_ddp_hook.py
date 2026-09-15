@@ -5,6 +5,7 @@ import threading
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Literal, Sequence
+from urllib.parse import quote
 
 import torch
 import torch.distributed as dist
@@ -62,6 +63,7 @@ class GreedyLoreParameterState:
 @dataclass
 class BucketContext:
     context_id: int
+    bucket_index: int
     bucket: dist.GradBucket
     buffer: Tensor
     gradients: tuple[Tensor, ...]
@@ -154,8 +156,23 @@ def _profile_range(name: str, **metadata: Any):
     return record_function(name, args=json.dumps(metadata, sort_keys=True))
 
 
+def _profile_marker(name: str, **metadata: Any):
+    suffix = " ".join(
+        f"{key}={quote(str(value), safe='')}"
+        for key, value in sorted(metadata.items())
+    )
+    return _profile_range(f"{name} {suffix}", **metadata)
+
+
 def _tensor_bytes(tensor: Tensor) -> int:
     return int(tensor.numel() * tensor.element_size())
+
+
+def _bucket_profile_identity(context: "BucketContext") -> dict[str, int]:
+    return {
+        "context_id": context.context_id,
+        "bucket_index": context.bucket_index,
+    }
 
 
 @contextmanager
@@ -226,6 +243,7 @@ def _bucket_profile_metadata(state: "GreedyLoreDDPState", context: "BucketContex
         state._specs_by_parameter[id(parameter)] for parameter in context.parameters
     ]
     return {
+        **_bucket_profile_identity(context),
         "bucket_bytes": _tensor_bytes(context.buffer),
         "matrix_bytes": matrix_bytes,
         "dense_aux_bytes": dense_bytes,
@@ -624,6 +642,11 @@ class GreedyLoreDDPState:
         self._next_context_id += 1
         context = BucketContext(
             context_id=context_id,
+            bucket_index=(
+                int(bucket.index())
+                if callable(getattr(bucket, "index", None))
+                else -1
+            ),
             bucket=bucket,
             buffer=buffer,
             gradients=gradients,
@@ -898,6 +921,11 @@ def enqueue_bucket_chain(
     def after_previous(previous: torch.futures.Future) -> None:
         try:
             previous.value()
+            with _profile_marker(
+                "greedylore_hook/collective_unblocked",
+                **_bucket_profile_identity(context),
+            ):
+                pass
             if context.buffer.device.type == "cuda":
                 device = context.buffer.device
                 callback_stream = torch.cuda.current_stream(device)
@@ -938,6 +966,11 @@ def enqueue_collective_bucket_chain(
     def after_previous(previous: torch.futures.Future) -> None:
         try:
             previous.value()
+            with _profile_marker(
+                "greedylore_hook/collective_unblocked",
+                **_bucket_profile_identity(context),
+            ):
+                pass
             if context.buffer.device.type == "cuda":
                 execution_stream = state.execution_stream(context.buffer.device)
                 ready_event = (
@@ -1002,6 +1035,38 @@ def _broadcast_future(
     future = torch.futures.Future(devices=_future_devices(tensor.device))
     future.set_result(tensor)
     return future
+
+
+def _profiled_all_reduce_future(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+    tensor: Tensor,
+    category: str,
+) -> torch.futures.Future:
+    with _profile_marker(
+        "greedylore_hook/collective_launch",
+        **_bucket_profile_identity(context),
+        collective_category=category,
+        operation="all_reduce",
+        bytes=_tensor_bytes(tensor),
+    ):
+        return _all_reduce_future(state, tensor, category)
+
+
+def _profiled_broadcast_future(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+    tensor: Tensor,
+    category: str,
+) -> torch.futures.Future:
+    with _profile_marker(
+        "greedylore_hook/collective_launch",
+        **_bucket_profile_identity(context),
+        collective_category=category,
+        operation="broadcast",
+        bytes=_tensor_bytes(tensor),
+    ):
+        return _broadcast_future(state, tensor, category)
 
 
 def _on_bucket_execution_stream(
@@ -1102,7 +1167,9 @@ def _launch_dense_bucket(
     state: GreedyLoreDDPState,
     context: BucketContext,
 ) -> torch.futures.Future:
-    source = _all_reduce_future(state, context.buffer, "greedylore_hook/dense")
+    source = _profiled_all_reduce_future(
+        state, context, context.buffer, "greedylore_hook/dense"
+    )
 
     def finish(completed: torch.futures.Future) -> Tensor:
         _divide_completed_buffer(state, completed.value())
@@ -1116,7 +1183,9 @@ def _launch_refresh_bucket(
     context: BucketContext,
 ) -> torch.futures.Future:
     _prepare_refresh_buffer(context)
-    source = _all_reduce_future(state, context.buffer, "greedylore_hook/dense")
+    source = _profiled_all_reduce_future(
+        state, context, context.buffer, "greedylore_hook/dense"
+    )
     if state.config.basis_sync == "local_svd":
         return source.then(
             _on_bucket_execution_stream_result(
@@ -1166,8 +1235,9 @@ def _launch_refresh_bucket(
                 )
                 parameter_state.error.zero_()
                 futures.append(
-                    _broadcast_future(
+                    _profiled_broadcast_future(
                         state,
+                        context,
                         parameter_state.basis,
                         "greedylore_hook/basis_broadcast",
                     )
@@ -1452,9 +1522,15 @@ def _launch_compressed_reconstruction(
     return completed
 
 
-def _mark_future_complete(future: torch.futures.Future) -> torch.futures.Future:
+def _mark_future_complete(
+    future: torch.futures.Future,
+    context: BucketContext,
+) -> torch.futures.Future:
     def mark(_completed: torch.futures.Future) -> None:
-        with _profile_range("greedylore_hook/future_complete"):
+        with _profile_marker(
+            "greedylore_hook/future_complete",
+            **_bucket_profile_identity(context),
+        ):
             pass
 
     future.add_done_callback(mark)
@@ -1474,8 +1550,9 @@ def _launch_compressed_bucket(
     score_plus_aux = context.prepared.score_plus_aux
     matrix_work = context.prepared.matrix_work
     dense_ranges = context.prepared.dense_ranges
-    score_source = _all_reduce_future(
+    score_source = _profiled_all_reduce_future(
         state,
+        context,
         score_plus_aux,
         "greedylore_hook/score_plus_aux_allreduce",
     )
@@ -1500,8 +1577,9 @@ def _launch_compressed_bucket(
                 matrix_work,
             )
             context.retained.append(factor_buffer)
-            factor_source = _all_reduce_future(
+            factor_source = _profiled_all_reduce_future(
                 state,
+                context,
                 factor_buffer,
                 "greedylore_hook/factor_allreduce",
             )
@@ -1548,11 +1626,8 @@ def greedy_lore_ddp_hook(
 
     context = state.note_bucket(bucket)
     bucket_metadata = _bucket_profile_metadata(state, context)
-    bucket_metadata_suffix = " ".join(
-        f"{key}={value}" for key, value in sorted(bucket_metadata.items())
-    )
-    with _profile_range(
-        f"greedylore_hook/bucket_ready {bucket_metadata_suffix}",
+    with _profile_marker(
+        "greedylore_hook/bucket_ready",
         **bucket_metadata,
     ):
         pass
@@ -1561,27 +1636,27 @@ def greedy_lore_ddp_hook(
             state,
             context,
             lambda current: _launch_dense_bucket(state, current),
-        ))
+        ), context)
     if is_refresh_step(context.step, state.config):
         return _mark_future_complete(enqueue_bucket_chain(
             state,
             context,
             lambda current: _launch_refresh_bucket(state, current),
-        ))
+        ), context)
     if _matrix_entries(context):
         try:
             _prepare_compressed_bucket(state, context)
         except BaseException as exc:
             context.collective_completion_future.set_exception(exc)
             context.completion_future.set_exception(exc)
-            return _mark_future_complete(context.completion_future)
+            return _mark_future_complete(context.completion_future, context)
         return _mark_future_complete(enqueue_collective_bucket_chain(
             state,
             context,
             lambda current: _launch_compressed_bucket(state, current),
-        ))
+        ), context)
     return _mark_future_complete(enqueue_collective_bucket_chain(
         state,
         context,
         lambda current: _launch_dense_bucket(state, current),
-    ))
+    ), context)

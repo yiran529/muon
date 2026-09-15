@@ -18,3 +18,27 @@
 - Dion 当前 M002 路径使用 FP32 参数与 FP32 DDP gradient bucket，BF16 仅用于 autocast 计算；因此 `bucket` 默认值产生 FP32 通信，并与参考 hook 的 dtype 策略一致。显式 `bfloat16` 是额外的通信压缩 ablation，不应称为“恢复作者 BF16 默认逻辑”。
 - CM065 只将普通 compressed step 的 packed `score+dense_aux` All-Reduce 从 FP32 改为 BF16；Top-r 前 score 转回 FP32，factor、refresh basis、dense-only bucket 和 Muon 语义不变。其 130M/bucket80 三次 mean 从 `228.423` 降至 `220.303 ms`，改善 `8.120 ms`（`3.55%`）；严格相邻 r1/r2 改善 `6.530 ms`（`2.87%`），低于项目关注的 5% 实用门槛。短程 val loss 仅作健康检查，不能给出最终质量结论。
 - 论文写作中可将 BF16 packed communication 报告为有效但幅度有限的系统 ablation；不能声称 payload 减半会等比例转化为 wall-clock，也不能在没有 profiler 的情况下把完整 step 差值直接归因给 NCCL collective。
+
+## ARC-TopK 论文报告结果的 dtype（2026-09-13）
+
+- 结论针对 arXiv:2510.26709。论文正文没有直接声明实验 dtype；应以官方复现实验脚本为准。
+- C4/LLaMA 的官方 README 和 launcher 明确传入 `--dtype float32`，输出目录也标记为 `float32`。因此 Table IV、Table V 以及通信 bits 曲线对应的是 FP32 模型参数/梯度通信，而不是 BF16 参数或 BF16 通信。运行脚本虽然在 BF16 可用时默认选择 BF16，但论文复现实验显式覆盖成了 FP32。
+- CIFAR 脚本只执行默认模型的 `.to(device)`，没有 AMP 或 dtype 转换，因此也是默认 FP32。GLUE 示例没有启用混合精度或显式 dtype 转换，按普通执行应理解为 FP32；若外部 accelerator 配置了 mixed precision，则需另行记录。
+- 本项目当前训练路径是 FP32 模型参数，BF16 仅用于 autocast 下的计算；ARC-TopK 梯度/通信张量仍跟随 FP32 参数和梯度。因此就参数 dtype 与通信 dtype 而言，与论文官方报告结果是可比的。若改成 BF16 参数或 BF16 通信，不能再直接沿用论文结果作 dtype 对齐结论。
+
+证据：
+
+- [论文](https://arxiv.org/pdf/2510.26709)
+- [官方 README 的 C4 命令](https://raw.githubusercontent.com/pkumelon/ARC-TopK-release/master/README.md#L109-L126)
+- [官方 C4 launcher](https://raw.githubusercontent.com/pkumelon/ARC-TopK-release/master/c4/scripts/c4_none_0123.sh#L34-L41)
+- [官方 C4 dtype 处理](https://raw.githubusercontent.com/pkumelon/ARC-TopK-release/master/c4/run_llama_pretraining.py#L52-L53)
+- [官方 CIFAR 训练脚本](https://raw.githubusercontent.com/pkumelon/ARC-TopK-release/master/cifar10/run_cifar10.py#L126-L138)
+
+## 当前 GreedyLore 主通信 payload 的 dtype（2026-09-13）
+
+- 当前默认 `model_dtype=float32`，且 `greedy_lore_dense_aux_communication_dtype=bucket`；因此 DDP bucket、dense auxiliary、压缩 score 以及 factor 的主梯度通信 payload 均为 FP32。
+- 训练中的 BF16 autocast 只影响前向/反向计算，不会自动把 FP32 模型参数或 GreedyLore 通信 payload 改成 BF16。
+- 若显式设置 `model_dtype=bfloat16` 并保持 `dense_aux_communication_dtype=bucket`，bucket-native 通信会变为 BF16；若额外指定 `dense_aux_communication_dtype=float32`，则 score+dense auxiliary packed buffer 会单独使用 FP32，不能再视为全链路 dtype 一致。
+- 因此当前默认 GreedyLore 配置的参数/通信 dtype 与 ARC-TopK 论文官方报告结果的 FP32 设置一致；SVD 内部临时使用 FP32 属于计算 dtype，不改变上述通信结论。
+
+本地依据：[train.py](../../train.py#L65)、[train_greedylore.py](../../train_greedylore.py#L32-L34)、[greedy_lore_ddp_hook.py](../../dion/greedy_lore_ddp_hook.py#L1081-L1085)。

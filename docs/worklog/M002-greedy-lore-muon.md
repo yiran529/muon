@@ -519,3 +519,17 @@ CM075 在与 CM070a/b 相同的 GPU 2–5、BF16 GPT-60M paper-aligned 配方上
 随后复用 CM074 的 GPT-130M BF16/GA1 timing 配方，在 GPU 2–5 启用 `greedy_lore_isolate_dense_aux_buckets`，不启用 embedding/lm-head 压缩。前两组 rotated dense/M002 配对均完成：r1 为 `199.03/203.77 ms`，r2 为 `200.36/203.08 ms`；有效配对均值为 `199.695/203.425 ms`，隔离版 M002 慢 `3.730 ms (+1.87%)`。第三个 dense cell 完成于 `200.17 ms`，但对应 M002 r3 在首次 compiled forward 申请 `3.07 GiB` 时因 GPU 2 仅余 `2.14 GiB` 而 OOM；失败后 GPU 2–4 可见其他任务占用，且前两个同配置 M002 cell 已成功，因此记录为外部资源争用。
 
 实验最终为5/6 cells成功，没有正式 `summary.json`。结论按两组有效同期配对记为 `partial/negative`：物理隔离 dense auxiliary bucket 没有显现端到端收益，阶段性慢 `1.87%`；不使用未配对的 r3 dense 计算均值或区间。artifact：`artifacts/compressed_muon/CM076-m002-greedylore-dense-aux-isolation-gpt130m-bf16-timing-ws4-s42/`。
+
+### CM077 targeted profile：实际仅完成 partial isolation
+
+在 GPU 2–5 复用 CM076 配置，串行采集 dense/M002 refresh 与 ordinary；4/4 cells exit0，共生成16份 rank trace。profiler 新增逐 bucket 的 gradient-ready、collective-unblocked 和 Future-complete 时间线，以实际 reducer bucket 而非预期 cap 推断布局。
+
+trace 显示 M002 的四个 rank、refresh/ordinary 均只有3桶：`73.6875 MiB` 的 `lm_head.weight` dense-only、`69.75 MiB` matrix-only，以及 `111.9375 MiB` 的末桶（`38.25 MiB` matrix + `73.6875 MiB` `transformer.wte.weight`）。原 cap 序列 `[73.6875, 67.5, 40.5, 73.6875] MiB` 没有产生预期四桶：按完整 block 估计的边界与真实 backward-ready 顺序不匹配，DDP 又把 cap 当作 soft threshold并按实际顺序装入不可切分参数；matrix-only 桶在 `69.75 MiB` 才越过 `67.5 MiB`，余下 matrix 的 `38.25 MiB` 未达到下一个 `40.5 MiB` cap，因而继续并入 embedding。由此追溯修正 CM076：它测得的是当前代码的 partial isolation，而不是两个 auxiliary 参数的完整物理隔离。
+
+ordinary rank-max 的 dense/M002 exposed NCCL 为 `28.899/26.943 ms`，M002 只节省约 `1.956 ms`。M002 本地 score/Top-r/factor/error/reconstruction 分别为 `2.244/0.753/0.341/0.767/0.682 ms`，各类别 rank-max 合计约 `4.788 ms`；collective rank-max 的 dense/factor/score+aux/Muon-result 分别为 `12.958/4.854/15.899/7.029 ms`。有限的 exposed NCCL 改善与不可忽略的本地工作共同提示压缩开销可能抵消通信收益，方向上与 CM076 profiler-off 的 `+3.730 ms (+1.87%)` 一致；但它们不是同一 rank 上互斥的关键路径分量，不能机械相加或据此完成定量归因。Kineto 还将 M002 ordinary profile window 放大到 `269.879 ms`（dense 为 `195.788 ms`），该差值不能当作真实 step regression。
+
+M002 refresh 的 local-SVD GPU 为 `1508.984 ms`，interval200 简单摊销约 `7.54 ms/update`；critical-path tail 为 `641.749 ms`。dense refresh 单样本的 NCCL union `163.156 ms` 明显偏离 ordinary 的 `45.774 ms`，不用于精确 refresh 对照。末尾 embedding mixed bucket 在 backward 后段 ready，Future 约在 backward CPU range 结束前 `1.1 ms` 完成，仍是晚期路径。
+
+采样点还有首调用偏差：`start_compress_step=20`，而 refresh/ordinary profile step 正是 `20/21`，分别为第一次 refresh 和第一次 ordinary compressed 分支；rank0 首个 score/Top-r CPU range 约为 `87.8/49.0 ms`，显示初始化或 profiler 冷启动污染。因而本轮 bucket composition 是可靠结构证据，时间分解则只作定性诊断。
+
+结论：先把采样移至第二个压缩周期（step220/221，或等价的分支预热后采样），并增加 prepare begin/end、chain-wait begin 标记，以拆分本地准备与真实依赖等待；再依据实际 reducer 顺序修正或替代 cap 构造，并在 compiled GPU trace 中验证真实四桶布局。最终用同批次 rotated dense/current-partial/fixed-full 三臂 profiler-off timing 做因果消融，同时分开统计 ordinary 分布与 refresh spike。在布局和稳态时间验证前，不把当前结果外推为“完整隔离无效”。artifact：`artifacts/compressed_muon/CM077-m002-gpt130m-bf16-dense-aux-isolation-targeted-profile-ws4-s42/`。

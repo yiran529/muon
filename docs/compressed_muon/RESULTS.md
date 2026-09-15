@@ -817,3 +817,37 @@ M002 both 的 CV 为 `0.462%`，dense CV 为 `1.244%`，paired mean-difference i
 OOM 发生时 rank0 还需分配 `3.07 GiB`，但物理 GPU 仅余 `2.14 GiB`；同一配置此前两个 M002 cell 均完整运行，且失败后可见 GPU 2–4 已被其他任务占用，因此将 r3 归类为外部资源争用，而非 bucket 隔离路径的确定性容量失败。
 
 当前两组同期有效配对方向均为负，说明 **dense auxiliary bucket 隔离没有展现端到端加速，阶段性平均慢 `1.87%`**。由于缺少第三组配对且无正式汇总，这一结果记为 `partial/negative`，不计算三重复区间，也不把 r3 dense 纳入均值。原始产物：`artifacts/compressed_muon/CM076-m002-greedylore-dense-aux-isolation-gpt130m-bf16-timing-ws4-s42/`。
+
+后续 CM077 的真实 CUDA trace 证明上述“两个 dense auxiliary 参数均已物理隔离”的前提并未完全成立：`lm_head.weight` 成为 dense-only bucket，但 `transformer.wte.weight` 仍与 Transformer matrix 混桶。因此 CM076 测量的是当前实现的 **partial isolation** 路径；其同期 timing 结论仍有效，但不能代表完整隔离后的性能。
+
+## CM077：M002 dense auxiliary 隔离 targeted profile（2026-09-15）
+
+复用 CM076 的 GPT-130M BF16/GA1 配置，在 GPU 2–5 串行采集 dense/M002 的 refresh 与 ordinary，共4个 cells、16份 rank trace，全部 exit `0`。profile 增加了逐 bucket 的 gradient-ready、collective-unblocked 与 Future-complete 时间线，用于核验 DDP rebuild 后的实际 bucket composition 和关键路径。
+
+尽管传入的 cap 序列为 `[73.6875, 67.5, 40.5, 73.6875] MiB`，四个 rank 在 M002 refresh/ordinary 中均实际重建为3个 bucket：
+
+| bucket | 总大小 | matrix | dense auxiliary | 实际组成 |
+|---|---:|---:|---:|---|
+| 0 | 73.6875 MiB | 0 | 73.6875 MiB | `lm_head.weight` dense-only |
+| 1 | 69.75 MiB | 69.75 MiB | 0 | matrix-only |
+| 2 | 111.9375 MiB | 38.25 MiB | 73.6875 MiB | matrix + `transformer.wte.weight` |
+
+根因是按完整 Transformer block 估计的 cap 边界与 reducer 的真实 backward-ready 顺序不匹配，同时 `bucket_cap_mb_list` 只是 soft thresholds，rebuild 会按实际顺序装入不可切分参数并在越过阈值后才关闭 bucket。bucket 1 在 `69.75 MiB` 越过预期 `67.5 MiB` cap，余下 matrix 仅 `38.25 MiB`，尚未达到下一个 `40.5 MiB` cap，随后 embedding 被并入并形成 `111.9375 MiB` 的末桶。因此该实现只隔离了 lm-head，没有隔离 embedding。
+
+ordinary trace 的 rank-max 摘要如下；Kineto 对含大量 Python callback/`record_function` 的 M002 路径扰动明显，因此 profile window 不作为端到端 step time：
+
+| metric | dense ordinary | M002 ordinary |
+|---|---:|---:|
+| profile window | 195.788 ms | 269.879 ms |
+| NCCL union | 45.774 ms | 39.760 ms |
+| exposed NCCL | 28.899 ms | 26.943 ms |
+| exposed gradient tail | 21.546 ms | — |
+| compressor critical-path tail | — | 0.205 ms |
+
+M002 ordinary 的本地 GPU 工作为 score `2.244 ms`、Top-r `0.753 ms`、factor `0.341 ms`、error `0.767 ms`、reconstruction `0.682 ms`，各类别 rank-max 合计约 `4.788 ms`。对应 collective rank-max 为 dense `12.958 ms`、factor All-Reduce `4.854 ms`、score+aux All-Reduce `15.899 ms`、Muon result `7.029 ms`。相对 dense，M002 的 exposed NCCL 只减少约 `1.956 ms`，而 ordinary 本地压缩工作仍不可忽略，这强烈提示有限通信收益可能被本地工作抵消，并与 CM076 未加速的方向一致。但 exposed NCCL 与各类别 rank-max 求和不是同一 rank 上互斥的关键路径分量，不能据此定量证明 `3.730 ms` 回退；端到端及后续消融仍以 profiler-off timing 为准。
+
+refresh trace 中 M002 profile window/exposed NCCL/local-SVD GPU/critical-path tail 分别为 `2023.289/68.007/1508.984/641.749 ms`；以 interval200 粗略摊销，SVD 约为 `7.54 ms/update`。dense refresh 单样本的 NCCL union 为 `163.156 ms`，远高于 dense ordinary 的 `45.774 ms`，存在明显环境噪声，不能据此计算精确 refresh 增量。逐桶时间线还显示末尾 embedding mixed bucket 在 backward 后段才 ready，并约在 backward CPU range 结束前 `1.1 ms` 完成，仍处于晚期路径。
+
+本轮另有首调用限制：压缩从 step20 启动，采样的 refresh/ordinary 正好是 step20/21，即第一次 refresh 和第一次 ordinary compressed 分支；rank0 的首个 score/Top-r CPU range 分别达到约 `87.8/49.0 ms`，明显带有初始化或 profiler 冷启动污染。因此 bucket composition 可作为可靠结构证据，但上述时间分解只作定性诊断。后续 profile 应采第二周期的 step220/221，或先分别预热多次 refresh/ordinary 分支。
+
+结论为 **completed/diagnostic**：CM076 的负结果与实际仅 partial isolation、dense payload 未完全移出压缩 bucket，以及有限 exposed communication 节省可能被 ordinary 本地工作和 refresh 成本抵消这一解释一致，但当前首调用 trace 不能完成定量归因。下一步先把 profile 移至第二个压缩周期，并增加 prepare begin/end 与 chain-wait 标记；再依据真实 reducer 顺序修正 cap 构造，以 compiled GPU trace 验证四桶布局，最后做 dense/current-partial/fixed-full 三臂 rotated profiler-off timing。原始产物：`artifacts/compressed_muon/CM077-m002-gpt130m-bf16-dense-aux-isolation-targeted-profile-ws4-s42/`。

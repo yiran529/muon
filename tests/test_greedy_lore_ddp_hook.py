@@ -477,6 +477,8 @@ def test_compressed_mixed_bucket_metadata_includes_aux_and_signed_scores():
     assert metadata["factor_bytes"] == 12
     assert metadata["parameter_names"] == "matrix,dense"
     assert metadata["parameter_roles"] == "matrix,dense_aux"
+    assert metadata["context_id"] == context.context_id
+    assert metadata["bucket_index"] == -1
 
 
 def test_dense_only_compressed_bucket_launches_one_dense_reduction_and_stops(monkeypatch):
@@ -522,6 +524,7 @@ def test_registered_hook_callback_path_avoids_forbidden_synchronization():
         hook_module._record_reconstruction_tensors_on_stream,
         hook_module._future_devices,
         hook_module._profile_range,
+        hook_module._profile_marker,
         hook_module._tensor_bytes,
         hook_module._collective_profile_range,
         hook_module._bucket_profile_metadata,
@@ -531,6 +534,8 @@ def test_registered_hook_callback_path_avoids_forbidden_synchronization():
         hook_module.enqueue_collective_bucket_chain,
         hook_module._all_reduce_future,
         hook_module._broadcast_future,
+        hook_module._profiled_all_reduce_future,
+        hook_module._profiled_broadcast_future,
         hook_module._on_bucket_execution_stream,
         hook_module._on_bucket_execution_stream_result,
         hook_module._matrix_entries,
