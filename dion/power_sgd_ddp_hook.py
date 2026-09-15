@@ -705,6 +705,11 @@ def power_sgd_ddp_hook(
     context = state.note_bucket(bucket)
 
     def fail(exc: BaseException) -> None:
+        # Torch futures accept Exception only, including on cancellation paths.
+        if not isinstance(exc, Exception):
+            failure = RuntimeError(f"{type(exc).__name__}: {exc}")
+            failure.__cause__ = exc
+            exc = failure
         for future in (context.collective_completion_future, context.completion_future):
             if not future.done():
                 future.set_exception(exc)

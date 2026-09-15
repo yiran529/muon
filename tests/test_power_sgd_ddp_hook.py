@@ -258,6 +258,37 @@ def test_second_bucket_waits_for_full_previous_chain(transport):
     ]
 
 
+@pytest.mark.parametrize(
+    "exception_type", [KeyboardInterrupt, SystemExit, BaseException]
+)
+def test_base_exception_settles_all_futures_and_releases_context(
+    monkeypatch, exception_type
+):
+    parameter = torch.nn.Parameter(torch.zeros(8, 12))
+    state = make_state([(parameter, "matrix")])
+    state.begin_step()
+
+    def cancelled(*args, **kwargs):
+        raise exception_type("preparation cancelled")
+
+    monkeypatch.setattr(hook_module, "corrected_gradient", cancelled)
+    result = hook_module.power_sgd_ddp_hook(
+        state, FakeGradBucket([parameter], [torch.ones_like(parameter)])
+    )
+    # Check completion before reading errors so a regression cannot hang pytest.
+    assert result.done()
+    assert state.tail_future.done()
+    assert state.collective_tail.done()
+    assert not state._active_contexts
+    for future in (result, state.tail_future, state.collective_tail):
+        with pytest.raises(
+            RuntimeError, match=f"{exception_type.__name__}.*preparation cancelled"
+        ):
+            future.value()
+    with pytest.raises(RuntimeError, match="preparation cancelled"):
+        state.finish_step()
+
+
 @pytest.mark.parametrize("warm_start", [True, False])
 def test_seeded_factors_use_stable_identity_phase_and_preserve_global_rng(warm_start):
     first = torch.nn.Parameter(torch.zeros(4, 4))
