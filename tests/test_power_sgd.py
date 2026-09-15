@@ -35,6 +35,14 @@ def test_config_defaults_and_rejects_invalid_values():
         PowerSGDConfig(rank=0)
     with pytest.raises(ValueError):
         PowerSGDConfig(error_feedback="bad")
+    with pytest.raises(ValueError):
+        PowerSGDConfig(min_compression_rate=float("nan"))
+    with pytest.raises(ValueError):
+        PowerSGDConfig(min_compression_rate=float("inf"))
+    with pytest.raises(ValueError):
+        PowerSGDConfig(orthogonalization_epsilon=float("nan"))
+    with pytest.raises(ValueError):
+        PowerSGDConfig(orthogonalization_epsilon=float("inf"))
 
 
 def test_compressed_phase_is_zero_based_after_warmup():
@@ -78,17 +86,23 @@ def test_power_sgd_factors_reconstruct_and_full_rank_is_exact():
     assert reconstructed.shape == corrected.shape
     assert reconstructed.dtype == corrected.dtype
 
-    full_left = torch.eye(2, dtype=corrected.dtype)
-    full_right = corrected.mT
+    corrected_full = torch.tensor([[2.0, 0.0], [0.0, 3.0]], dtype=corrected.dtype)
+    full_q = torch.eye(2, dtype=corrected.dtype)
+    full_left = orthogonalize(compute_left_factor(corrected_full, full_q))
+    full_right = compute_right_factor(corrected_full, full_left)
     exact = reconstruct(full_left, full_right)
-    assert torch.allclose(exact.float(), corrected.float(), atol=1e-5)
+    assert torch.allclose(exact.float(), corrected_full.float(), atol=1e-5)
 
 
 def test_corrected_gradient_and_error_feedback_recurrence():
-    gradient = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
-    error = torch.tensor([[0.5, -0.5], [1.0, -1.0]], dtype=torch.float32)
+    gradient = torch.tensor([[2.0, 0.0], [0.0, 3.0]], dtype=torch.bfloat16)
+    error = torch.tensor([[1.0, 0.0], [0.0, -1.0]], dtype=torch.bfloat16)
     corrected = corrected_gradient(gradient, error)
-    reconstructed = torch.tensor([[1.0, 1.0], [3.0, 5.0]], dtype=torch.bfloat16)
+    right = torch.tensor([[1.0], [0.0]], dtype=torch.bfloat16)
+    left = orthogonalize(compute_left_factor(corrected, right))
+    reconstructed = reconstruct(left, compute_right_factor(corrected, left))
     next_error = corrected - reconstructed
-    assert corrected.dtype == torch.float32
-    assert torch.equal(next_error, corrected - reconstructed)
+    assert corrected.dtype == torch.bfloat16
+    assert torch.equal(corrected, torch.tensor([[3.0, 0.0], [0.0, 2.0]], dtype=torch.bfloat16))
+    assert torch.equal(reconstructed, torch.tensor([[3.0, 0.0], [0.0, 0.0]], dtype=torch.bfloat16))
+    assert torch.equal(next_error, torch.tensor([[0.0, 0.0], [0.0, 2.0]], dtype=torch.bfloat16))

@@ -1,6 +1,7 @@
 """Tensor-level PowerSGD primitives used by the DDP gradient hook."""
 
 from dataclasses import dataclass
+import math
 from typing import Literal
 
 import torch
@@ -31,13 +32,13 @@ class PowerSGDConfig:
             raise ValueError("rank must be positive")
         if self.start_compress_step < 0:
             raise ValueError("start_compress_step must be non-negative")
-        if self.min_compression_rate <= 0:
+        if not math.isfinite(self.min_compression_rate) or self.min_compression_rate <= 0:
             raise ValueError("min_compression_rate must be positive")
         if self.error_feedback not in ("ef14", "none"):
             raise ValueError("error_feedback must be 'ef14' or 'none'")
         if not isinstance(self.warm_start, bool):
             raise TypeError("warm_start must be a bool")
-        if self.orthogonalization_epsilon < 0:
+        if not math.isfinite(self.orthogonalization_epsilon) or self.orthogonalization_epsilon < 0:
             raise ValueError("orthogonalization_epsilon must be non-negative")
         if self.seed_scheme_version != 1:
             raise ValueError("seed_scheme_version must be 1")
