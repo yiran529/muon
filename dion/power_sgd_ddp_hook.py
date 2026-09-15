@@ -2,7 +2,7 @@
 
 import threading
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import torch
 import torch.distributed as dist
@@ -10,7 +10,19 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.nn import Parameter
 
-from .power_sgd import PowerSGDConfig, compressed_phase, should_compress
+from .collective_observer import observe_collective
+from .power_sgd import (
+    PowerSGDConfig,
+    compressed_phase,
+    compute_left_factor,
+    compute_right_factor,
+    corrected_gradient,
+    derive_power_sgd_seed,
+    make_random_factor,
+    orthogonalize,
+    reconstruct,
+    should_compress,
+)
 
 POWER_SGD_COMPRESSOR_SCHEMA_VERSION = 1
 
@@ -594,3 +606,185 @@ class PowerSGDDDPState:
         if committed_step < 0:
             raise ValueError("PowerSGD compressor checkpoint committed step is invalid")
         return committed_step
+
+
+@dataclass
+class _MatrixWork:
+    gradient: Tensor
+    state: PowerSGDParameterState
+    corrected: Tensor
+    p: Tensor
+    q: Tensor
+
+
+def _all_reduce_future(
+    state: PowerSGDDDPState, tensor: Tensor, stage: str
+) -> torch.futures.Future:
+    if state.world_size > 1:
+        observe_collective(f"powersgd_hook/{stage}", "all_reduce", tensor)
+        return dist.all_reduce(
+            tensor, group=state.process_group, async_op=True
+        ).get_future()
+    future = torch.futures.Future(devices=_future_devices(tensor.device))
+    future.set_result(tensor)
+    return future
+
+
+def _prepare_compressed_bucket(
+    state: PowerSGDDDPState, context: BucketContext
+) -> tuple[Tensor, Tensor, list[tuple[Tensor, Tensor]], list[_MatrixWork]]:
+    """Pack exact entries first, followed by native-orientation P factors."""
+    dense = [
+        gradient
+        for gradient, item in zip(context.gradients, context.parameter_states)
+        if item is None
+    ]
+    entries = [
+        (gradient, item)
+        for gradient, item in zip(context.gradients, context.parameter_states)
+        if item is not None
+    ]
+    dense_numel = sum(gradient.numel() for gradient in dense)
+    first = context.buffer.new_empty(
+        dense_numel
+        + sum(gradient.shape[0] * item.q_memory.shape[1] for gradient, item in entries)
+    )
+    second = context.buffer.new_empty(sum(item.q_memory.numel() for _, item in entries))
+    context.retained.extend((first, second))
+    dense_views = []
+    offset = 0
+    for gradient in dense:
+        packed = first[offset : offset + gradient.numel()].view_as(gradient)
+        packed.copy_(gradient)
+        dense_views.append((gradient, packed))
+        offset += gradient.numel()
+
+    matrix_work = []
+    q_offset = 0
+    config = state.config
+    assert context.phase is not None
+    for gradient, item in entries:
+        corrected = corrected_gradient(
+            gradient, item.error if config.error_feedback == "ef14" else None
+        )
+        seed = derive_power_sgd_seed(
+            base_seed=config.seed,
+            phase=context.phase,
+            stable_parameter_id=item.spec.stable_id,
+            seed_scheme_version=config.seed_scheme_version,
+        )
+        initial_q = make_random_factor(
+            item.q_memory.shape[0],
+            item.q_memory.shape[1],
+            seed,
+            gradient.device,
+            gradient.dtype,
+        )
+        if config.warm_start:
+            initial_q = torch.where(item.q_initialized, item.q_memory, initial_q)
+        initial_q = orthogonalize(initial_q, config.orthogonalization_epsilon)
+        p_numel = gradient.shape[0] * item.q_memory.shape[1]
+        p = first[offset : offset + p_numel].view(gradient.shape[0], -1)
+        p.copy_(compute_left_factor(corrected, initial_q))
+        q = second[q_offset : q_offset + item.q_memory.numel()].view_as(item.q_memory)
+        matrix_work.append(_MatrixWork(gradient, item, corrected, p, q))
+        offset += p_numel
+        q_offset += item.q_memory.numel()
+    context.retained.append(matrix_work)
+    return first, second, dense_views, matrix_work
+
+
+def power_sgd_ddp_hook(
+    state: PowerSGDDDPState, bucket: dist.GradBucket
+) -> torch.futures.Future[Tensor]:
+    """Average a DDP bucket via P+dense, Q, then local EF14 reconstruction.
+
+    This conservative chain serializes complete buckets. Both state-owned
+    placeholders complete together; a later overlap path can split their tails.
+    """
+    context = state.note_bucket(bucket)
+
+    def fail(exc: BaseException) -> None:
+        for future in (context.collective_completion_future, context.completion_future):
+            if not future.done():
+                future.set_exception(exc)
+
+    def finish() -> None:
+        if context.collective_completion_future is not context.completion_future:
+            context.collective_completion_future.set_result(None)
+        context.completion_future.set_result(context.buffer)
+
+    def guarded(callback: Callable[[], None]) -> Callable[[torch.futures.Future], None]:
+        def run(completed: torch.futures.Future) -> None:
+            try:
+                # The callback runs only after completion; value propagates errors
+                # without blocking a worker thread on Work.wait().
+                completed.value()
+                if context.buffer.device.type == "cuda":
+                    device = context.buffer.device
+                    callback_stream = torch.cuda.current_stream(device)
+                    if device not in state._execution_streams:
+                        state._execution_streams[device] = torch.cuda.Stream(
+                            device=device
+                        )
+                    execution_stream = state._execution_streams[device]
+                    execution_stream.wait_stream(callback_stream)
+                    assert context.bucket_ready_event is not None
+                    execution_stream.wait_event(context.bucket_ready_event)
+                    context.buffer.record_stream(execution_stream)
+                    with torch.cuda.stream(execution_stream):
+                        callback()
+                    callback_stream.wait_stream(execution_stream)
+                else:
+                    callback()
+            except BaseException as exc:
+                fail(exc)
+
+        return run
+
+    def launch() -> None:
+        if context.phase is None or not any(context.parameter_states):
+
+            def finish_dense() -> None:
+                context.buffer.div_(state.world_size)
+                finish()
+
+            _all_reduce_future(state, context.buffer, "dense").add_done_callback(
+                guarded(finish_dense)
+            )
+            return
+
+        first, second, dense_views, matrix_work = _prepare_compressed_bucket(
+            state, context
+        )
+
+        def after_p() -> None:
+            for gradient, packed in dense_views:
+                gradient.copy_(packed.div_(state.world_size))
+            for work in matrix_work:
+                # P is a sum. Scaling before this normalization changes epsilon's
+                # effect, and is unnecessary for the PowerSGD projection.
+                work.p.copy_(
+                    orthogonalize(work.p, state.config.orthogonalization_epsilon)
+                )
+                work.q.copy_(compute_right_factor(work.corrected, work.p))
+
+            def after_q() -> None:
+                second.div_(state.world_size)
+                for work in matrix_work:
+                    approximation = reconstruct(work.p, work.q)
+                    if state.config.error_feedback == "ef14":
+                        work.state.error.copy_(work.corrected - approximation)
+                    work.state.q_memory.copy_(work.q)
+                    work.state.q_initialized.fill_(True)
+                    work.gradient.copy_(approximation)
+                finish()
+
+            _all_reduce_future(state, second, "q").add_done_callback(guarded(after_q))
+
+        _all_reduce_future(state, first, "p_plus_aux").add_done_callback(
+            guarded(after_p)
+        )
+
+    context.previous_tail.add_done_callback(guarded(launch))
+    return context.completion_future
