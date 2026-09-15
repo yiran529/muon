@@ -507,3 +507,15 @@ embedding/head 也进行 GreedyLore 通信压缩在接口上可行：解耦 opti
 CM075 在与 CM070a/b 相同的 GPU 2–5、BF16 GPT-60M paper-aligned 配方上完成10,000步，最终 val loss `4.2622`、ppl `70.97`、step `90.27 ms`、peak `6318 MiB`，W&B run 为 `ueijo55s`。历史同配方 BF16 dense/仅block压缩的 loss 为 `4.1079/4.2119`、ppl为 `60.82/67.48`；both 相对两者 ppl 分别高 `16.68%/5.16%`。压缩刚开始后 loss 在 step1000/1500 从 `4.8892` 升到 `5.1938`，此后恢复下降，说明训练未发散，但最终质量进一步劣化。CM075 的绝对 step 比历史 dense/block-only 快约 `2.99%/4.80%`，但这是跨日期、跨代码版本的非同期比较，与 CM074 的同期负结果方向相反，不能作为速度收益结论。
 
 结论：rank32 下同时压缩 embedding/lm-head 为 **quality-negative 且没有同期 wall-clock 收益**，不应原样进入更大规模训练。artifact：`artifacts/compressed_muon/CM074-m002-greedylore-both-gpt130m-bf16-timing-ws4-s42/`、`artifacts/compressed_muon/CM075-m002-greedylore-both-gpt60m-bf16-ddp-ws4-s1234/`。
+
+## 2026-09-15：dense auxiliary role-aligned DDP bucket 实现
+
+按 CM073 mixed-bucket 审计后的第一优先级，实现默认关闭的 `greedy_lore_isolate_dense_aux_buckets`。该选项不改变 GPT module tree、参数名、forward、Muon/AdamW 参数组或 GreedyLore 数学路径，而是在 DDP 构造前生成 `bucket_cap_mb_list`：按 steady-state backward ready 顺序，首尾分别使用 lm-head/embedding 的精确参数字节数，中间按普通 `bucket_cap_mb` 将反向遍历的完整 Transformer block 聚合成精确边界。当前 GPT 参数注册顺序若不再是 embedding、blocks、lm-head，则直接拒绝启动；该选项也与 `greedy_lore_compress_embedding_lm_head` 互斥。
+
+共享 `train.main` 新增 entry-specific DDP kwargs factory seam，其他训练入口默认行为不变。GreedyLore profiler 的 bucket metadata 现在额外记录稳定参数名和 matrix/dense_aux role，通用 launcher 也能通过 `--greedy-lore-isolate-dense-aux-buckets` 生成后续 profile/timing 命令。该可选路径依赖 PyTorch 2.11 的 `bucket_cap_mb_list`；项目整体版本下限保持不变，旧版运行时只有启用该开关才会以明确错误 fail closed。真实两 rank CPU/Gloo 回归覆盖 DDP rebuild，并加入非均匀 block 大小以防 cap 顺序被对称模型掩盖；连续两轮 rebuild 后的 bucket 均保持 `lm_head-only -> whole-block-only -> embedding-only`，两个 rank 完全一致。按本轮要求未启动 GPU profiler、timing 或训练，因此当前只证明布局机制和 rebuild 行为，不声称 NCCL overlap 或 wall-clock 改善。
+
+### CM076 dense auxiliary bucket 隔离 timing
+
+随后复用 CM074 的 GPT-130M BF16/GA1 timing 配方，在 GPU 2–5 启用 `greedy_lore_isolate_dense_aux_buckets`，不启用 embedding/lm-head 压缩。前两组 rotated dense/M002 配对均完成：r1 为 `199.03/203.77 ms`，r2 为 `200.36/203.08 ms`；有效配对均值为 `199.695/203.425 ms`，隔离版 M002 慢 `3.730 ms (+1.87%)`。第三个 dense cell 完成于 `200.17 ms`，但对应 M002 r3 在首次 compiled forward 申请 `3.07 GiB` 时因 GPU 2 仅余 `2.14 GiB` 而 OOM；失败后 GPU 2–4 可见其他任务占用，且前两个同配置 M002 cell 已成功，因此记录为外部资源争用。
+
+实验最终为5/6 cells成功，没有正式 `summary.json`。结论按两组有效同期配对记为 `partial/negative`：物理隔离 dense auxiliary bucket 没有显现端到端收益，阶段性慢 `1.87%`；不使用未配对的 r3 dense 计算均值或区间。artifact：`artifacts/compressed_muon/CM076-m002-greedylore-dense-aux-isolation-gpt130m-bf16-timing-ws4-s42/`。

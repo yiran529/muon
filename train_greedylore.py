@@ -1,6 +1,8 @@
 """Dedicated DDP training entry point for GreedyLore gradient sync with Muon."""
 
 import argparse
+import inspect
+import math
 
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -33,6 +35,7 @@ class GreedyLoreHyperparameters(train.Hyperparameters):
         "bucket", "float32", "bfloat16"
     ] = "bucket"
     greedy_lore_compress_embedding_lm_head: bool = False
+    greedy_lore_isolate_dense_aux_buckets: bool = False
 
 
 def configure_greedy_lore_parser(parser: argparse.ArgumentParser) -> None:
@@ -56,6 +59,15 @@ def configure_greedy_lore_parser(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Compress both embedding and LM-head gradients with GreedyLore",
     )
+    parser.add_argument(
+        "--greedy_lore_isolate_dense_aux_buckets",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use exact DDP bucket caps to isolate the dense embedding and LM head "
+            "from compressed Transformer blocks"
+        ),
+    )
 
 
 def validate_greedy_lore_hyperparameters(hp: GreedyLoreHyperparameters) -> None:
@@ -69,6 +81,101 @@ def validate_greedy_lore_hyperparameters(hp: GreedyLoreHyperparameters) -> None:
         basis_sync=hp.greedy_lore_basis_sync,
         dense_aux_communication_dtype=hp.greedy_lore_dense_aux_communication_dtype,
     )
+    if (
+        hp.greedy_lore_isolate_dense_aux_buckets
+        and hp.greedy_lore_compress_embedding_lm_head
+    ):
+        raise ValueError(
+            "greedy_lore_isolate_dense_aux_buckets and "
+            "greedy_lore_compress_embedding_lm_head cannot be enabled together"
+        )
+
+
+_MIB = 1024 * 1024
+
+
+def _parameter_bytes(parameters) -> int:
+    return sum(parameter.numel() * parameter.element_size() for parameter in parameters)
+
+
+def build_isolated_dense_aux_bucket_cap_mb_list(
+    model,
+    *,
+    target_cap_mb: float,
+) -> list[float]:
+    """Return exact caps for embedding, whole-block groups, and LM head."""
+
+    if not math.isfinite(target_cap_mb) or target_cap_mb <= 0:
+        raise ValueError("target_cap_mb must be finite and positive")
+
+    embedding = tuple(model.transformer.wte.parameters())
+    blocks = tuple(tuple(block.parameters()) for block in model.transformer.h)
+    lm_head = tuple(model.lm_head.parameters())
+    expected_parameters = (
+        *embedding,
+        *(p for block in blocks for p in block),
+        *lm_head,
+    )
+    actual_parameters = tuple(model.parameters())
+    if tuple(map(id, actual_parameters)) != tuple(map(id, expected_parameters)):
+        raise ValueError(
+            "dense auxiliary bucket isolation requires GPT parameter registration "
+            "order: embedding, Transformer blocks, LM head"
+        )
+
+    embedding_bytes = _parameter_bytes(embedding)
+    lm_head_bytes = _parameter_bytes(lm_head)
+    if embedding_bytes == 0 or lm_head_bytes == 0:
+        raise ValueError("embedding and LM head must each contain parameters")
+
+    target_bytes = int(target_cap_mb * _MIB)
+    block_bucket_bytes: list[int] = []
+    current_bytes = 0
+    for block in reversed(blocks):
+        block_bytes = _parameter_bytes(block)
+        if block_bytes == 0:
+            continue
+        if current_bytes and current_bytes + block_bytes > target_bytes:
+            block_bucket_bytes.append(current_bytes)
+            current_bytes = 0
+        current_bytes += block_bytes
+    if current_bytes:
+        block_bucket_bytes.append(current_bytes)
+    if not block_bucket_bytes:
+        raise ValueError(
+            "at least one trainable Transformer block parameter is required"
+        )
+
+    return [
+        value / _MIB for value in (lm_head_bytes, *block_bucket_bytes, embedding_bytes)
+    ]
+
+
+def require_ddp_bucket_cap_mb_list_support(ddp_type=DDP) -> None:
+    if "bucket_cap_mb_list" not in inspect.signature(ddp_type).parameters:
+        raise RuntimeError(
+            "greedy_lore_isolate_dense_aux_buckets requires PyTorch DDP support "
+            "for bucket_cap_mb_list (available in PyTorch 2.11 or newer)"
+        )
+
+
+def greedy_lore_ddp_kwargs(model, hp, cli_args) -> dict:
+    """Opt into role-aligned DDP buckets without changing the GPT module tree."""
+
+    if not hp.greedy_lore_isolate_dense_aux_buckets:
+        return {}
+    require_ddp_bucket_cap_mb_list_support()
+    target_cap_mb = (
+        25.0
+        if getattr(cli_args, "bucket_cap_mb", None) is None
+        else cli_args.bucket_cap_mb
+    )
+    caps = build_isolated_dense_aux_bucket_cap_mb_list(
+        model,
+        target_cap_mb=target_cap_mb,
+    )
+    train.print0(f"GreedyLore DDP bucket caps (MiB): {caps}")
+    return {"bucket_cap_mb_list": caps}
 
 
 def _install_greedy_lore_ddp_hook(
@@ -220,4 +327,5 @@ if __name__ == "__main__":
         optimizer_factory=init_greedy_lore_optimizer,
         configure_parser=configure_greedy_lore_parser,
         validate_hyperparameters=validate_greedy_lore_hyperparameters,
+        ddp_kwargs_factory=greedy_lore_ddp_kwargs,
     )

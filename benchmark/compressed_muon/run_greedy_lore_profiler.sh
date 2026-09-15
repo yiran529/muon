@@ -26,6 +26,7 @@ greedy_lore_rank=32
 greedy_lore_update_interval=200
 greedy_lore_dense_aux_communication_dtype="bucket"
 greedy_lore_compress_embedding_lm_head=0
+greedy_lore_isolate_dense_aux_buckets=0
 gpu_list=""
 exclude_gpus=""
 artifact_root=""
@@ -54,6 +55,7 @@ while (($#)); do
         --greedy-lore-update-interval) greedy_lore_update_interval="$2"; shift 2 ;;
         --greedy-lore-dense-aux-communication-dtype) greedy_lore_dense_aux_communication_dtype="$2"; shift 2 ;;
         --greedy-lore-compress-embedding-lm-head) greedy_lore_compress_embedding_lm_head=1; shift ;;
+        --greedy-lore-isolate-dense-aux-buckets) greedy_lore_isolate_dense_aux_buckets=1; shift ;;
         --gpu-list) gpu_list="$2"; shift 2 ;;
         --exclude-gpus) exclude_gpus="$2"; shift 2 ;;
         --artifact-root) artifact_root="$2"; shift 2 ;;
@@ -96,6 +98,10 @@ case "$model_dtype" in
     float32|bfloat16) ;;
     *) printf 'invalid model dtype: %s\n' "$model_dtype" >&2; exit 64 ;;
 esac
+if ((greedy_lore_compress_embedding_lm_head && greedy_lore_isolate_dense_aux_buckets)); then
+    printf 'embedding/lm-head compression and dense auxiliary bucket isolation are mutually exclusive\n' >&2
+    exit 64
+fi
 if [[ "$profile_modes_csv" == "none" ]]; then
     profile_modes=()
 else
@@ -145,6 +151,7 @@ print_plan() {
     TIMING_NI="$timing_num_iterations" BUCKET="$bucket_cap_mb" REPS="$repeats" GL_RANK="$greedy_lore_rank" \
     GL_INTERVAL="$greedy_lore_update_interval" GL_DENSE_AUX_DTYPE="$greedy_lore_dense_aux_communication_dtype" \
     GL_COMPRESS_EMBEDDING_LM_HEAD="$greedy_lore_compress_embedding_lm_head" \
+    GL_ISOLATE_DENSE_AUX_BUCKETS="$greedy_lore_isolate_dense_aux_buckets" \
     GPU_LIST_VALUE="${gpu_list:-dynamic}" EXCLUDED="$exclude_gpus" \
     PROFILE_MODES="$profile_modes_csv" TIMING_MODES="$timing_modes_csv" \
     ROOT="$artifact_root" "$python_bin" - <<'PY'
@@ -197,6 +204,7 @@ print(json.dumps({
         "update_interval": int(os.environ["GL_INTERVAL"]),
         "dense_aux_communication_dtype": os.environ["GL_DENSE_AUX_DTYPE"],
         "compress_embedding_lm_head": bool(int(os.environ["GL_COMPRESS_EMBEDDING_LM_HEAD"])),
+        "isolate_dense_aux_buckets": bool(int(os.environ["GL_ISOLATE_DENSE_AUX_BUCKETS"])),
         "start_compress_step": int(os.environ["WARMUP"]),
         "refresh_profile_step": int(os.environ["REFRESH"]),
         "compressed_profile_step": int(os.environ["COMPRESSED"]),
@@ -315,6 +323,9 @@ run_cell() {
             --greedy_lore_dense_aux_communication_dtype "$greedy_lore_dense_aux_communication_dtype")
         if ((greedy_lore_compress_embedding_lm_head)); then
             command+=(--greedy_lore_compress_embedding_lm_head)
+        fi
+        if ((greedy_lore_isolate_dense_aux_buckets)); then
+            command+=(--greedy_lore_isolate_dense_aux_buckets)
         fi
         if [[ "$mode_name" == "greedylore_broadcast" ]]; then
             command+=(--greedy_lore_basis_sync broadcast)

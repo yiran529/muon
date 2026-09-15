@@ -14,7 +14,7 @@ rank-local accumulated gradient
 
 因此 M002 是新的近似 Muon 变体，不是 dense Muon 的等价通信实现。GreedyLore 论文对 MSGD/Adam 的收敛分析不会自动迁移到 Muon：Muon 在动量之后应用非线性正交化，通常有 `Ortho(Average(G)) != Average(Ortho(G))`。在完成专门理论之前，不宣称 M002 具有论文给出的收敛保证。
 
-首版只支持固定 process group 的 DDP、`find_unused_parameters=False`、FP32 Muon 矩阵 bucket 和同构软件/硬件栈。FSDP/HSDP、DDP join、unused parameters、动态参数组、world-size-changing resume、三维 matrix batch、AMP GradScaler skip/retry 与异构 accelerator stack 不在范围内。默认矩阵资格由 `train.build_muon_param_groups()` 的第一个 Muon group 决定；启用 `greedy_lore_compress_embedding_lm_head` 后，二维 embedding 与 lm-head 同时加入通信压缩集合，但继续由原 AdamW 参数组更新。其他 auxiliary 参数保持 exact dense sync。
+首版只支持固定 process group 的 DDP、`find_unused_parameters=False`、FP32 Muon 矩阵 bucket 和同构软件/硬件栈。FSDP/HSDP、DDP join、unused parameters、动态参数组、world-size-changing resume、三维 matrix batch、AMP GradScaler skip/retry 与异构 accelerator stack 不在范围内。默认矩阵资格由 `train.build_muon_param_groups()` 的第一个 Muon group 决定；启用 `greedy_lore_compress_embedding_lm_head` 后，二维 embedding 与 lm-head 同时加入通信压缩集合，但继续由原 AdamW 参数组更新。其他 auxiliary 参数保持 exact dense sync。作为互斥的性能实验选项，`greedy_lore_isolate_dense_aux_buckets` 保持 embedding/lm-head dense，只通过 role-aligned DDP bucket caps 将它们与 Transformer block 分开。
 
 ## 算法状态与通信
 
@@ -32,6 +32,8 @@ matrix factors All-Reduce
 ```
 
 Muon 自身的 result communication 未修改，并与 GreedyLore gradient collectives 分开归因。
+
+可选的 dense auxiliary bucket isolation 不修改模型注册树、参数名、forward、optimizer param group 或压缩公式。它利用 PyTorch 2.11 DDP 的 `bucket_cap_mb_list`，按 steady-state backward ready 顺序构造“lm-head 精确字节数、若干反向 Transformer block 组的精确字节数、embedding 精确字节数”的 cap 序列；block 只在层边界处分组，目标大小由普通 `bucket_cap_mb` 给出。这样 DDP rebuild 后能把两个大 auxiliary 参数放入 dense-only bucket。低版本 PyTorch 或 GPT 参数注册顺序不再是 embedding、blocks、lm-head 时，实现会给出明确错误并 fail closed；实际 profiler metadata 同时记录每个 bucket 的稳定参数名和通信角色，供运行后审计。
 
 ## local-SVD 与 broadcast
 

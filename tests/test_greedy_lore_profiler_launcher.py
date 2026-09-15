@@ -57,6 +57,7 @@ def test_print_plan_rotates_greedylore_modes_and_parameterizes_resources(tmp_pat
         "update_interval": 4,
         "dense_aux_communication_dtype": "bucket",
         "compress_embedding_lm_head": False,
+        "isolate_dense_aux_buckets": False,
         "start_compress_step": 5,
         "refresh_profile_step": 5,
         "compressed_profile_step": 6,
@@ -87,6 +88,22 @@ def test_print_plan_rotates_greedylore_modes_and_parameterizes_resources(tmp_pat
         "dense-timing-r2",
     ]
     assert "CUDA_VISIBLE_DEVICES=0" not in json.dumps(plan)
+
+
+def test_print_plan_enables_dense_aux_bucket_isolation():
+    plan = json.loads(
+        _plan(
+            "--world-size",
+            "1",
+            "--global-batch-size",
+            "1",
+            "--device-batch-size",
+            "1",
+            "--greedy-lore-isolate-dense-aux-buckets",
+        ).stdout
+    )
+
+    assert plan["greedy_lore"]["isolate_dense_aux_buckets"] is True
 
 
 def test_print_plan_profiles_exact_refresh_then_nonrefresh_lifecycle_step():

@@ -222,6 +222,9 @@ def _bucket_profile_metadata(state: "GreedyLoreDDPState", context: "BucketContex
         "float32": torch.empty((), dtype=torch.float32).element_size(),
         "bfloat16": torch.empty((), dtype=torch.bfloat16).element_size(),
     }[state.config.dense_aux_communication_dtype]
+    bucket_specs = [
+        state._specs_by_parameter[id(parameter)] for parameter in context.parameters
+    ]
     return {
         "bucket_bytes": _tensor_bytes(context.buffer),
         "matrix_bytes": matrix_bytes,
@@ -234,6 +237,8 @@ def _bucket_profile_metadata(state: "GreedyLoreDDPState", context: "BucketContex
         ),
         "basis_bytes": basis_bytes,
         "parameter_count": len(context.parameters),
+        "parameter_names": ",".join(spec.stable_name for spec in bucket_specs),
+        "parameter_roles": ",".join(spec.role for spec in bucket_specs),
         "phase": phase,
     }
 

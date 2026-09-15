@@ -475,6 +475,8 @@ def test_compressed_mixed_bucket_metadata_includes_aux_and_signed_scores():
     # Two dense auxiliary values plus one signed score per matrix row.
     assert metadata["score_bytes"] == 16
     assert metadata["factor_bytes"] == 12
+    assert metadata["parameter_names"] == "matrix,dense"
+    assert metadata["parameter_roles"] == "matrix,dense_aux"
 
 
 def test_dense_only_compressed_bucket_launches_one_dense_reduction_and_stops(monkeypatch):

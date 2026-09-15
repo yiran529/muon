@@ -59,6 +59,34 @@ class _FormalLoopModel(_StubModel):
         return matrix + auxiliary * 0.0
 
 
+class _BucketLayoutModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.transformer = torch.nn.ModuleDict(
+            {
+                "wte": torch.nn.Embedding(16, 8),
+                "h": torch.nn.ModuleList(
+                    [
+                        torch.nn.Sequential(
+                            torch.nn.Linear(8, 8, bias=False),
+                            torch.nn.Linear(8, 8, bias=False),
+                            torch.nn.Linear(8, 8, bias=False),
+                        ),
+                        torch.nn.Linear(8, 8, bias=False),
+                        torch.nn.Linear(8, 8, bias=False),
+                    ]
+                ),
+            }
+        )
+        self.lm_head = torch.nn.Linear(8, 16, bias=False)
+
+    def forward(self, tokens):
+        hidden = self.transformer.wte(tokens)
+        for block in self.transformer.h:
+            hidden = block(hidden)
+        return self.lm_head(hidden).sum()
+
+
 def _cli(**overrides):
     values = dict(
         use_gram_newton_schulz=False,
@@ -68,6 +96,152 @@ def _cli(**overrides):
     )
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def test_dense_aux_bucket_caps_isolate_aux_and_pack_whole_blocks_without_mutation():
+    module = _module()
+    model = _BucketLayoutModel()
+    names_before = [name for name, _parameter in model.named_parameters()]
+    ids_before = [id(parameter) for parameter in model.parameters()]
+
+    caps = module.build_isolated_dense_aux_bucket_cap_mb_list(
+        model,
+        target_cap_mb=0.00075,
+    )
+
+    mib = 1024 * 1024
+    assert caps == pytest.approx([512 / mib, 512 / mib, 768 / mib, 512 / mib])
+    assert [name for name, _parameter in model.named_parameters()] == names_before
+    assert [id(parameter) for parameter in model.parameters()] == ids_before
+
+
+def test_dense_aux_bucket_layout_ddp_kwargs_are_opt_in_and_use_cli_target():
+    module = _module()
+    model = _BucketLayoutModel()
+    hp = module.GreedyLoreHyperparameters(
+        greedy_lore_isolate_dense_aux_buckets=True,
+    )
+
+    kwargs = module.greedy_lore_ddp_kwargs(
+        model,
+        hp,
+        _cli(bucket_cap_mb=0.00075),
+    )
+
+    mib = 1024 * 1024
+    assert kwargs == {
+        "bucket_cap_mb_list": pytest.approx(
+            [512 / mib, 512 / mib, 768 / mib, 512 / mib]
+        )
+    }
+    assert (
+        module.greedy_lore_ddp_kwargs(
+            model,
+            module.GreedyLoreHyperparameters(),
+            _cli(bucket_cap_mb=0.00075),
+        )
+        == {}
+    )
+
+
+def test_dense_aux_bucket_layout_rejects_compressed_embedding_and_head():
+    module = _module()
+    hp = module.GreedyLoreHyperparameters(
+        greedy_lore_isolate_dense_aux_buckets=True,
+        greedy_lore_compress_embedding_lm_head=True,
+    )
+
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        module.validate_greedy_lore_hyperparameters(hp)
+
+
+def test_dense_aux_bucket_layout_fails_closed_without_ddp_cap_list_support():
+    module = _module()
+
+    class LegacyDDP:
+        def __init__(self, model, bucket_cap_mb=None):
+            pass
+
+    with pytest.raises(RuntimeError, match="requires PyTorch DDP support"):
+        module.require_ddp_bucket_cap_mb_list_support(LegacyDDP)
+
+
+def _bucket_layout_hook(state, bucket):
+    state["current"].append(
+        [state["names"][id(parameter)] for parameter in bucket.parameters()]
+    )
+    future = dist.all_reduce(bucket.buffer(), async_op=True).get_future()
+
+    def average(_completed):
+        bucket.buffer().div_(state["world_size"])
+        return bucket.buffer()
+
+    return future.then(average)
+
+
+def _bucket_layout_worker(rank, world_size, port, output_dir):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    try:
+        module = _module()
+        model = _BucketLayoutModel()
+        caps = module.build_isolated_dense_aux_bucket_cap_mb_list(
+            model,
+            target_cap_mb=0.00075,
+        )
+        ddp = DDP(model, bucket_cap_mb_list=caps)
+        state = {
+            "current": [],
+            "names": {
+                id(parameter): name for name, parameter in model.named_parameters()
+            },
+            "world_size": world_size,
+        }
+        ddp.register_comm_hook(state, _bucket_layout_hook)
+        iterations = []
+        tokens = torch.tensor([[1, 2]])
+        for _step in range(3):
+            state["current"] = []
+            ddp(tokens).backward()
+            iterations.append(state["current"])
+            ddp.zero_grad(set_to_none=True)
+        Path(output_dir, f"bucket-layout-rank-{rank}.json").write_text(
+            json.dumps(iterations)
+        )
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_real_ddp_rebuild_keeps_embedding_and_head_in_dense_only_buckets():
+    with tempfile.TemporaryDirectory(prefix="greedylore-bucket-layout-") as output_dir:
+        mp.spawn(
+            _bucket_layout_worker,
+            args=(2, _free_port(), output_dir),
+            nprocs=2,
+            join=True,
+        )
+        results = [
+            json.loads(Path(output_dir, f"bucket-layout-rank-{rank}.json").read_text())
+            for rank in range(2)
+        ]
+
+    expected = [
+        ["lm_head.weight"],
+        ["transformer.h.2.weight", "transformer.h.1.weight"],
+        [
+            "transformer.h.0.2.weight",
+            "transformer.h.0.1.weight",
+            "transformer.h.0.0.weight",
+        ],
+        ["transformer.wte.weight"],
+    ]
+    assert results[0] == results[1]
+    assert results[0][1] == expected
+    assert results[0][2] == expected
 
 
 def test_factory_builds_ordinary_muon_with_one_greedylore_hook_and_muon_group_roles():

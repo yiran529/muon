@@ -629,6 +629,29 @@ def build_muon_param_groups(model: GPT, hp: Hyperparameters) -> list[dict]:
     ]
 
 
+def build_ddp_kwargs(
+    model: GPT,
+    hp: Hyperparameters,
+    cli_args: argparse.Namespace,
+    *,
+    local_rank: int,
+    ddp_kwargs_factory: Optional[
+        Callable[[GPT, Hyperparameters, argparse.Namespace], Mapping[str, Any]]
+    ] = None,
+) -> dict[str, Any]:
+    """Build shared DDP arguments with an optional entry-specific extension."""
+
+    kwargs: dict[str, Any] = {
+        "device_ids": [local_rank],
+        "output_device": local_rank,
+    }
+    if cli_args.bucket_cap_mb is not None:
+        kwargs["bucket_cap_mb"] = cli_args.bucket_cap_mb
+    if ddp_kwargs_factory is not None:
+        kwargs.update(ddp_kwargs_factory(model, hp, cli_args))
+    return kwargs
+
+
 def init_optimizer(
     model: GPT,
     device_mesh: Optional[DeviceMesh],
@@ -1034,6 +1057,7 @@ def main(
     optimizer_factory=init_optimizer,
     configure_parser=None,
     validate_hyperparameters=None,
+    ddp_kwargs_factory=None,
 ):
     torch._dynamo.config.cache_size_limit = 100
     # --- Parse command line arguments and set hyperparams ---
@@ -1176,9 +1200,13 @@ def main(
         # Use LOCAL_RANK here (per-node GPU index)
         # This ensures each process is pinned to the correct local GPU
         local_rank = int(os.environ["LOCAL_RANK"])
-        ddp_kwargs = dict(device_ids=[local_rank], output_device=local_rank)
-        if cli_args.bucket_cap_mb is not None:
-            ddp_kwargs["bucket_cap_mb"] = cli_args.bucket_cap_mb
+        ddp_kwargs = build_ddp_kwargs(
+            model,
+            hp,
+            cli_args,
+            local_rank=local_rank,
+            ddp_kwargs_factory=ddp_kwargs_factory,
+        )
         model = DDP(model, **ddp_kwargs)
         raw_model = model.module  # the underlying model
 

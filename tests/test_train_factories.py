@@ -43,6 +43,35 @@ def test_main_exposes_defaulted_factories():
     )
     assert signature.parameters["optimizer_factory"].default is train.init_optimizer
     assert signature.parameters["configure_parser"].default is None
+    assert signature.parameters["ddp_kwargs_factory"].default is None
+
+
+def test_build_ddp_kwargs_combines_standard_and_entry_specific_settings():
+    train = _import_train()
+    model = _StubModel()
+    hp = train.Hyperparameters()
+    cli_args = type("Args", (), {"bucket_cap_mb": 64.0})()
+    calls = []
+
+    def extension(current_model, current_hp, current_cli_args):
+        calls.append((current_model, current_hp, current_cli_args))
+        return {"bucket_cap_mb_list": [1.0, 2.0, 3.0]}
+
+    kwargs = train.build_ddp_kwargs(
+        model,
+        hp,
+        cli_args,
+        local_rank=3,
+        ddp_kwargs_factory=extension,
+    )
+
+    assert calls == [(model, hp, cli_args)]
+    assert kwargs == {
+        "device_ids": [3],
+        "output_device": 3,
+        "bucket_cap_mb": 64.0,
+        "bucket_cap_mb_list": [1.0, 2.0, 3.0],
+    }
 
 
 class _StubModel(torch.nn.Module):

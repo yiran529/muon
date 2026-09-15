@@ -800,3 +800,20 @@ M002 both 的 CV 为 `0.462%`，dense CV 为 `1.244%`，paired mean-difference i
 因此本方向在 rank32 下分类为 **quality-negative 且无同期 wall-clock 收益**，不应原样扩展到130M完整训练。若继续研究，应先 profile 两个宽矩阵的 score与重建计算，并提高 embedding/head rank或减少其压缩频率后做短质量筛选。
 
 原始产物：`artifacts/compressed_muon/CM075-m002-greedylore-both-gpt60m-bf16-ddp-ws4-s1234/`。
+
+## CM076：M002 dense auxiliary bucket 隔离 timing（2026-09-15）
+
+保持 embedding 与 lm-head 为 dense 同步，仅启用 `greedy_lore_isolate_dense_aux_buckets`，将两个 dense auxiliary 参数与 Transformer block 的压缩通信 bucket 物理隔离。测速复用 CM074 的 GPT-130M BF16/GA1 口径：4-rank DDP、GPU 2–5、seq256、global/device batch512/128、bucket80 MiB、rank32、interval200、local-SVD、seed42；计划进行3组 rotated dense/M002 pairing，每 cell 为20 warmup + 800 measured updates。
+
+前两组配对完整成功，第三组 dense 成功，但对应 M002 cell 在首次 compiled forward 时因 GPU 2 外部进程占用导致 OOM。因此实验为5/6 cells exit `0`，没有生成正式 `summary.json`；第三个 dense 样本不能与缺失的 M002 r3 配对。不过，两组实验可信度还是比较高的。
+
+| repeat | dense step | bucket 隔离 M002 step | M002−dense |
+|---|---:|---:|---:|
+| r1 | 199.03 ms | 203.77 ms | +4.74 ms (+2.38%) |
+| r2 | 200.36 ms | 203.08 ms | +2.72 ms (+1.36%) |
+| r3 | 200.17 ms | OOM | — |
+| **有效配对 mean（r1–r2）** | **199.695 ms** | **203.425 ms** | **+3.730 ms (+1.87%)** |
+
+OOM 发生时 rank0 还需分配 `3.07 GiB`，但物理 GPU 仅余 `2.14 GiB`；同一配置此前两个 M002 cell 均完整运行，且失败后可见 GPU 2–4 已被其他任务占用，因此将 r3 归类为外部资源争用，而非 bucket 隔离路径的确定性容量失败。
+
+当前两组同期有效配对方向均为负，说明 **dense auxiliary bucket 隔离没有展现端到端加速，阶段性平均慢 `1.87%`**。由于缺少第三组配对且无正式汇总，这一结果记为 `partial/negative`，不计算三重复区间，也不把 r3 dense 纳入均值。原始产物：`artifacts/compressed_muon/CM076-m002-greedylore-dense-aux-isolation-gpt130m-bf16-timing-ws4-s42/`。
