@@ -4,6 +4,7 @@ import json
 import threading
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
 from urllib.parse import quote
 
@@ -273,6 +274,10 @@ class GreedyLoreDDPState:
         optimizer_parameters: Sequence[Parameter],
         config: GreedyLoreConfig,
         find_unused_parameters: bool = False,
+        bucket_layout_output_dir: str | None = None,
+        bucket_layout_capture_step: int | None = None,
+        require_role_aligned_buckets: bool = False,
+        required_bucket_count: int | None = None,
     ) -> None:
         if find_unused_parameters:
             raise ValueError(
@@ -284,6 +289,12 @@ class GreedyLoreDDPState:
                     "an optimizer parameter is absent from the model parameter table"
                 )
             raise ValueError("GreedyLore DDP hook requires at least one parameter spec")
+        if bucket_layout_capture_step is not None and bucket_layout_capture_step < 1:
+            raise ValueError("bucket layout capture step must be positive")
+        if bucket_layout_capture_step is not None and not bucket_layout_output_dir:
+            raise ValueError("bucket layout capture requires an output directory")
+        if required_bucket_count is not None and required_bucket_count < 1:
+            raise ValueError("required bucket count must be positive")
 
         stable_names = [spec.stable_name for spec in parameter_specs]
         stable_ids = [spec.stable_id for spec in parameter_specs]
@@ -334,6 +345,10 @@ class GreedyLoreDDPState:
         self.fingerprint = fingerprint
         self.config = config
         self.parameter_specs = tuple(parameter_specs)
+        self.bucket_layout_output_dir = bucket_layout_output_dir
+        self.bucket_layout_capture_step = bucket_layout_capture_step
+        self.require_role_aligned_buckets = require_role_aligned_buckets
+        self.required_bucket_count = required_bucket_count
         self.world_size = (
             dist.get_world_size(process_group) if process_group is not None else 1
         )
@@ -380,6 +395,7 @@ class GreedyLoreDDPState:
         self._active_step: int | None = None
         self._finished_step = False
         self._seen_parameter_ids: set[int] = set()
+        self._current_bucket_layout: list[dict[str, Any]] = []
         self._active_contexts: dict[int, BucketContext] = {}
         self._next_context_id = 0
         self._context_lock = threading.Lock()
@@ -561,7 +577,82 @@ class GreedyLoreDDPState:
         self._active_step = self.committed_step + 1
         self._finished_step = False
         self._seen_parameter_ids.clear()
+        self._current_bucket_layout.clear()
         return self._active_step
+
+    def _record_bucket_layout(self, context: BucketContext) -> None:
+        specs = [self._specs_by_parameter[id(parameter)] for parameter in context.parameters]
+        self._current_bucket_layout.append(
+            {
+                "bucket_index": context.bucket_index,
+                "bucket_bytes": _tensor_bytes(context.buffer),
+                "parameters": [
+                    {
+                        "stable_name": spec.stable_name,
+                        "role": spec.role,
+                        "bytes": _tensor_bytes(spec.parameter),
+                    }
+                    for spec in specs
+                ],
+            }
+        )
+
+    def _validate_role_aligned_bucket_layout(self) -> None:
+        if self.required_bucket_count is not None and (
+            len(self._current_bucket_layout) != self.required_bucket_count
+        ):
+            raise GreedyLoreStateError(
+                "GreedyLore role-aligned DDP bucket count mismatch: "
+                f"expected {self.required_bucket_count}, got "
+                f"{len(self._current_bucket_layout)}"
+            )
+        dense_names = set()
+        for bucket in self._current_bucket_layout:
+            parameters = bucket["parameters"]
+            roles = {parameter["role"] for parameter in parameters}
+            if len(roles) != 1:
+                names = ", ".join(parameter["stable_name"] for parameter in parameters)
+                raise GreedyLoreStateError(
+                    "GreedyLore role-aligned DDP bucket validation found a mixed "
+                    f"bucket: {names}"
+                )
+            if roles == {"dense_aux"}:
+                if len(parameters) != 1:
+                    names = ", ".join(
+                        parameter["stable_name"] for parameter in parameters
+                    )
+                    raise GreedyLoreStateError(
+                        "GreedyLore dense auxiliary parameters must be isolated into "
+                        f"singleton buckets, got: {names}"
+                    )
+                dense_names.add(parameters[0]["stable_name"])
+        expected_dense_names = {
+            spec.stable_name for spec in self.parameter_specs if spec.role == "dense_aux"
+        }
+        if dense_names != expected_dense_names:
+            raise GreedyLoreStateError(
+                "GreedyLore role-aligned DDP bucket validation did not observe all "
+                "dense auxiliary parameters"
+            )
+
+    def _write_bucket_layout(self) -> None:
+        assert self._active_step is not None
+        assert self.bucket_layout_output_dir is not None
+        output_dir = Path(self.bucket_layout_output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "rank": self.global_rank,
+            "step": self._active_step,
+            "buckets": self._current_bucket_layout,
+        }
+        output_path = output_dir / (
+            f"rank-{self.global_rank}-step-{self._active_step}.json"
+        )
+        output_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
     def parameter_state(self, parameter: Parameter) -> GreedyLoreParameterState:
         try:
@@ -663,6 +754,7 @@ class GreedyLoreDDPState:
             collective_completion_future=collective_completion_future,
             completion_future=completion_future,
         )
+        self._record_bucket_layout(context)
         with self._context_lock:
             self._active_contexts[context_id] = context
             self.tail_future = _join_completion_futures(
@@ -696,6 +788,12 @@ class GreedyLoreDDPState:
         if not self.tail_future.done():
             raise GreedyLoreStateError("GreedyLore bucket tail is still in flight")
         self.tail_future.value()
+        # DDP's first iteration intentionally uses its construction-time bucket;
+        # role alignment is meaningful only after the reducer has rebuilt once.
+        if self.require_role_aligned_buckets and self._active_step >= 2:
+            self._validate_role_aligned_bucket_layout()
+        if self.bucket_layout_capture_step == self._active_step:
+            self._write_bucket_layout()
         self._finished_step = True
 
     def commit_step(self) -> None:
@@ -942,7 +1040,21 @@ def enqueue_bucket_chain(
         except BaseException as exc:
             destination.set_exception(exc)
 
-    context.previous_tail.add_done_callback(after_previous)
+    with _profile_marker(
+        "greedylore_hook/chain_wait_begin",
+        **_bucket_profile_identity(context),
+    ):
+        pass
+
+    def after_previous_profiled(previous: torch.futures.Future) -> None:
+        with _profile_marker(
+            "greedylore_hook/chain_wait_end",
+            **_bucket_profile_identity(context),
+        ):
+            pass
+        after_previous(previous)
+
+    context.previous_tail.add_done_callback(after_previous_profiled)
     return destination
 
 
@@ -997,7 +1109,21 @@ def enqueue_collective_bucket_chain(
             if not context.collective_completion_future.done():
                 context.collective_completion_future.set_exception(exc)
 
-    context.previous_collective_tail.add_done_callback(after_previous)
+    with _profile_marker(
+        "greedylore_hook/chain_wait_begin",
+        **_bucket_profile_identity(context),
+    ):
+        pass
+
+    def after_previous_profiled(previous: torch.futures.Future) -> None:
+        with _profile_marker(
+            "greedylore_hook/chain_wait_end",
+            **_bucket_profile_identity(context),
+        ):
+            pass
+        after_previous(previous)
+
+    context.previous_collective_tail.add_done_callback(after_previous_profiled)
     return destination
 
 
@@ -1645,7 +1771,17 @@ def greedy_lore_ddp_hook(
         ), context)
     if _matrix_entries(context):
         try:
+            with _profile_marker(
+                "greedylore_hook/prepare_begin",
+                **_bucket_profile_identity(context),
+            ):
+                pass
             _prepare_compressed_bucket(state, context)
+            with _profile_marker(
+                "greedylore_hook/prepare_end",
+                **_bucket_profile_identity(context),
+            ):
+                pass
         except BaseException as exc:
             context.collective_completion_future.set_exception(exc)
             context.completion_future.set_exception(exc)

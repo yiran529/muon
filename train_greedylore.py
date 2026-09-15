@@ -68,6 +68,28 @@ def configure_greedy_lore_parser(parser: argparse.ArgumentParser) -> None:
             "from compressed Transformer blocks"
         ),
     )
+    parser.add_argument(
+        "--greedy-lore-bucket-cap-mb-list",
+        type=_parse_bucket_cap_mb_list,
+        default=None,
+        help="Comma-separated calibrated DDP bucket caps in reducer-ready order",
+    )
+    parser.add_argument(
+        "--greedy-lore-bucket-layout-output-dir",
+        default=None,
+        help="Write the observed per-rank reducer bucket layout as JSON",
+    )
+    parser.add_argument(
+        "--greedy-lore-bucket-layout-capture-step",
+        type=int,
+        default=None,
+        help="GreedyLore active step whose rebuilt bucket layout is written",
+    )
+    parser.add_argument(
+        "--greedy-lore-require-role-aligned-buckets",
+        action="store_true",
+        help="Fail after DDP rebuild if any bucket mixes matrix and dense auxiliary roles",
+    )
 
 
 def validate_greedy_lore_hyperparameters(hp: GreedyLoreHyperparameters) -> None:
@@ -92,6 +114,20 @@ def validate_greedy_lore_hyperparameters(hp: GreedyLoreHyperparameters) -> None:
 
 
 _MIB = 1024 * 1024
+
+
+def _parse_bucket_cap_mb_list(value: str) -> tuple[float, ...]:
+    try:
+        caps = tuple(float(item) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "bucket cap list must contain comma-separated numbers"
+        ) from exc
+    if not caps or any(not math.isfinite(cap) or cap <= 0 for cap in caps):
+        raise argparse.ArgumentTypeError(
+            "bucket cap list values must be finite and positive"
+        )
+    return caps
 
 
 def _parameter_bytes(parameters) -> int:
@@ -165,15 +201,19 @@ def greedy_lore_ddp_kwargs(model, hp, cli_args) -> dict:
     if not hp.greedy_lore_isolate_dense_aux_buckets:
         return {}
     require_ddp_bucket_cap_mb_list_support()
-    target_cap_mb = (
-        25.0
-        if getattr(cli_args, "bucket_cap_mb", None) is None
-        else cli_args.bucket_cap_mb
-    )
-    caps = build_isolated_dense_aux_bucket_cap_mb_list(
-        model,
-        target_cap_mb=target_cap_mb,
-    )
+    calibrated_caps = getattr(cli_args, "greedy_lore_bucket_cap_mb_list", None)
+    if calibrated_caps is None:
+        target_cap_mb = (
+            25.0
+            if getattr(cli_args, "bucket_cap_mb", None) is None
+            else cli_args.bucket_cap_mb
+        )
+        caps = build_isolated_dense_aux_bucket_cap_mb_list(
+            model,
+            target_cap_mb=target_cap_mb,
+        )
+    else:
+        caps = list(calibrated_caps)
     train.print0(f"GreedyLore DDP bucket caps (MiB): {caps}")
     return {"bucket_cap_mb_list": caps}
 
@@ -184,6 +224,7 @@ def _install_greedy_lore_ddp_hook(
     optimizer: torch.optim.Optimizer,
     hp: GreedyLoreHyperparameters,
     compressed_parameters: set[int],
+    cli_args: argparse.Namespace,
 ) -> train.GradientSyncRuntime:
     config = GreedyLoreConfig(
         rank=hp.greedy_lore_rank,
@@ -240,6 +281,20 @@ def _install_greedy_lore_ddp_hook(
             ddp_model,
             "find_unused_parameters",
             False,
+        ),
+        bucket_layout_output_dir=getattr(
+            cli_args, "greedy_lore_bucket_layout_output_dir", None
+        ),
+        bucket_layout_capture_step=getattr(
+            cli_args, "greedy_lore_bucket_layout_capture_step", None
+        ),
+        require_role_aligned_buckets=getattr(
+            cli_args, "greedy_lore_require_role_aligned_buckets", False
+        ),
+        required_bucket_count=(
+            len(cli_args.greedy_lore_bucket_cap_mb_list)
+            if getattr(cli_args, "greedy_lore_bucket_cap_mb_list", None) is not None
+            else None
         ),
     )
     ddp_model.register_comm_hook(state, greedy_lore_ddp_hook)
@@ -317,6 +372,7 @@ def init_greedy_lore_optimizer(
         optimizer,
         hp,
         compressed_parameters,
+        cli_args,
     )
     return optimizer, runtime
 

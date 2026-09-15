@@ -17,6 +17,7 @@ sequence_length=1024
 model_dtype="float32"
 timing_warmup_steps=20
 measured_full_periods=1
+profile_period=1
 bucket_cap_mb=160
 repeats=1
 profile_modes_csv="dense,greedylore_local_svd,greedylore_broadcast"
@@ -27,6 +28,7 @@ greedy_lore_update_interval=200
 greedy_lore_dense_aux_communication_dtype="bucket"
 greedy_lore_compress_embedding_lm_head=0
 greedy_lore_isolate_dense_aux_buckets=0
+greedy_lore_calibrated_bucket_cap_mb_list=""
 gpu_list=""
 exclude_gpus=""
 artifact_root=""
@@ -47,6 +49,7 @@ while (($#)); do
         --bucket-cap-mb) bucket_cap_mb="$2"; shift 2 ;;
         --timing-warmup-steps) timing_warmup_steps="$2"; shift 2 ;;
         --measured-full-periods) measured_full_periods="$2"; shift 2 ;;
+        --profile-period) profile_period="$2"; shift 2 ;;
         --repeats) repeats="$2"; shift 2 ;;
         --profile-modes) profile_modes_csv="$2"; shift 2 ;;
         --timing-modes) timing_modes_csv="$2"; shift 2 ;;
@@ -56,6 +59,7 @@ while (($#)); do
         --greedy-lore-dense-aux-communication-dtype) greedy_lore_dense_aux_communication_dtype="$2"; shift 2 ;;
         --greedy-lore-compress-embedding-lm-head) greedy_lore_compress_embedding_lm_head=1; shift ;;
         --greedy-lore-isolate-dense-aux-buckets) greedy_lore_isolate_dense_aux_buckets=1; shift ;;
+        --greedy-lore-calibrated-bucket-cap-mb-list) greedy_lore_calibrated_bucket_cap_mb_list="$2"; shift 2 ;;
         --gpu-list) gpu_list="$2"; shift 2 ;;
         --exclude-gpus) exclude_gpus="$2"; shift 2 ;;
         --artifact-root) artifact_root="$2"; shift 2 ;;
@@ -77,7 +81,7 @@ validate_modes() {
     IFS=',' read -ra values <<<"$raw"
     for value in "${values[@]}"; do
         case "$value" in
-            dense|greedylore_local_svd|greedylore_broadcast) ;;
+            dense|greedylore_local_svd|greedylore_broadcast|greedylore_local_svd_partial|greedylore_local_svd_full) ;;
             *) printf 'invalid %s mode: %s\n' "$label" "$value" >&2; return 64 ;;
         esac
         if [[ "$seen" == *",$value,"* ]]; then
@@ -118,13 +122,13 @@ if ((world_size < 1 || device_batch_size < 1 || global_batch_size % denominator 
     printf 'global batch must be divisible by world_size * device_batch_size\n' >&2
     exit 64
 fi
-if ((timing_warmup_steps < 1 || measured_full_periods < 1 || greedy_lore_update_interval < 2)); then
+if ((timing_warmup_steps < 1 || measured_full_periods < 1 || profile_period < 1 || greedy_lore_update_interval < 2)); then
     printf 'warmup, measured periods, and GreedyLore interval must be positive; interval must be at least 2\n' >&2
     exit 64
 fi
 grad_accum_steps=$((global_batch_size / denominator))
-refresh_profile_step="$timing_warmup_steps"
-compressed_profile_step=$((timing_warmup_steps + 1))
+refresh_profile_step=$((timing_warmup_steps + (profile_period - 1) * greedy_lore_update_interval))
+compressed_profile_step=$((refresh_profile_step + 1))
 timing_num_iterations=$((timing_warmup_steps + measured_full_periods * greedy_lore_update_interval))
 val_tokens=$((world_size * device_batch_size * sequence_length))
 artifact_root="${artifact_root:-$repo_dir/artifacts/compressed_muon/CM-greedylore-profiler-ws${world_size}}"
@@ -147,11 +151,12 @@ fi
 print_plan() {
     WS="$world_size" GBS="$global_batch_size" DBS="$device_batch_size" GA="$grad_accum_steps" \
     MD="$model_dim" NL="$layers" NH="$heads" SEQ="$sequence_length" MODEL_DTYPE="$model_dtype" REFRESH="$refresh_profile_step" \
-    COMPRESSED="$compressed_profile_step" WARMUP="$timing_warmup_steps" PERIODS="$measured_full_periods" \
+    COMPRESSED="$compressed_profile_step" WARMUP="$timing_warmup_steps" PERIODS="$measured_full_periods" PROFILE_PERIOD="$profile_period" \
     TIMING_NI="$timing_num_iterations" BUCKET="$bucket_cap_mb" REPS="$repeats" GL_RANK="$greedy_lore_rank" \
     GL_INTERVAL="$greedy_lore_update_interval" GL_DENSE_AUX_DTYPE="$greedy_lore_dense_aux_communication_dtype" \
     GL_COMPRESS_EMBEDDING_LM_HEAD="$greedy_lore_compress_embedding_lm_head" \
     GL_ISOLATE_DENSE_AUX_BUCKETS="$greedy_lore_isolate_dense_aux_buckets" \
+    GL_CALIBRATED_BUCKET_CAPS="$greedy_lore_calibrated_bucket_cap_mb_list" \
     GPU_LIST_VALUE="${gpu_list:-dynamic}" EXCLUDED="$exclude_gpus" \
     PROFILE_MODES="$profile_modes_csv" TIMING_MODES="$timing_modes_csv" \
     ROOT="$artifact_root" "$python_bin" - <<'PY'
@@ -196,6 +201,7 @@ print(json.dumps({
     "bucket_cap_mb": float(os.environ["BUCKET"]),
     "timing_warmup_steps": int(os.environ["WARMUP"]),
     "measured_full_periods": int(os.environ["PERIODS"]),
+    "profile_period": int(os.environ["PROFILE_PERIOD"]),
     "timing_num_iterations": int(os.environ["TIMING_NI"]),
     "profile_modes": list(profile_modes),
     "timing_modes": list(timing_modes),
@@ -205,6 +211,10 @@ print(json.dumps({
         "dense_aux_communication_dtype": os.environ["GL_DENSE_AUX_DTYPE"],
         "compress_embedding_lm_head": bool(int(os.environ["GL_COMPRESS_EMBEDDING_LM_HEAD"])),
         "isolate_dense_aux_buckets": bool(int(os.environ["GL_ISOLATE_DENSE_AUX_BUCKETS"])),
+        "calibrated_bucket_cap_mb_list": (
+            [float(value) for value in os.environ["GL_CALIBRATED_BUCKET_CAPS"].split(",")]
+            if os.environ["GL_CALIBRATED_BUCKET_CAPS"] else None
+        ),
         "start_compress_step": int(os.environ["WARMUP"]),
         "refresh_profile_step": int(os.environ["REFRESH"]),
         "compressed_profile_step": int(os.environ["COMPRESSED"]),
@@ -324,7 +334,17 @@ run_cell() {
         if ((greedy_lore_compress_embedding_lm_head)); then
             command+=(--greedy_lore_compress_embedding_lm_head)
         fi
-        if ((greedy_lore_isolate_dense_aux_buckets)); then
+        if [[ "$mode_name" == "greedylore_local_svd_partial" ]]; then
+            command+=(--greedy_lore_isolate_dense_aux_buckets)
+        elif [[ "$mode_name" == "greedylore_local_svd_full" ]]; then
+            [[ -n "$greedy_lore_calibrated_bucket_cap_mb_list" ]] || {
+                log "BLOCKED missing_calibrated_bucket_caps cell=$cell"
+                return 64
+            }
+            command+=(--greedy_lore_isolate_dense_aux_buckets
+                --greedy-lore-bucket-cap-mb-list "$greedy_lore_calibrated_bucket_cap_mb_list"
+                --greedy-lore-require-role-aligned-buckets)
+        elif ((greedy_lore_isolate_dense_aux_buckets)); then
             command+=(--greedy_lore_isolate_dense_aux_buckets)
         fi
         if [[ "$mode_name" == "greedylore_broadcast" ]]; then

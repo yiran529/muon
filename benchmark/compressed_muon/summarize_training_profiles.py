@@ -183,6 +183,21 @@ def _timing_summary_from_records(plan: dict, records: list[dict]) -> dict:
         for mode, mode_summary in modes.items()
     }
     preferred_pairs = [
+        (
+            "greedylore_local_svd_full",
+            "dense",
+            "full_isolation_vs_dense",
+        ),
+        (
+            "greedylore_local_svd_partial",
+            "dense",
+            "partial_isolation_vs_dense",
+        ),
+        (
+            "greedylore_local_svd_full",
+            "greedylore_local_svd_partial",
+            "full_vs_partial_isolation",
+        ),
         ("greedylore_local_svd", "dense", "local_svd_vs_dense"),
         ("greedylore_broadcast", "dense", "broadcast_vs_dense"),
         (
@@ -361,6 +376,16 @@ def summarize_profile_root(artifact_root: Path, *, require_plan: bool = False) -
             "rank_max_collective_time_ms": rank_max_collectives,
             "rank_max_nccl_union_time_ms": max(item["nccl_union_time_ms"] for item in traces),
             "rank_max_exposed_nccl_time_ms": max(item["exposed_nccl_time_ms"] for item in traces),
+            "rank_max_greedylore_local_gpu_union_ms": max(
+                item["greedylore_local_gpu_union_ms"] for item in traces
+            ),
+            "rank_max_greedylore_local_backward_compute_overlap_ms": max(
+                item["greedylore_local_backward_compute_overlap_ms"]
+                for item in traces
+            ),
+            "rank_max_exposed_greedylore_local_gpu_ms": max(
+                item["exposed_greedylore_local_gpu_ms"] for item in traces
+            ),
             "rank_max_arc_collective_backward_compute_overlap_ms": max(
                 item["arc_collective_backward_compute_overlap_ms"] for item in traces
             ),
@@ -388,6 +413,18 @@ def summarize_profile_root(artifact_root: Path, *, require_plan: bool = False) -
             ),
             "mean_rank_max_exposed_nccl_time_ms": statistics.mean(
                 cell["rank_max_exposed_nccl_time_ms"] for cell in mode_cells
+            ),
+            "mean_rank_max_greedylore_local_gpu_union_ms": statistics.mean(
+                cell["rank_max_greedylore_local_gpu_union_ms"]
+                for cell in mode_cells
+            ),
+            "mean_rank_max_greedylore_local_backward_compute_overlap_ms": statistics.mean(
+                cell["rank_max_greedylore_local_backward_compute_overlap_ms"]
+                for cell in mode_cells
+            ),
+            "mean_rank_max_exposed_greedylore_local_gpu_ms": statistics.mean(
+                cell["rank_max_exposed_greedylore_local_gpu_ms"]
+                for cell in mode_cells
             ),
             "mean_rank_max_arc_collective_backward_compute_overlap_ms": statistics.mean(
                 cell["rank_max_arc_collective_backward_compute_overlap_ms"]

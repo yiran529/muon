@@ -851,3 +851,47 @@ refresh trace 中 M002 profile window/exposed NCCL/local-SVD GPU/critical-path t
 本轮另有首调用限制：压缩从 step20 启动，采样的 refresh/ordinary 正好是 step20/21，即第一次 refresh 和第一次 ordinary compressed 分支；rank0 的首个 score/Top-r CPU range 分别达到约 `87.8/49.0 ms`，明显带有初始化或 profiler 冷启动污染。因此 bucket composition 可作为可靠结构证据，但上述时间分解只作定性诊断。后续 profile 应采第二周期的 step220/221，或先分别预热多次 refresh/ordinary 分支。
 
 结论为 **completed/diagnostic**：CM076 的负结果与实际仅 partial isolation、dense payload 未完全移出压缩 bucket，以及有限 exposed communication 节省可能被 ordinary 本地工作和 refresh 成本抵消这一解释一致，但当前首调用 trace 不能完成定量归因。下一步先把 profile 移至第二个压缩周期，并增加 prepare begin/end 与 chain-wait 标记；再依据真实 reducer 顺序修正 cap 构造，以 compiled GPU trace 验证四桶布局，最后做 dense/current-partial/fixed-full 三臂 rotated profiler-off timing。原始产物：`artifacts/compressed_muon/CM077-m002-gpt130m-bf16-dense-aux-isolation-targeted-profile-ws4-s42/`。
+
+## CM078：M002 calibrated full isolation timing 与稳态 profile（2026-09-15）
+
+复用 CM076/CM077 的 GPT-130M BF16/GA1、GPU 2–5、seq256、global/device batch512/128、bucket80 MiB、rank32、interval200、local-SVD、seed42 口径。实验先在 compiled step2 捕获四个 rank 一致的真实 reducer-ready 参数顺序，再生成 role-aligned cap `[73.6875, 78.75, 29.25, 73.6875] MiB`；预期布局依次为 lm-head dense-only、两个 matrix-only bucket、embedding dense-only。正式 full-isolation cells 从第二个 optimizer step 起启用 fail-closed 检查，全部成功，证明实际四桶隔离成立。
+
+profiler-off timing 为 dense/current-partial/calibrated-full 三臂、3组 rotated repeats，每 cell 20 warmup + 800 measured updates，9/9 cells exit `0`：
+
+| repeat | dense | partial isolation | full isolation |
+|---|---:|---:|---:|
+| r1 | 197.93 ms | 203.97 ms | 202.89 ms |
+| r2 | 198.16 ms | 203.36 ms | 204.05 ms |
+| r3 | 199.79 ms | 202.87 ms | 204.37 ms |
+| **mean** | **198.627 ms** | **203.400 ms** | **203.770 ms** |
+
+partial−dense 为 `+4.773 ms (+2.41%)`，三组区间 `[+3.08,+6.04] ms`；full−dense 为 `+5.143 ms (+2.59%)`，区间 `[+4.58,+5.89] ms`。full−partial 仅 `+0.370 ms (+0.18%)`，逐组为 `[-1.08,+0.69,+1.50] ms`，区间跨零，未显示 full isolation 优于 partial。CV 为 dense/partial/full `0.511%/0.271%/0.382%`；peak allocated 为 `11207/11475/11447 MiB`。因此 timing 结论为明确 **negative**：完整移出 embedding mixed bucket 没有使 M002 超过 dense，也没有产生可辨认的 partial→full 收益。CM076 的负结果不能主要归因于未完全隔离。
+
+稳态 profile 改采 step220 refresh 与 step221 ordinary，并增加 prepare/chain-wait marker。6/6 profile cells 均 exit `0`，共24份 rank trace；约 `1.02 GiB` trace 的 offline summarizer 于16:53完成并生成正式 `profile/summary.json`。ordinary 单样本的核心 rank-max 指标如下：
+
+| ordinary 模式 | NCCL union | exposed NCCL | local GPU union | 与 backward overlap | exposed local GPU | gradient-sync tail |
+|---|---:|---:|---:|---:|---:|---:|
+| dense | 52.137 ms | 32.931 ms | — | — | — | 25.125 ms |
+| partial isolation | 35.414 ms | 20.850 ms | 6.868 ms | 2.756 ms | 4.262 ms | 0 ms |
+| full isolation | 39.003 ms | 23.593 ms | 6.139 ms | 2.273 ms | 3.915 ms | 0 ms |
+
+相对 dense，partial/full 的 exposed NCCL 单样本分别减少 `12.081/9.338 ms`，并把 ordinary gradient-sync tail 压到0；但各自仍有 `4.262/3.915 ms` exposed local GPU。partial 的 score/Top-r/factor/error/reconstruction GPU rank-max 分别为 `4.174/0.923/0.400/0.820/0.858 ms`，full 为 `3.597/0.785/0.352/0.786/0.678 ms`。每个 rank 跨 bucket 的 prepare duration sum 约为 partial `9.689–10.651 ms`、full `9.755–9.986 ms`，collective-unblocked 最晚出现在 ready 后约 `5.910/6.882 ms`；chain-wait sum 仅 partial `0.111–0.130 ms`、full `0.145–0.154 ms`。这说明 ordinary 路径的主要本地等待来自 score preparation，而非上一 bucket chain wait；完整隔离也没有进一步降低通信时间。
+
+稳态 refresh 的 partial/full local-SVD GPU 分别为 `1569.157/1565.804 ms`，且与 backward GPU compute overlap 均为0；按 interval200 粗摊约为 `7.846/7.829 ms/update`。因此，ordinary exposed local 与 refresh 摊销的量级已经足以消耗 exposed NCCL 节省，方向上与 profiler-off 的 `+2.41%/+2.59%` 回退一致。这里仍不能机械相加不同 rank-max 或把单个 Kineto profile window 当作真实 step time；定量端到端结论继续以三重复 profiler-off timing 为准。
+
+CM078 最终状态为 **completed/negative+diagnostic**：稳态 trace 排除了 CM077 首调用污染，确认 M002 能减少 ordinary exposed communication，但 full isolation 不优于 partial；当前主要代价转向每步 score preparation/local GPU 与每200步约1.57秒的同步 refresh，而不是 bucket chain wait。原始产物：`artifacts/compressed_muon/CM078-m002-gpt130m-bf16-dense-aux-full-isolation-timing-profile-ws4-s42/`。
+
+## CM079/CM080：350M/1B 最大候选 device batch timing（2026-09-15）
+
+在4×RTX 4090、BF16参数、seq256、GA1、bucket80 MiB、rank32、interval200、local-SVD、seed42下，从预设离散候选由大到小探测 M002，再以 dense 复核首个可行值。350M 在 device batch `128/96` OOM、`72`通过；1B 在`32`因 Triton CUDA OOM、`24`通过。因此两者分别采用 global/device batch `288/72` 和 `96/24`。这些是候选集最大共同可行值，不是逐整数显存极限。两个正式实验均为3组 rotated、每 cell 20 warmup + 800 measured updates，12/12 timing cells exit `0`：
+
+| 模型 | 参数量 | device/global batch | dense step | M002 step | M002−dense | dense/M002 peak |
+|---|---:|---:|---:|---:|---:|---:|
+| GPT-350M | 354.7M | 72/288 | 370.310 ms | 408.727 ms | +38.417 ms (+10.38%) | 17218/18613 MiB |
+| GPT-1B | 1003.9M | 24/96 | 518.720 ms | 632.973 ms | +114.253 ms (+22.04%) | 16603/20948 MiB |
+
+350M 的逐组差值为 `+36.09/+42.30/+36.86 ms`，区间 `[+36.09,+42.30] ms`；1B 为 `+106.61/+127.13/+109.02 ms`，区间 `[+106.61,+127.13] ms`，全部同方向。dense/M002 吞吐分别为350M `199.1K/180.4K tokens/s`、1B `47.38K/38.83K tokens/s`。结论均为明确 **negative**。
+
+该趋势不能单独归因为参数量，因为 device/global batch 也随模型变化。当前实现每个 ordinary step 的 score 使用完整 `basis.T @ corrected`，对 Transformer block 的主要复杂度近似 `O(layers×d³)`；refresh 的完整 FP32 SVD/eigh 也具有类似的宽度立方增长。相比之下，dense All-Reduce 与可节省的通信量主要按参数量 `O(layers×d²)` 增长，factor/error/reconstruction 还会以 `O(P×rank)` 或 `O(P)` 遍历完整矩阵。模型增宽后，本地 score/refresh 增长快于通信节省；最大可行 batch 又从130M的128降至350M的72和1B的24，使与batch无关的压缩开销占 step 比例继续上升。BF16同时把 dense通信字节减半，而 embedding/lm-head仍走dense同步，进一步降低了当前单机四卡场景的压缩收益上限。
+
+这也解释了为何此前 bucket isolation、流水化和buffer改进没有扭转结果：它们优化的是 bucket composition、chain wait 和若干毫秒级的重组开销，没有改变完整 basis score 与周期性 SVD 两个主导复杂度。后续应先在共同 device batch24下做130M/350M/1B受控尺度比较，并用 interval100/200/400/800 profiler-off分相 timing量化 refresh；算法优先级应转向复用或稀疏更新 support、避免每步扫描完整 basis，以及错峰或近似 refresh，而不是继续微调 bucket。原始产物：`artifacts/compressed_muon/CM079-m002-gpt350m-bf16-max-device-batch-timing-ws4-s42/`、`artifacts/compressed_muon/CM080-m002-gpt1b-bf16-max-device-batch-timing-ws4-s42/`。

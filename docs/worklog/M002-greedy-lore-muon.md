@@ -533,3 +533,37 @@ M002 refresh 的 local-SVD GPU 为 `1508.984 ms`，interval200 简单摊销约 `
 采样点还有首调用偏差：`start_compress_step=20`，而 refresh/ordinary profile step 正是 `20/21`，分别为第一次 refresh 和第一次 ordinary compressed 分支；rank0 首个 score/Top-r CPU range 约为 `87.8/49.0 ms`，显示初始化或 profiler 冷启动污染。因而本轮 bucket composition 是可靠结构证据，时间分解则只作定性诊断。
 
 结论：先把采样移至第二个压缩周期（step220/221，或等价的分支预热后采样），并增加 prepare begin/end、chain-wait begin 标记，以拆分本地准备与真实依赖等待；再依据实际 reducer 顺序修正或替代 cap 构造，并在 compiled GPU trace 中验证真实四桶布局。最终用同批次 rotated dense/current-partial/fixed-full 三臂 profiler-off timing 做因果消融，同时分开统计 ordinary 分布与 refresh spike。在布局和稳态时间验证前，不把当前结果外推为“完整隔离无效”。artifact：`artifacts/compressed_muon/CM077-m002-gpt130m-bf16-dense-aux-isolation-targeted-profile-ws4-s42/`。
+
+## 2026-09-15：稳态 profile、calibrated full isolation 与 CM078 启动
+
+针对 CM077 的两个证据缺口完成可选诊断路径。GreedyLore hook 新增 per-rank rebuilt bucket layout JSON、指定 active step capture、role-aligned fail-closed 验证和预期 bucket count 验证；默认路径不启用这些诊断。calibration helper 将所有 rank 一致的真实 reducer bucket 顺序展开，按 dense auxiliary singleton 和不超过目标 cap 的连续 matrix 组重新生成精确 cap，避免硬编码 CM077 的 MiB 数字。正式 full-isolation cell 在第二个 optimizer step 起检查实际 bucket 数、matrix/dense_aux 不混桶，以及每个 dense auxiliary 均为 singleton；不满足即停止，不生成性能结论。
+
+profiler marker 新增 per-bucket `prepare_begin/end` 与 `chain_wait_begin/end`，offline summary 记录 prepare/chain-wait 相对 ready 的时延，并在每个 rank 内计算 GreedyLore local GPU union、与 backward compute overlap 及 exposed local GPU，再在 cell 层取 rank-max。通用 launcher 新增 profile period 参数；CM078 使用第二周期 step220 refresh 与 step221 ordinary，避免 CM077 step20/21 的压缩分支首调用污染。
+
+CM078 controller 于2026-09-15在 tmux `CM078-m002-full-isolation` 启动。它自行等待4张至少 `23500 MiB` 空闲显存的 GPU，先运行 compiled step2 calibration，再串行运行 dense/current-partial/calibrated-full 三臂的3组 rotated profiler-off timing（20 warmup + 800 measured），最后采集三臂稳态 refresh/ordinary profile。按用户要求不运行测试脚本；启动前仅完成 Python `py_compile`、两个 launcher 的 `bash -n`、profile step220/221 print-plan、`git diff --check` 和一次 GPU/磁盘检查，启动后不由 Agent 轮询。artifact：`artifacts/compressed_muon/CM078-m002-gpt130m-bf16-dense-aux-full-isolation-timing-profile-ws4-s42/`。
+
+### CM078 timing 完成（当时 profile summary 尚在运行）
+
+calibration 在 GPU 2–5 成功捕获四个 rank 一致的 compiled step2 reducer 顺序，并导出 `[73.6875,78.75,29.25,73.6875] MiB` caps。四个目标 bucket 为 lm-head singleton dense-only、`78.75/29.25 MiB` 两个 matrix-only、embedding singleton dense-only；正式 full-isolation timing/profile cells 的 fail-closed 检查均通过。
+
+三臂 rotated timing 9/9 cells exit0。dense 三组为 `197.93/198.16/199.79 ms`，mean `198.627 ms`；current partial 为 `203.97/203.36/202.87 ms`，mean `203.400 ms`，相对 dense `+4.773 ms (+2.41%)`；calibrated full 为 `202.89/204.05/204.37 ms`，mean `203.770 ms`，相对 dense `+5.143 ms (+2.59%)`。full−partial 三组为 `-1.08/+0.69/+1.50 ms`，mean `+0.370 ms (+0.18%)`、区间跨零。full isolation 因此没有显示端到端收益，且不能把 CM076 的负结果主要归因于 embedding mixed bucket。dense/partial/full peak 为 `11207/11475/11447 MiB`。
+
+step220/221 的6个 profile cells 也全部 exit0并生成24份 trace，但总量约 `1.02 GiB`，offline summarizer 截至本次记录仍以单核运行，尚无正式 `profile/summary.json`。暂不从单份 trace 抽取时间归因，实验状态记为 `timing-completed/profile-summary-pending`；待汇总完成后再追加稳态 prepare、chain wait、exposed local GPU、NCCL 与 refresh 结论。
+
+## 2026-09-15：CM079/CM080 最大可行 device batch timing 启动
+
+为检验模型增大后 M002 的通信收益边界，登记 CM079（GPT-350M）与 CM080（GPT-1B），统一使用4卡、BF16参数、seq256、GA1、bucket80 MiB、rank32、interval200、local-SVD、seed42。每个模型先让显存更严格的 M002 以 interval2、1 warmup + 2 measured 的短进程覆盖 refresh/ordinary 分支，按预设离散候选从大到小粗探测：350M 为 `128/96/72/64/48/32/24/16/8/4/2/1`，1B 为 `32/24/16/12/8/4/2/1`；首个可行值再用 dense 复核。该值是候选集中的最大共同可行 batch，不追求逐整数显存极限。global batch 随之设为 `4×device batch`，不以 GA 保持512。
+
+正式 timing 对每个可行模型运行3组 dense/M002 rotated pairing，每 cell 为20 warmup + 800 measured updates；CM079结束后才开始CM080。controller 自行等待4张至少23500 MiB空闲显存的GPU，并在选中卡被外部任务占用时继续等待。按用户要求不运行脚本正确性测试、不生成 profiler trace，也不由 Agent 轮询。controller：`benchmark/compressed_muon/run_cm079_cm080_max_device_batch_timing.sh`；artifacts：`artifacts/compressed_muon/CM079-m002-gpt350m-bf16-max-device-batch-timing-ws4-s42/`、`artifacts/compressed_muon/CM080-m002-gpt1b-bf16-max-device-batch-timing-ws4-s42/`。
+
+### CM078 稳态 trace 汇总完成
+
+offline summarizer 于16:53完成，正式 `profile/summary.json` 约213 KiB。ordinary 的 dense/partial/full exposed NCCL 为 `32.931/20.850/23.593 ms`，partial/full local GPU union 为 `6.868/6.139 ms`、与 backward overlap 为 `2.756/2.273 ms`、exposed local 为 `4.262/3.915 ms`；dense gradient-sync tail 为 `25.125 ms`，两种M002均为0。partial/full各rank跨bucket prepare sum约`9.689–10.651/9.755–9.986 ms`，chain-wait sum仅`0.111–0.130/0.145–0.154 ms`，说明score preparation而非上一bucket chain wait是ordinary本地等待主项。
+
+稳态 refresh 的 partial/full local-SVD GPU 为 `1569.157/1565.804 ms`，均无 backward GPU overlap，按interval200粗摊为 `7.846/7.829 ms/update`。ordinary exposed local与refresh摊销量级足以消耗通信节省，与profiler-off负结果方向一致；但rank-max不作机械加减，单样本Kineto window也不替代三重复timing。CM078最终状态更新为`completed/negative+diagnostic`：full isolation没有降低partial的端到端或通信时间，后续不再优先优化bucket chain，转向score与refresh复杂度。
+
+### CM079/CM080 完成结果
+
+controller 在GPU 2–5串行完成并exit `0`。CM079中350M的M002在device batch128/96 OOM，72通过且dense复核通过；正式6/6 cells exit0，dense/M002 mean为`370.310/408.727 ms`，逐组差值`+36.09/+42.30/+36.86 ms`，M002平均慢`38.417 ms (+10.38%)`，peak为`17218/18613 MiB`。CM080中1B的batch32实际为Triton CUDA OOM（controller状态文本因匹配式未覆盖该写法而记作`PROBE_FAILED`），batch24两模式通过；正式6/6 cells exit0，dense/M002为`518.720/632.973 ms`，逐组差值`+106.61/+127.13/+109.02 ms`，平均慢`114.253 ms (+22.04%)`，peak为`16603/20948 MiB`。
+
+两组均为明确negative。跨130M/350M/1B的相对回退约为`2.6%/10.4%/22.0%`，但batch分别为128/72/24，不能解释成纯参数量效应。现实现ordinary score的完整`basis.T @ corrected`与refresh FP32 SVD/eigh近似按`layers×hidden³`增长，快于按参数量增长的通信节省；error/factor/reconstruction还遍历完整矩阵。模型越大时M002额外状态又迫使physical batch降低，使这些与batch无关的成本占比进一步上升。此前bucket isolation、流水化与buffer改进没有改变这两个主导复杂度，因此难以扭转趋势。下一步优先做共同device batch24的受控尺度比较、interval分相timing，以及固定support/projector诊断；算法方向转向避免每步扫描完整basis和降低/错峰refresh。

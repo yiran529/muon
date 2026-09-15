@@ -460,6 +460,11 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
         for category in _GREEDY_LORE_LOCAL_CATEGORIES
         for interval in category_intervals.get(category, [])
     ]
+    greedylore_local_union_us = _interval_union(greedylore_local_intervals)
+    greedylore_local_backward_overlap_us = _overlap(
+        greedylore_local_intervals,
+        compute_intervals,
+    )
     greedylore_future_ends = [
         end for category, _start, end, _corr, _event in ranges
         if category == "greedylore_hook_future_complete"
@@ -495,6 +500,14 @@ def attribute_trace(trace: Any) -> dict[str, Any]:
         "exposed_nccl_time_ms": max(0.0, union_us - overlap_us) / 1000.0,
         "exposed_time_ms": max(0.0, union_us - overlap_us) / 1000.0,
         "exposed_is_trace_estimate": True,
+        "greedylore_local_gpu_union_ms": greedylore_local_union_us / 1000.0,
+        "greedylore_local_backward_compute_overlap_ms": (
+            greedylore_local_backward_overlap_us / 1000.0
+        ),
+        "exposed_greedylore_local_gpu_ms": max(
+            0.0,
+            greedylore_local_union_us - greedylore_local_backward_overlap_us,
+        ) / 1000.0,
         "arc_collective_backward_compute_overlap_ms": (
             _overlap(arc_intervals, compute_intervals) / 1000.0
         ),
@@ -655,6 +668,10 @@ def summarize_training_trace(trace: Any) -> dict[str, Any]:
         and any(
             _has_range_name(event, name)
             for name in (
+                "greedylore_hook/prepare_begin",
+                "greedylore_hook/prepare_end",
+                "greedylore_hook/chain_wait_begin",
+                "greedylore_hook/chain_wait_end",
                 "greedylore_hook/collective_unblocked",
                 "greedylore_hook/collective_launch",
                 "greedylore_hook/future_complete",
@@ -675,6 +692,22 @@ def summarize_training_trace(trace: Any) -> dict[str, Any]:
         unblocked = [
             event for event in matching
             if _has_range_name(event, "greedylore_hook/collective_unblocked")
+        ]
+        prepare_begins = [
+            event for event in matching
+            if _has_range_name(event, "greedylore_hook/prepare_begin")
+        ]
+        prepare_ends = [
+            event for event in matching
+            if _has_range_name(event, "greedylore_hook/prepare_end")
+        ]
+        chain_wait_begins = [
+            event for event in matching
+            if _has_range_name(event, "greedylore_hook/chain_wait_begin")
+        ]
+        chain_wait_ends = [
+            event for event in matching
+            if _has_range_name(event, "greedylore_hook/chain_wait_end")
         ]
         launches = [
             event for event in matching
@@ -709,6 +742,30 @@ def summarize_training_trace(trace: Any) -> dict[str, Any]:
                 (min(float(event.get("ts", 0.0)) for event in unblocked) - ready_start)
                 / 1000.0
                 if unblocked else None
+            ),
+            "prepare_from_ready_ms": (
+                (min(float(event.get("ts", 0.0)) for event in prepare_begins)
+                 - ready_start) / 1000.0
+                if prepare_begins else None
+            ),
+            "prepare_duration_ms": (
+                (
+                    max(float(event.get("ts", 0.0)) for event in prepare_ends)
+                    - min(float(event.get("ts", 0.0)) for event in prepare_begins)
+                ) / 1000.0
+                if prepare_begins and prepare_ends else None
+            ),
+            "chain_wait_from_ready_ms": (
+                (min(float(event.get("ts", 0.0)) for event in chain_wait_begins)
+                 - ready_start) / 1000.0
+                if chain_wait_begins else None
+            ),
+            "chain_wait_duration_ms": (
+                (
+                    max(float(event.get("ts", 0.0)) for event in chain_wait_ends)
+                    - min(float(event.get("ts", 0.0)) for event in chain_wait_begins)
+                ) / 1000.0
+                if chain_wait_begins and chain_wait_ends else None
             ),
             "collective_launches": [
                 {
