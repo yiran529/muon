@@ -577,3 +577,12 @@ controller 在GPU 2–5串行完成并exit `0`。CM079中350M的M002在device ba
 - NCCL：实际两个channel均为`SHM/direct/direct`。BF16 1/32/80 MiB All-Reduce分别为`0.190/3.698/9.132 ms`，algorithm bandwidth为`5.51/9.07/9.19 GB/s`，ring-equivalent bus bandwidth为`8.26/13.61/13.78 GB/s`。产物JSON字段后缀`gbps`为误标，数值实际单位是GB/s。
 - 结论：shared score证明完整independent-vector score是1B额外开销之一，但只收回历史dense差距的约`26.9%`，没有扭转端到端负结果；SHM transport大类已与论文描述对齐。下一步若继续，优先做shared ordinary/refresh分相，再决定是否进行质量实验。
 - 产物：`artifacts/compressed_muon/CM081-m002-shared-score-gpt1b-nccl-timing-ws4-s42/`。
+
+## 2026-09-15：CM082 shared phase timing 与 gradient-sync oracle
+
+- 目的：用 profiler-off interval差分拆分1B shared路径的ordinary与refresh摊销，并测量当前配置下DDP gradient sync可消除时间的上限。
+- 配置：GPT-1B BF16、4 GPU、seq256、global/device batch96/24、bucket80 MiB、rank32；只新增shared interval800与no-gradient-sync oracle各1个20 warmup + 800 measured cell，dense与shared interval200分别复用CM080/CM081历史summary，由单一controller串行执行。
+- 方法：假设`T(I)=T_ordinary+R_refresh/I`，由interval200/800解出ordinary和单次refresh额外时间。oracle通过benchmark-only DDP identity hook跳过gradient All-Reduce，但保留Muon optimizer/result communication；允许rank参数分叉，只作timing上限。
+- 进展：首次controller在选卡后、任何cell启动前因shell同一`local`声明引用未绑定`label`而exit1，失败根目录移为`-attempt1-controller-bug`。修复后shared interval800成功，step为`519.53 ms`、peak为`20948 MiB`；结合CM081 interval200的`602.247 ms`，二点模型估计shared ordinary为`491.96 ms`、单次refresh额外约`22.06 s`，即interval200/800分别摊销`110.29/27.57 ms/update`。interval800仅比CM080历史dense `518.720 ms`慢`0.81 ms (0.16%)`，单样本/跨实验不作等效声明，但`82.72 ms`的interval差异远大于CM081约5.3 ms样本标准差，refresh主导方向明确。
+- Oracle：首次在DDP hook注册时因bucket注解为`Any`而失败，尚未进入训练；已增加回归测试并改为PyTorch要求的`dist.GradBucket`，将只重跑oracle，不重跑成功的interval800。
+- 产物：`artifacts/compressed_muon/CM082-m002-shared-phase-gradient-sync-oracle-gpt1b-ws4-s42/`。
