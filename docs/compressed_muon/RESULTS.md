@@ -895,3 +895,30 @@ CM078 最终状态为 **completed/negative+diagnostic**：稳态 trace 排除了
 该趋势不能单独归因为参数量，因为 device/global batch 也随模型变化。当前实现每个 ordinary step 的 score 使用完整 `basis.T @ corrected`，对 Transformer block 的主要复杂度近似 `O(layers×d³)`；refresh 的完整 FP32 SVD/eigh 也具有类似的宽度立方增长。相比之下，dense All-Reduce 与可节省的通信量主要按参数量 `O(layers×d²)` 增长，factor/error/reconstruction 还会以 `O(P×rank)` 或 `O(P)` 遍历完整矩阵。模型增宽后，本地 score/refresh 增长快于通信节省；最大可行 batch 又从130M的128降至350M的72和1B的24，使与batch无关的压缩开销占 step 比例继续上升。BF16同时把 dense通信字节减半，而 embedding/lm-head仍走dense同步，进一步降低了当前单机四卡场景的压缩收益上限。
 
 这也解释了为何此前 bucket isolation、流水化和buffer改进没有扭转结果：它们优化的是 bucket composition、chain wait 和若干毫秒级的重组开销，没有改变完整 basis score 与周期性 SVD 两个主导复杂度。后续应先在共同 device batch24下做130M/350M/1B受控尺度比较，并用 interval100/200/400/800 profiler-off分相 timing量化 refresh；算法优先级应转向复用或稀疏更新 support、避免每步扫描完整 basis，以及错峰或近似 refresh，而不是继续微调 bucket。原始产物：`artifacts/compressed_muon/CM079-m002-gpt350m-bf16-max-device-batch-timing-ws4-s42/`、`artifacts/compressed_muon/CM080-m002-gpt1b-bf16-max-device-batch-timing-ws4-s42/`。
+
+## CM081：M002 shared-vector score timing 与 NCCL 诊断（2026-09-15）
+
+为检验 CM080 的 1B 回退是否主要来自 ordinary step 的完整 `basis.T @ corrected`，新增 `score_randomization=shared` 消融：所有 basis 方向共用一个 Gaussian vector，按 `basis.T @ (corrected @ v)` 计算 score，将方阵情况下的主要 score 复杂度从约 `O(d³)` 降至 `O(d²)`。该变体不与论文 Algorithm 2 的每方向独立随机向量等价，只用于性能归因。
+
+实验复用 CM080 的 GPT-1B BF16、GPU 2–5、seq256、global/device batch96/24、GA1、bucket80 MiB、rank32、interval200、local-SVD 和 seed42。原计划运行 dense/independent/shared 三臂，NCCL 诊断完成后进入 dense r1 时，按用户要求缩减为 shared-only；未完成的 dense r1 被中止并排除。正式 shared 三次均为20 warmup + 800 measured updates，3/3 cells 与 controller 均 exit `0`：
+
+| repeat | shared step | final validation loss | peak allocated |
+|---|---:|---:|---:|
+| r1 | 599.02 ms | 5.4824 | 20948 MiB |
+| r2 | 599.33 ms | 5.4874 | 20948 MiB |
+| r3 | 608.39 ms | 5.4983 | 20948 MiB |
+| **mean** | **602.247 ms** | **5.4894** | **20948 MiB** |
+
+shared 的 step CV 为 `0.884%`，mean throughput 为 `40.81K tokens/s`。探索性地与相同配置、同日完成的 CM080 历史结果比较，dense/independent/shared 分别为 `518.720/632.973/602.247 ms`。shared 比 independent 快 `30.727 ms (4.85%)`，收回原 `114.253 ms` dense 差距的约 `26.9%`；但仍比 dense 慢 `83.527 ms (16.10%)`。三组 shared 全部快于 CM080 的三个 independent 样本，也全部慢于三个 dense 样本，因此方向清楚；但因不是同期 rotated pairing，不计算配对区间，也不把小差异作为稳健结论。shared 与 independent 的 peak 均为 `20948 MiB`，说明移除完整 score 中间量没有改变由持久状态或 refresh 路径决定的峰值。
+
+同一 controller 在 timing 前独立运行4-rank BF16 NCCL All-Reduce microbenchmark，并保存 NCCL INFO 与 topology。NCCL 2.28.9 的两个 channel 均记录为 `via SHM/direct/direct`，确认当前单机 GPU 2–5 实际采用 SHM transport；这与论文 Table V 声明的 SHM 属于同一大类，因而“本地自动选路未使用 SHM”不再是主要解释，但具体 PCIe/NUMA 拓扑和有效带宽仍可能不同。microbenchmark 使用各 rank median 的最大值：
+
+| BF16 payload | All-Reduce | algorithm bandwidth | ring-equivalent bus bandwidth |
+|---:|---:|---:|---:|
+| 1 MiB | 0.190 ms | 5.51 GB/s | 8.26 GB/s |
+| 32 MiB | 3.698 ms | 9.07 GB/s | 13.61 GB/s |
+| 80 MiB | 9.132 ms | 9.19 GB/s | 13.78 GB/s |
+
+原始 `bandwidth.json` 的两个带宽字段后缀误写为 `gbps`，计算实际为 bytes/s 除以 `1e9`，所以本表按 **GB/s** 记录；不能解释成 Gbit/s。该 microbenchmark 反映孤立 collective 能力，不等于训练中 exposed communication。
+
+CM081 结论为 **completed/negative-vs-dense+diagnostic**：shared-vector score 显著降低了1B M002 step time，证明完整 independent-vector score 是实际瓶颈之一；但它只消除约四分之一的历史回退，M002 仍比 dense 慢约16%，且 refresh SVD、factor/error/reconstruction 与通信关键路径均未改变。shared 的短窗口 validation loss 与 independent 接近，不能据此宣称质量等价。后续若继续该方向，应先做 shared ordinary/refresh 分相，再决定是否投入完整训练质量验证。原始产物：`artifacts/compressed_muon/CM081-m002-shared-score-gpt1b-nccl-timing-ws4-s42/`。

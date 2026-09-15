@@ -19,6 +19,7 @@ class GreedyLoreConfig:
     dense_aux_communication_dtype: Literal[
         "bucket", "float32", "bfloat16"
     ] = "bucket"
+    score_randomization: Literal["independent", "shared"] = "independent"
     seed_scheme_version: int = 1
 
     def __post_init__(self) -> None:
@@ -51,6 +52,10 @@ class GreedyLoreConfig:
             raise ValueError(
                 "dense_aux_communication_dtype must be 'bucket', 'float32', "
                 "or 'bfloat16'"
+            )
+        if self.score_randomization not in ("independent", "shared"):
+            raise ValueError(
+                "score_randomization must be 'independent' or 'shared'"
             )
         if self.seed_scheme_version != 1:
             raise ValueError("seed_scheme_version must be 1")
@@ -189,6 +194,14 @@ def approximate_signed_lambda(
 
     projected_rows = basis.mT @ corrected
     return (projected_rows * random_vectors).sum(dim=1)
+
+
+def approximate_signed_lambda_shared(
+    corrected: Tensor, basis: Tensor, random_vector: Tensor
+) -> Tensor:
+    """Approximate all subspace scores using one shared Gaussian vector."""
+
+    return (basis.mT @ (corrected @ random_vector)).reshape(-1)
 
 
 def select_projector(

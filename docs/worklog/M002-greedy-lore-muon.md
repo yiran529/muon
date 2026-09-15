@@ -567,3 +567,13 @@ offline summarizer 于16:53完成，正式 `profile/summary.json` 约213 KiB。o
 controller 在GPU 2–5串行完成并exit `0`。CM079中350M的M002在device batch128/96 OOM，72通过且dense复核通过；正式6/6 cells exit0，dense/M002 mean为`370.310/408.727 ms`，逐组差值`+36.09/+42.30/+36.86 ms`，M002平均慢`38.417 ms (+10.38%)`，peak为`17218/18613 MiB`。CM080中1B的batch32实际为Triton CUDA OOM（controller状态文本因匹配式未覆盖该写法而记作`PROBE_FAILED`），batch24两模式通过；正式6/6 cells exit0，dense/M002为`518.720/632.973 ms`，逐组差值`+106.61/+127.13/+109.02 ms`，平均慢`114.253 ms (+22.04%)`，peak为`16603/20948 MiB`。
 
 两组均为明确negative。跨130M/350M/1B的相对回退约为`2.6%/10.4%/22.0%`，但batch分别为128/72/24，不能解释成纯参数量效应。现实现ordinary score的完整`basis.T @ corrected`与refresh FP32 SVD/eigh近似按`layers×hidden³`增长，快于按参数量增长的通信节省；error/factor/reconstruction还遍历完整矩阵。模型越大时M002额外状态又迫使physical batch降低，使这些与batch无关的成本占比进一步上升。此前bucket isolation、流水化与buffer改进没有改变这两个主导复杂度，因此难以扭转趋势。下一步优先做共同device batch24的受控尺度比较、interval分相timing，以及固定support/projector诊断；算法方向转向避免每步扫描完整basis和降低/错峰refresh。
+## 2026-09-15：CM081 shared-vector score 与 NCCL transport/bandwidth
+
+- 目的：检验 ordinary step 的完整 independent-vector score 是否为 GPT-1B timing 退化的主要来源。
+- 变体：增加 `score_randomization=shared`，以一个共享 Gaussian vector 计算所有 basis score；该变体不与论文 Algorithm 2 等价，仅作为性能消融。
+- 实验：GPT-1B BF16、4 GPU、seq256、global/device batch96/24、GA1、bucket80 MiB、rank32、interval200；按用户缩减后的范围只正式运行 shared 三次，每 cell 为20 warmup + 800 measured updates，并探索性对照 CM080 历史 dense/independent。
+- 通信诊断：正式 timing 前串行捕获 NCCL transport、PCIe/P2P topology，以及 BF16 1/32/80 MiB All-Reduce bandwidth；诊断不与 timing 并发。
+- 结果：controller、NCCL诊断及3/3 shared cells均exit `0`。shared step为`599.02/599.33/608.39 ms`，mean `602.247 ms`、CV `0.884%`、throughput `40.81K tokens/s`、peak `20948 MiB`。相对CM080历史independent的`632.973 ms`快`30.727 ms (4.85%)`，但相对历史dense的`518.720 ms`仍慢`83.527 ms (16.10%)`；非同期配对，不计算区间。短窗口validation loss mean为`5.4894`，不作质量等价结论。
+- NCCL：实际两个channel均为`SHM/direct/direct`。BF16 1/32/80 MiB All-Reduce分别为`0.190/3.698/9.132 ms`，algorithm bandwidth为`5.51/9.07/9.19 GB/s`，ring-equivalent bus bandwidth为`8.26/13.61/13.78 GB/s`。产物JSON字段后缀`gbps`为误标，数值实际单位是GB/s。
+- 结论：shared score证明完整independent-vector score是1B额外开销之一，但只收回历史dense差距的约`26.9%`，没有扭转端到端负结果；SHM transport大类已与论文描述对齐。下一步若继续，优先做shared ordinary/refresh分相，再决定是否进行质量实验。
+- 产物：`artifacts/compressed_muon/CM081-m002-shared-score-gpt1b-nccl-timing-ws4-s42/`。

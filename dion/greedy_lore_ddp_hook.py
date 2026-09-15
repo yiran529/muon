@@ -19,6 +19,7 @@ from .greedy_lore import (
     GreedyLoreConfig,
     MatrixOrientation,
     approximate_signed_lambda,
+    approximate_signed_lambda_shared,
     compressed_phase,
     corrected_gradient,
     derive_greedy_lore_seed,
@@ -1453,8 +1454,9 @@ def _prepare_score_plus_aux_buffer(
                 parameter_state.orientation,
             )
             rows, columns = corrected.shape
+            random_rows = 1 if state.config.score_randomization == "shared" else rows
             random_vectors = make_random_vectors(
-                rows=rows,
+                rows=random_rows,
                 columns=columns,
                 seed=derive_greedy_lore_seed(
                     base_seed=state.config.seed,
@@ -1464,11 +1466,18 @@ def _prepare_score_plus_aux_buffer(
                 device=corrected.device,
                 dtype=corrected.dtype,
             )
-            signed_lambda = approximate_signed_lambda(
-                corrected,
-                parameter_state.basis,
-                random_vectors,
-            )
+            if state.config.score_randomization == "shared":
+                signed_lambda = approximate_signed_lambda_shared(
+                    corrected,
+                    parameter_state.basis,
+                    random_vectors.reshape(columns, 1),
+                )
+            else:
+                signed_lambda = approximate_signed_lambda(
+                    corrected,
+                    parameter_state.basis,
+                    random_vectors,
+                )
             chunks.append(signed_lambda)
             matrix_work.append(
                 CompressedMatrixWork(

@@ -34,6 +34,9 @@ class GreedyLoreHyperparameters(train.Hyperparameters):
     greedy_lore_dense_aux_communication_dtype: Literal[
         "bucket", "float32", "bfloat16"
     ] = "bucket"
+    greedy_lore_score_randomization: Literal[
+        "independent", "shared"
+    ] = "independent"
     greedy_lore_compress_embedding_lm_head: bool = False
     greedy_lore_isolate_dense_aux_buckets: bool = False
 
@@ -52,6 +55,15 @@ def configure_greedy_lore_parser(parser: argparse.ArgumentParser) -> None:
         "--greedy_lore_dense_aux_communication_dtype",
         choices=("bucket", "float32", "bfloat16"),
         default=None,
+    )
+    parser.add_argument(
+        "--greedy_lore_score_randomization",
+        choices=("independent", "shared"),
+        default=None,
+        help=(
+            "Use independent random vectors per basis direction (Algorithm 2) "
+            "or one shared random vector for the score ablation"
+        ),
     )
     parser.add_argument(
         "--greedy_lore_compress_embedding_lm_head",
@@ -102,6 +114,7 @@ def validate_greedy_lore_hyperparameters(hp: GreedyLoreHyperparameters) -> None:
         start_compress_step=hp.greedy_lore_start_compress_step,
         basis_sync=hp.greedy_lore_basis_sync,
         dense_aux_communication_dtype=hp.greedy_lore_dense_aux_communication_dtype,
+        score_randomization=hp.greedy_lore_score_randomization,
     )
     if (
         hp.greedy_lore_isolate_dense_aux_buckets
@@ -233,6 +246,7 @@ def _install_greedy_lore_ddp_hook(
         start_compress_step=hp.greedy_lore_start_compress_step,
         basis_sync=hp.greedy_lore_basis_sync,
         dense_aux_communication_dtype=hp.greedy_lore_dense_aux_communication_dtype,
+        score_randomization=hp.greedy_lore_score_randomization,
     )
     specs = tuple(
         GreedyLoreDDPParameterSpec(
@@ -346,6 +360,10 @@ def init_greedy_lore_optimizer(
     train.print0(
         "GreedyLore dense auxiliary communication dtype: "
         f"{hp.greedy_lore_dense_aux_communication_dtype}"
+    )
+    train.print0(
+        "GreedyLore score randomization: "
+        f"{hp.greedy_lore_score_randomization}"
     )
     train.print0(
         "GreedyLore compress embedding and LM head: "

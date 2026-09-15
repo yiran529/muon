@@ -81,7 +81,7 @@ validate_modes() {
     IFS=',' read -ra values <<<"$raw"
     for value in "${values[@]}"; do
         case "$value" in
-            dense|greedylore_local_svd|greedylore_broadcast|greedylore_local_svd_partial|greedylore_local_svd_full) ;;
+            dense|greedylore_local_svd|greedylore_local_svd_shared|greedylore_broadcast|greedylore_local_svd_partial|greedylore_local_svd_full) ;;
             *) printf 'invalid %s mode: %s\n' "$label" "$value" >&2; return 64 ;;
         esac
         if [[ "$seen" == *",$value,"* ]]; then
@@ -331,6 +331,11 @@ run_cell() {
             --greedy_lore_update_interval "$greedy_lore_update_interval"
             --greedy_lore_start_compress_step "$timing_warmup_steps"
             --greedy_lore_dense_aux_communication_dtype "$greedy_lore_dense_aux_communication_dtype")
+        if [[ "$mode_name" == "greedylore_local_svd_shared" ]]; then
+            command+=(--greedy_lore_score_randomization shared)
+        else
+            command+=(--greedy_lore_score_randomization independent)
+        fi
         if ((greedy_lore_compress_embedding_lm_head)); then
             command+=(--greedy_lore_compress_embedding_lm_head)
         fi

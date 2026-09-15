@@ -56,3 +56,4 @@ greedy_lore_seed: 42
 greedy_lore_start_compress_step: 1000
 greedy_lore_basis_sync: local_svd
 greedy_lore_dense_aux_communication_dtype: bucket
+greedy_lore_score_randomization: independent

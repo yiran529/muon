@@ -199,6 +199,16 @@ def _timing_summary_from_records(plan: dict, records: list[dict]) -> dict:
             "full_vs_partial_isolation",
         ),
         ("greedylore_local_svd", "dense", "local_svd_vs_dense"),
+        (
+            "greedylore_local_svd_shared",
+            "dense",
+            "shared_score_vs_dense",
+        ),
+        (
+            "greedylore_local_svd_shared",
+            "greedylore_local_svd",
+            "shared_vs_independent_score",
+        ),
         ("greedylore_broadcast", "dense", "broadcast_vs_dense"),
         (
             "greedylore_local_svd",
