@@ -76,6 +76,14 @@ bucket160 MiB、EF14、warm start、step1000后压缩和 seed1234。dense 与 M0
 PowerSGD warmup 后测量 800 个稳态 rank32 PowerSGD step。CM089 的 calibrated role-isolation
 是 GreedyLore 专属布局，CM095 不声称与其 bucket role layout 完全一致。
 
+CM095 于 2026-09-16 22:32 获得四张GPU后启动，但launcher传入未被
+`train_powersgd.py`接受的`--val_loss_every`，入口参数解析即失败（exit 1），
+没有训练或timing数据。保留失败产物；CM095a 使用独立YAML设置
+`val_loss_every: 0`并移除非法CLI参数，作为修正后的重跑。
+CM095a 启动前进行了4卡短试跑：dim64、2层、rank2、BF16、4 updates、
+`start_compress_step=0`、无compile，exit 0，最终打印 step4/4 与验证指标。
+此试跑只验证入口参数和基本DDP压缩路径，不作为rank32性能数据。
+
 首次 controller 启动后按用户要求关闭 checkpoint 保存；训练 worker 被定向停止，
 原 controller 与 CM093 早期产物以 `-aborted-20260916T181005-checkpoint-enabled`
 后缀保留。两份正式配置均改为 `checkpoint_freq: 0`，随后使用原实验编号重新启动；
