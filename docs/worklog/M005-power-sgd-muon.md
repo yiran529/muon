@@ -65,6 +65,17 @@ CM093 为 GPT-60M/10,000 updates，CM094 为 GPT-130M/20,000 updates；均使用
 bucket160 MiB、EF14、warm start、step1000后压缩和 seed1234。dense 与 M002
 对照复用 CM070，不重跑 high-rank PowerSGD。
 
+## 2026-09-16：warm-start 与 batched orthogonalization 性能修复
+
+针对 CM093/CM094 在压缩阶段约 3 倍于 dense 的 step time，修复两条明确的本地
+开销路径：warm start 仅在首个压缩 phase 生成随机 Q，后续直接复用 `q_memory`；
+相同 shape 的 Q/P 按组堆叠，以 3-D FP32 Gram–Schmidt 合并矩阵间 CUDA kernel，
+保留原逐列算法、epsilon、BF16输入输出和 P/Q All-Reduce 语义。
+
+新增 CM095 timing-only 实验，复用 CM089 的 GPT-130M BF16 训练几何，20 步
+PowerSGD warmup 后测量 800 个稳态 rank32 PowerSGD step。CM089 的 calibrated role-isolation
+是 GreedyLore 专属布局，CM095 不声称与其 bucket role layout 完全一致。
+
 首次 controller 启动后按用户要求关闭 checkpoint 保存；训练 worker 被定向停止，
 原 controller 与 CM093 早期产物以 `-aborted-20260916T181005-checkpoint-enabled`
 后缀保留。两份正式配置均改为 `checkpoint_freq: 0`，随后使用原实验编号重新启动；

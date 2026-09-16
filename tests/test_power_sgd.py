@@ -73,6 +73,30 @@ def test_orthogonalize_accumulates_in_fp32_and_returns_input_dtype():
     assert torch.allclose(result.float().T @ result.float(), torch.eye(2), atol=2e-2)
 
 
+def test_orthogonalize_batches_matrices_without_changing_individual_results():
+    matrices = torch.tensor(
+        [
+            [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            [[2.0, 1.0], [1.0, 3.0], [0.0, 1.0]],
+        ],
+        dtype=torch.bfloat16,
+    )
+
+    batched = orthogonalize(matrices, epsilon=1e-8)
+    individual = torch.stack(
+        [orthogonalize(matrix, epsilon=1e-8) for matrix in matrices]
+    )
+
+    assert batched.dtype == matrices.dtype
+    torch.testing.assert_close(batched, individual)
+    torch.testing.assert_close(
+        batched.float().mT @ batched.float(),
+        torch.eye(2).expand(2, 2, 2),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+
+
 def test_power_sgd_factors_reconstruct_and_full_rank_is_exact():
     corrected = torch.tensor(
         [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.bfloat16

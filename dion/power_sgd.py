@@ -88,22 +88,23 @@ def make_random_factor(
 
 
 def orthogonalize(matrix: Tensor, epsilon: float = 1e-8) -> Tensor:
-    """Column-orthogonalize a 2-D matrix with FP32 accumulation."""
-    if matrix.ndim != 2:
-        raise ValueError("orthogonalize requires a two-dimensional matrix")
-    if matrix.shape[1] > matrix.shape[0]:
+    """Column-orthogonalize one matrix or a batch with FP32 accumulation."""
+    if matrix.ndim not in (2, 3):
+        raise ValueError("orthogonalize requires a two- or three-dimensional tensor")
+    if matrix.shape[-1] > matrix.shape[-2]:
         raise ValueError("orthogonalize requires at least as many rows as columns")
     if epsilon < 0:
         raise ValueError("epsilon must be non-negative")
     work = matrix.float().clone()
-    for index in range(work.shape[1]):
-        column = work[:, index]
-        norm = torch.linalg.vector_norm(column)
-        work[:, index] = column / (norm + epsilon)
-        if index + 1 < work.shape[1]:
-            work[:, index + 1 :] -= torch.outer(
-                work[:, index], work[:, index] @ work[:, index + 1 :]
-            )
+    for index in range(work.shape[-1]):
+        column = work[..., :, index]
+        norm = torch.linalg.vector_norm(column, dim=-1, keepdim=True)
+        normalized = column / (norm + epsilon)
+        work[..., :, index] = normalized
+        if index + 1 < work.shape[-1]:
+            remaining = work[..., :, index + 1 :]
+            coefficients = normalized.unsqueeze(-2) @ remaining
+            remaining -= normalized.unsqueeze(-1) @ coefficients
     return work.to(dtype=matrix.dtype)
 
 

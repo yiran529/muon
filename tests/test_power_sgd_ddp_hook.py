@@ -234,6 +234,53 @@ def test_mixed_bucket_packs_dense_fallback_and_p_then_q_only(transport):
     state.finish_step()
 
 
+def test_warm_start_randomizes_only_the_first_compressed_step(monkeypatch):
+    parameters = [torch.nn.Parameter(torch.zeros(8, 12)) for _ in range(2)]
+    state = make_state([(parameter, "matrix") for parameter in parameters])
+    original = hook_module.make_random_factor
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hook_module, "make_random_factor", counted)
+    for _ in range(2):
+        state.begin_step()
+        result = hook_module.power_sgd_ddp_hook(
+            state,
+            FakeGradBucket(parameters, [torch.ones_like(p) for p in parameters]),
+        )
+        result.wait()
+        state.finish_step()
+        state.commit_step()
+
+    assert len(calls) == len(parameters)
+
+
+def test_same_shape_matrices_use_batched_orthogonalization(monkeypatch):
+    parameters = [torch.nn.Parameter(torch.zeros(8, 12)) for _ in range(2)]
+    state = make_state([(parameter, "matrix") for parameter in parameters])
+    original = hook_module.orthogonalize
+    shapes = []
+
+    def observed(matrix, epsilon):
+        shapes.append(tuple(matrix.shape))
+        return original(matrix, epsilon)
+
+    monkeypatch.setattr(hook_module, "orthogonalize", observed)
+    state.begin_step()
+    result = hook_module.power_sgd_ddp_hook(
+        state,
+        FakeGradBucket(parameters, [torch.ones_like(p) for p in parameters]),
+    )
+    result.wait()
+    state.finish_step()
+
+    assert (2, 12, 1) in shapes
+    assert (2, 8, 1) in shapes
+
+
 @pytest.mark.parametrize("failure_stage", [0, 1])
 def test_collective_failure_completes_both_state_placeholders(transport, failure_stage):
     calls, _ = transport

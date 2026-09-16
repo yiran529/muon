@@ -711,6 +711,28 @@ def _profiled_all_reduce_future(
         return _all_reduce_future(state, tensor, stage)
 
 
+def _orthogonalize_grouped(
+    matrices: Sequence[Tensor], epsilon: float
+) -> list[Tensor]:
+    """Orthogonalize equal-shaped matrices together to reduce kernel launches."""
+    grouped: dict[tuple[torch.Size, torch.dtype, torch.device], list[int]] = {}
+    for index, matrix in enumerate(matrices):
+        key = (matrix.shape, matrix.dtype, matrix.device)
+        grouped.setdefault(key, []).append(index)
+
+    results: list[Tensor | None] = [None] * len(matrices)
+    for indices in grouped.values():
+        if len(indices) == 1:
+            index = indices[0]
+            results[index] = orthogonalize(matrices[index], epsilon)
+            continue
+        batch = torch.stack([matrices[index] for index in indices])
+        orthogonalized = orthogonalize(batch, epsilon)
+        for index, matrix in zip(indices, orthogonalized.unbind(0)):
+            results[index] = matrix
+    return [result for result in results if result is not None]
+
+
 def _mark_future_complete(context: BucketContext) -> None:
     def mark(_completed: torch.futures.Future) -> None:
         with _profile_marker(
@@ -752,6 +774,8 @@ def _prepare_compressed_bucket(
         offset += gradient.numel()
 
     matrix_work = []
+    pending = []
+    initial_factors = []
     q_offset = 0
     config = state.config
     assert context.phase is not None
@@ -759,23 +783,33 @@ def _prepare_compressed_bucket(
         corrected = corrected_gradient(
             gradient, item.error if config.error_feedback == "ef14" else None
         )
-        seed = derive_power_sgd_seed(
-            base_seed=config.seed,
-            phase=context.phase,
-            stable_parameter_id=item.spec.stable_id,
-            seed_scheme_version=config.seed_scheme_version,
+        reuse_q = config.warm_start and (
+            context.phase > 0 or bool(item.q_initialized)
         )
-        initial_q = make_random_factor(
-            item.q_memory.shape[0],
-            item.q_memory.shape[1],
-            seed,
-            gradient.device,
-            gradient.dtype,
+        if reuse_q:
+            initial_q = item.q_memory
+        else:
+            seed = derive_power_sgd_seed(
+                base_seed=config.seed,
+                phase=context.phase,
+                stable_parameter_id=item.spec.stable_id,
+                seed_scheme_version=config.seed_scheme_version,
+            )
+            initial_q = make_random_factor(
+                item.q_memory.shape[0],
+                item.q_memory.shape[1],
+                seed,
+                gradient.device,
+                gradient.dtype,
+            )
+        pending.append((gradient, item, corrected))
+        initial_factors.append(initial_q)
+
+    with _profile_range("powersgd_hook/orthogonalization"):
+        initial_factors = _orthogonalize_grouped(
+            initial_factors, config.orthogonalization_epsilon
         )
-        if config.warm_start:
-            initial_q = torch.where(item.q_initialized, item.q_memory, initial_q)
-        with _profile_range("powersgd_hook/orthogonalization"):
-            initial_q = orthogonalize(initial_q, config.orthogonalization_epsilon)
+    for (gradient, item, corrected), initial_q in zip(pending, initial_factors):
         p_numel = gradient.shape[0] * item.q_memory.shape[1]
         p = first[offset : offset + p_numel].view(gradient.shape[0], -1)
         p.copy_(compute_left_factor(corrected, initial_q))
@@ -899,13 +933,15 @@ def power_sgd_ddp_hook(
         def after_p() -> None:
             for gradient, packed in dense_views:
                 gradient.copy_(packed.div_(state.world_size))
-            for work in matrix_work:
-                # P is a sum. Scaling before this normalization changes epsilon's
-                # effect, and is unnecessary for the PowerSGD projection.
-                with _profile_range("powersgd_hook/orthogonalization"):
-                    work.p.copy_(
-                        orthogonalize(work.p, state.config.orthogonalization_epsilon)
-                    )
+            # P is a sum. Scaling before this normalization changes epsilon's
+            # effect, and is unnecessary for the PowerSGD projection.
+            with _profile_range("powersgd_hook/orthogonalization"):
+                orthogonalized_p = _orthogonalize_grouped(
+                    [work.p for work in matrix_work],
+                    state.config.orthogonalization_epsilon,
+                )
+            for work, normalized_p in zip(matrix_work, orthogonalized_p):
+                work.p.copy_(normalized_p)
                 work.q.copy_(compute_right_factor(work.corrected, work.p))
 
             def after_q() -> None:
