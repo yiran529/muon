@@ -64,6 +64,7 @@ class BucketContext:
     previous_collective_tail: torch.futures.Future
     collective_completion_future: torch.futures.Future
     completion_future: torch.futures.Future
+    prepare_done: torch.cuda.Event | None = None
     retained: list[Any] = field(default_factory=list)
 
 
@@ -699,8 +700,8 @@ def power_sgd_ddp_hook(
 ) -> torch.futures.Future[Tensor]:
     """Average a DDP bucket via P+dense, Q, then local EF14 reconstruction.
 
-    This conservative chain serializes complete buckets. Both state-owned
-    placeholders complete together; a later overlap path can split their tails.
+    Preparation starts at bucket readiness. Only the collective tail orders
+    buckets; the aggregate completion tail also includes reconstruction writes.
     """
     context = state.note_bucket(bucket)
 
@@ -714,10 +715,47 @@ def power_sgd_ddp_hook(
             if not future.done():
                 future.set_exception(exc)
 
-    def finish() -> None:
-        if context.collective_completion_future is not context.completion_future:
-            context.collective_completion_future.set_result(None)
-        context.completion_future.set_result(context.buffer)
+    device = context.buffer.device
+
+    def stream_for(streams: dict[torch.device, torch.cuda.Stream]) -> torch.cuda.Stream:
+        if device not in streams:
+            streams[device] = torch.cuda.Stream(device=device)
+        return streams[device]
+
+    def record_inputs(stream: torch.cuda.Stream) -> None:
+        context.buffer.record_stream(stream)
+        for item in context.parameter_states:
+            if item is not None:
+                item.error.record_stream(stream)
+                item.q_memory.record_stream(stream)
+                item.q_initialized.record_stream(stream)
+
+    prepared = None
+    try:
+        if context.phase is not None and any(context.parameter_states):
+            if device.type == "cuda":
+                preparation_stream = stream_for(state._preparation_streams)
+                assert context.bucket_ready_event is not None
+                preparation_stream.wait_event(context.bucket_ready_event)
+                record_inputs(preparation_stream)
+                with torch.cuda.stream(preparation_stream):
+                    prepared = _prepare_compressed_bucket(state, context)
+                    context.prepare_done = torch.cuda.Event()
+                    context.prepare_done.record(preparation_stream)
+            else:
+                prepared = _prepare_compressed_bucket(state, context)
+    except BaseException as exc:
+        fail(exc)
+        return context.completion_future
+
+    def record_prepared(stream: torch.cuda.Stream) -> None:
+        record_inputs(stream)
+        if prepared is not None:
+            first, second, _, matrix_work = prepared
+            first.record_stream(stream)
+            second.record_stream(stream)
+            for work in matrix_work:
+                work.corrected.record_stream(stream)
 
     def guarded(callback: Callable[[], None]) -> Callable[[torch.futures.Future], None]:
         def run(completed: torch.futures.Future) -> None:
@@ -725,21 +763,16 @@ def power_sgd_ddp_hook(
                 # The callback runs only after completion; value propagates errors
                 # without blocking a worker thread on Work.wait().
                 completed.value()
-                if context.buffer.device.type == "cuda":
-                    device = context.buffer.device
+                if device.type == "cuda":
                     callback_stream = torch.cuda.current_stream(device)
-                    if device not in state._execution_streams:
-                        state._execution_streams[device] = torch.cuda.Stream(
-                            device=device
-                        )
-                    execution_stream = state._execution_streams[device]
+                    execution_stream = stream_for(state._execution_streams)
                     execution_stream.wait_stream(callback_stream)
-                    assert context.bucket_ready_event is not None
-                    execution_stream.wait_event(context.bucket_ready_event)
-                    context.buffer.record_stream(execution_stream)
+                    ready = context.prepare_done or context.bucket_ready_event
+                    assert ready is not None
+                    execution_stream.wait_event(ready)
+                    record_prepared(execution_stream)
                     with torch.cuda.stream(execution_stream):
                         callback()
-                    callback_stream.wait_stream(execution_stream)
                 else:
                     callback()
             except BaseException as exc:
@@ -748,20 +781,18 @@ def power_sgd_ddp_hook(
         return run
 
     def launch() -> None:
-        if context.phase is None or not any(context.parameter_states):
+        if prepared is None:
 
             def finish_dense() -> None:
                 context.buffer.div_(state.world_size)
-                finish()
+                context.completion_future.set_result(context.buffer)
 
             _all_reduce_future(state, context.buffer, "dense").add_done_callback(
                 guarded(finish_dense)
             )
             return
 
-        first, second, dense_views, matrix_work = _prepare_compressed_bucket(
-            state, context
-        )
+        first, second, dense_views, matrix_work = prepared
 
         def after_p() -> None:
             for gradient, packed in dense_views:
@@ -775,15 +806,37 @@ def power_sgd_ddp_hook(
                 work.q.copy_(compute_right_factor(work.corrected, work.p))
 
             def after_q() -> None:
-                second.div_(state.world_size)
-                for work in matrix_work:
-                    approximation = reconstruct(work.p, work.q)
-                    if state.config.error_feedback == "ef14":
-                        work.state.error.copy_(work.corrected - approximation)
-                    work.state.q_memory.copy_(work.q)
-                    work.state.q_initialized.fill_(True)
-                    work.gradient.copy_(approximation)
-                finish()
+                # Capture Q visibility before releasing B: its callback may
+                # immediately enqueue more work on the shared execution stream.
+                q_done = None
+                if device.type == "cuda":
+                    q_done = torch.cuda.Event()
+                    q_done.record(torch.cuda.current_stream(device))
+                    context.retained.append(q_done)
+                context.collective_completion_future.set_result(None)
+
+                def reconstruct_bucket() -> None:
+                    second.div_(state.world_size)
+                    for work in matrix_work:
+                        approximation = reconstruct(work.p, work.q)
+                        if state.config.error_feedback == "ef14":
+                            work.state.error.copy_(work.corrected - approximation)
+                        work.state.q_memory.copy_(work.q)
+                        work.state.q_initialized.fill_(True)
+                        work.gradient.copy_(approximation)
+                    # CUDA-aware completion exports all reconstruction/error
+                    # writes to DDP and the aggregate lifecycle Future.
+                    context.completion_future.set_result(context.buffer)
+
+                if device.type == "cuda":
+                    reconstruction_stream = stream_for(state._reconstruction_streams)
+                    assert q_done is not None
+                    reconstruction_stream.wait_event(q_done)
+                    record_prepared(reconstruction_stream)
+                    with torch.cuda.stream(reconstruction_stream):
+                        reconstruct_bucket()
+                else:
+                    reconstruct_bucket()
 
             _all_reduce_future(state, second, "q").add_done_callback(guarded(after_q))
 
@@ -791,5 +844,5 @@ def power_sgd_ddp_hook(
             guarded(after_p)
         )
 
-    context.previous_tail.add_done_callback(guarded(launch))
+    context.previous_collective_tail.add_done_callback(guarded(launch))
     return context.completion_future

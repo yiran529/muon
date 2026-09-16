@@ -1,5 +1,7 @@
 """Packing, averaging, and asynchronous lifecycle for the PowerSGD hook."""
 
+import threading
+
 import pytest
 import torch
 
@@ -182,7 +184,8 @@ def test_collective_failure_completes_both_state_placeholders(transport, failure
 
 
 @pytest.mark.parametrize(
-    "failure_point", ["preparation", "launch", "previous_tail", "reconstruction"]
+    "failure_point",
+    ["preparation", "launch", "previous_collective_tail", "reconstruction"],
 )
 def test_non_transport_failures_release_both_placeholders(
     monkeypatch, transport, failure_point
@@ -196,9 +199,9 @@ def test_non_transport_failures_release_both_placeholders(
     def broken(*args, **kwargs):
         raise RuntimeError("injected failure")
 
-    if failure_point == "previous_tail":
-        state.tail_future = torch.futures.Future()
-        state.tail_future.set_exception(RuntimeError("injected failure"))
+    if failure_point == "previous_collective_tail":
+        state.collective_tail = torch.futures.Future()
+        state.collective_tail.set_exception(RuntimeError("injected failure"))
     else:
         monkeypatch.setattr(
             hook_module,
@@ -215,16 +218,20 @@ def test_non_transport_failures_release_both_placeholders(
     if failure_point == "reconstruction":
         complete(calls, 0)
         complete(calls, 1)
+    assert result.done()
     with pytest.raises(RuntimeError, match="injected failure"):
         result.wait()
     assert state.tail_future.done()
     assert state.collective_tail.done()
     assert not state._active_contexts
-    with pytest.raises(RuntimeError, match="injected failure"):
+    if failure_point == "reconstruction":
         state.collective_tail.value()
+    else:
+        with pytest.raises(RuntimeError, match="injected failure"):
+            state.collective_tail.value()
 
 
-def test_second_bucket_waits_for_full_previous_chain(transport):
+def test_second_bucket_collectives_wait_for_previous_q(transport):
     calls, observer = transport
     first = torch.nn.Parameter(torch.zeros(8, 12))
     second = torch.nn.Parameter(torch.zeros(8, 12))
@@ -256,6 +263,140 @@ def test_second_bucket_waits_for_full_previous_chain(transport):
         "powersgd_hook/p_plus_aux",
         "powersgd_hook/q",
     ]
+
+
+def test_second_bucket_prepares_while_first_collective_is_pending(
+    monkeypatch, transport
+):
+    calls, _ = transport
+    parameters = [torch.nn.Parameter(torch.zeros(8, 12)) for _ in range(2)]
+    state = make_state([(p, "matrix") for p in parameters])
+    state.world_size = 2
+    state.begin_step()
+    prepared = []
+    original = hook_module._prepare_compressed_bucket
+
+    def prepare(current_state, context):
+        result = original(current_state, context)
+        prepared.append(context.bucket_index)
+        return result
+
+    monkeypatch.setattr(hook_module, "_prepare_compressed_bucket", prepare)
+    futures = [
+        hook_module.power_sgd_ddp_hook(
+            state, FakeGradBucket([p], [torch.ones_like(p)], index=i)
+        )
+        for i, p in enumerate(parameters)
+    ]
+    assert prepared == [0, 1]
+    assert len(calls) == 1
+    assert not any(f.done() for f in futures)
+    for i in range(4):
+        complete(calls, i)
+    state.finish_step()
+
+
+def test_collectives_advance_while_reconstruction_and_step_finish_are_pending(
+    monkeypatch, transport
+):
+    calls, observer = transport
+    parameters = [torch.nn.Parameter(torch.zeros(8, 12)) for _ in range(2)]
+    state = make_state([(p, "matrix") for p in parameters])
+    state.world_size = 2
+    state.begin_step()
+    futures = [
+        hook_module.power_sgd_ddp_hook(
+            state, FakeGradBucket([p], [torch.ones_like(p)], index=i)
+        )
+        for i, p in enumerate(parameters)
+    ]
+    entered = threading.Event()
+    release = threading.Event()
+    original = hook_module.reconstruct
+
+    def delayed_reconstruct(p, q):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(timeout=10), "test did not release reconstruction"
+        return original(p, q)
+
+    monkeypatch.setattr(hook_module, "reconstruct", delayed_reconstruct)
+    complete(calls, 0)
+    worker = threading.Thread(target=complete, args=(calls, 1))
+    worker.start()
+    try:
+        assert entered.wait(timeout=10)
+        assert len(calls) == 3  # P(B) is submitted before reconstruction(A).
+        assert not futures[0].done()
+        complete(calls, 2)
+        complete(calls, 3)
+        assert futures[1].done()
+        assert state.collective_tail.done()
+        assert not state.tail_future.done()
+        with pytest.raises(hook_module.PowerSGDStateError, match="still in flight"):
+            state.finish_step()
+    finally:
+        release.set()
+        worker.join(timeout=10)
+    assert not worker.is_alive()
+    futures[0].value()
+    state.finish_step()
+    assert [event.category for event in observer.events] == [
+        "powersgd_hook/p_plus_aux",
+        "powersgd_hook/q",
+        "powersgd_hook/p_plus_aux",
+        "powersgd_hook/q",
+    ]
+
+
+@pytest.mark.parametrize("stage", ["p", "q", "reconstruction"])
+def test_pipeline_failure_preserves_collective_submission_contract(
+    monkeypatch, transport, stage
+):
+    calls, _ = transport
+    parameters = [torch.nn.Parameter(torch.zeros(8, 12)) for _ in range(2)]
+    state = make_state([(p, "matrix") for p in parameters])
+    state.world_size = 2
+    state.begin_step()
+    futures = [
+        hook_module.power_sgd_ddp_hook(
+            state, FakeGradBucket([p], [torch.ones_like(p)], index=i)
+        )
+        for i, p in enumerate(parameters)
+    ]
+    if stage == "reconstruction":
+        original = hook_module.reconstruct
+        failed = False
+
+        def fail_once(p, q):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise KeyboardInterrupt("reconstruction cancelled")
+            return original(p, q)
+
+        monkeypatch.setattr(hook_module, "reconstruct", fail_once)
+        complete(calls, 0)
+        complete(calls, 1)
+        assert len(calls) == 3
+        complete(calls, 2)
+        complete(calls, 3)
+        futures[1].value()
+        state.collective_tail.value()
+    else:
+        if stage == "q":
+            complete(calls, 0)
+        calls[-1][1].future.set_exception(RuntimeError("transport cancelled"))
+        assert len(calls) == (1 if stage == "p" else 2)
+        assert futures[1].done()
+        with pytest.raises(RuntimeError, match="cancelled"):
+            futures[1].value()
+    assert futures[0].done()
+    with pytest.raises(RuntimeError, match="cancelled"):
+        futures[0].value()
+    with pytest.raises(RuntimeError, match="cancelled"):
+        state.finish_step()
+    assert not state._active_contexts
 
 
 @pytest.mark.parametrize(
