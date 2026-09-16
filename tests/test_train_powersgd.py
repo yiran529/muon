@@ -186,6 +186,9 @@ def test_ddp_yaml_loads_as_explicit_bf16_power_sgd_recipe():
     import train
 
     values = yaml.safe_load(CONFIG.read_text())
+    assert values["checkpoint_freq"] <= 0 or values.get(
+        "checkpoint_dir"
+    ), "train.main requires checkpoint_dir when checkpoint_freq is positive"
     with patch.object(sys, "argv", ["train_powersgd.py", "--config", str(CONFIG)]):
         args = train.parse_cli_args(configure_parser=module.configure_power_sgd_parser)
     hp = train.override_args_from_cli(module.PowerSGDHyperparameters(), args)
