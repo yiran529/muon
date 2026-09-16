@@ -84,6 +84,81 @@ def complete(calls, index):
     work.future.set_result([tensor])
 
 
+def _profile_event_names(profiler):
+    return {event.key for event in profiler.key_averages()}
+
+
+def test_dense_path_emits_profiler_ranges(transport):
+    calls, _ = transport
+    parameter = torch.nn.Parameter(torch.zeros(8, 12))
+    state = make_state(
+        [(parameter, "matrix")],
+        config=PowerSGDConfig(start_compress_step=1),
+    )
+    state.world_size = 2
+    bucket = FakeGradBucket([parameter], [torch.ones_like(parameter)])
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU], acc_events=True
+    ) as profiler:
+        state.begin_step()
+        result = hook_module.power_sgd_ddp_hook(state, bucket)
+        complete(calls, 0)
+        result.wait()
+        state.finish_step()
+
+    names = _profile_event_names(profiler)
+    assert any(name.startswith("powersgd_hook/bucket_ready ") for name in names)
+    assert any(name.startswith("powersgd_hook/chain_wait_begin ") for name in names)
+    assert any(name.startswith("powersgd_hook/chain_wait_end ") for name in names)
+    assert any(
+        name.startswith("powersgd_hook/collective_launch ")
+        and "collective_category=powersgd_hook%2Fdense" in name
+        for name in names
+    )
+    assert "powersgd_hook/dense/payload bytes=384" in names
+    assert any(name.startswith("powersgd_hook/future_complete ") for name in names)
+
+
+def test_compressed_path_emits_profiler_ranges(transport):
+    calls, _ = transport
+    matrix = torch.nn.Parameter(torch.zeros(8, 12))
+    auxiliary = torch.nn.Parameter(torch.zeros(3))
+    state = make_state([(matrix, "matrix"), (auxiliary, "dense_aux")])
+    state.world_size = 2
+    bucket = FakeGradBucket(
+        [matrix, auxiliary], [torch.ones_like(matrix), torch.ones_like(auxiliary)]
+    )
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU], acc_events=True
+    ) as profiler:
+        state.begin_step()
+        result = hook_module.power_sgd_ddp_hook(state, bucket)
+        complete(calls, 0)
+        complete(calls, 1)
+        result.wait()
+        state.finish_step()
+
+    names = _profile_event_names(profiler)
+    assert any(name.startswith("powersgd_hook/bucket_ready ") for name in names)
+    assert "powersgd_hook/preparation" in names
+    assert any(name.startswith("powersgd_hook/chain_wait_begin ") for name in names)
+    assert any(name.startswith("powersgd_hook/chain_wait_end ") for name in names)
+    launches = {
+        name for name in names if name.startswith("powersgd_hook/collective_launch ")
+    }
+    assert any(
+        "collective_category=powersgd_hook%2Fp_plus_aux" in name for name in launches
+    )
+    assert any("collective_category=powersgd_hook%2Fq" in name for name in launches)
+    assert "powersgd_hook/p_plus_aux/payload bytes=44" in names
+    assert "powersgd_hook/q/payload bytes=48" in names
+    assert "powersgd_hook/orthogonalization" in names
+    assert "powersgd_hook/reconstruction_error" in names
+    assert any(name.startswith("powersgd_hook/future_complete ") for name in names)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_warmup_uses_one_dense_collective_and_averages_once(transport, dtype):
     calls, observer = transport

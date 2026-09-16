@@ -90,10 +90,18 @@ Task 7 在当前实现上执行了：
 - repository-wide 的 unit/integration 子集（排除显式 multi-GPU、NCCL、CUDA
   graph 和 sharded-GPU tests）：957 passed，16 skipped，2 unrelated failures。
 
-本次按任务约束没有启动训练、timing、profiler、benchmark 或 CM experiments，
-也没有占用 GPU 执行可选 NCCL suite；因此 NCCL correctness test file 仍是后续
-exclusive-GPU gate，而不是本记录新增的通过结果。两项 broader-suite failure
-属于既有 GreedyLore/profiler contract 漂移，不涉及 M005：
+本次按任务约束没有启动训练、timing、formal profiler run、benchmark 或 CM
+experiments，也没有捕获 profiler trace。Task 5 的最终 CUDA review fix 已在安全
+空闲的本地 GPU 上执行
+`.venv/bin/pytest -q -m multi_gpu tests/test_power_sgd_ddp_hook_nccl.py`：
+`3 passed, 14 warnings in 22.59s`。其中 FP32 和 BF16 用例使用真实本地 two-rank
+NCCL，覆盖 rank-skewed delay、allocator churn、returned-Future 可见性、三轮压缩、
+mixed dense auxiliary、跨 rank collective signature 一致性以及真实 DDP backward；
+另一个 warmed CUDA regression 在所选两张 GPU 上分别验证 `finish_step` aggregate
+对多 bucket、独立 reconstruction stream 的梯度、EF14 error、Q memory 和
+`q_initialized` 写入可见性。这是 correctness evidence，不是 formal experiment 或
+性能结论。两项 broader-suite failure 属于既有 GreedyLore/profiler contract 漂移，
+不涉及 M005：
 
 - `tests/test_greedy_lore_profiler_launcher.py::test_print_plan_rotates_greedylore_modes_and_parameterizes_resources`
   预期的 `greedy_lore` mapping 缺少当前 plan 的
@@ -101,6 +109,7 @@ exclusive-GPU gate，而不是本记录新增的通过结果。两项 broader-su
 - `tests/test_training_profiler_trace.py::test_greedylore_bucket_timeline_reports_queue_launch_and_completion_offsets`
   预期 timeline 缺少当前输出中的 `prepare_*` 和 `chain_wait_*` 字段。
 
-仍待完成的 gate 是 exclusive-GPU NCCL correctness、profiler-off paired timing、
-端到端通信/step timing、以及 dense Muon/M002/M005 的公平 quality/convergence
-比较。PowerSGD 的 SGD 收敛结果不能直接外推到 nonlinear Muon。
+仍待完成的 gate 是 multi-node correctness、端到端 training、profiler-off paired
+timing、端到端通信/step timing，以及 dense Muon/M002/M005 的公平
+quality/convergence 比较。PowerSGD 的 SGD 收敛结果不能直接外推到 nonlinear
+Muon。

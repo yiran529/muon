@@ -1,14 +1,18 @@
 """Stable state and lifecycle for the PowerSGD DDP communication hook."""
 
+import json
 import threading
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Literal, Sequence
+from urllib.parse import quote
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.nn import Parameter
+from torch.profiler import record_function
 
 from .collective_observer import observe_collective
 from .power_sgd import (
@@ -636,17 +640,86 @@ class _MatrixWork:
     q: Tensor
 
 
+def _profile_range(name: str, **metadata: Any):
+    return record_function(name, args=json.dumps(metadata, sort_keys=True))
+
+
+def _profile_marker(name: str, **metadata: Any):
+    suffix = " ".join(
+        f"{key}={quote(str(value), safe='')}" for key, value in sorted(metadata.items())
+    )
+    return _profile_range(f"{name} {suffix}", **metadata)
+
+
+def _tensor_bytes(tensor: Tensor) -> int:
+    return int(tensor.numel() * tensor.element_size())
+
+
+def _bucket_profile_identity(context: BucketContext) -> dict[str, int]:
+    return {
+        "context_id": context.context_id,
+        "bucket_index": context.bucket_index,
+    }
+
+
+@contextmanager
+def _collective_profile_range(category: str, tensor: Tensor):
+    payload_bytes = _tensor_bytes(tensor)
+    observe_collective(category, "all_reduce", tensor)
+    with _profile_range(
+        category,
+        operation="all_reduce",
+        bytes=payload_bytes,
+        numel=int(tensor.numel()),
+    ):
+        with _profile_range(
+            f"{category}/payload bytes={payload_bytes}",
+            operation="all_reduce",
+            bytes=payload_bytes,
+            numel=int(tensor.numel()),
+        ):
+            yield
+
+
 def _all_reduce_future(
     state: PowerSGDDDPState, tensor: Tensor, stage: str
 ) -> torch.futures.Future:
     if state.world_size > 1:
-        observe_collective(f"powersgd_hook/{stage}", "all_reduce", tensor)
-        return dist.all_reduce(
-            tensor, group=state.process_group, async_op=True
-        ).get_future()
+        category = f"powersgd_hook/{stage}"
+        with _collective_profile_range(category, tensor):
+            return dist.all_reduce(
+                tensor, group=state.process_group, async_op=True
+            ).get_future()
     future = torch.futures.Future(devices=_future_devices(tensor.device))
     future.set_result(tensor)
     return future
+
+
+def _profiled_all_reduce_future(
+    state: PowerSGDDDPState,
+    context: BucketContext,
+    tensor: Tensor,
+    stage: str,
+) -> torch.futures.Future:
+    with _profile_marker(
+        "powersgd_hook/collective_launch",
+        **_bucket_profile_identity(context),
+        collective_category=f"powersgd_hook/{stage}",
+        operation="all_reduce",
+        bytes=_tensor_bytes(tensor),
+    ):
+        return _all_reduce_future(state, tensor, stage)
+
+
+def _mark_future_complete(context: BucketContext) -> None:
+    def mark(_completed: torch.futures.Future) -> None:
+        with _profile_marker(
+            "powersgd_hook/future_complete",
+            **_bucket_profile_identity(context),
+        ):
+            pass
+
+    context.completion_future.add_done_callback(mark)
 
 
 def _prepare_compressed_bucket(
@@ -701,7 +774,8 @@ def _prepare_compressed_bucket(
         )
         if config.warm_start:
             initial_q = torch.where(item.q_initialized, item.q_memory, initial_q)
-        initial_q = orthogonalize(initial_q, config.orthogonalization_epsilon)
+        with _profile_range("powersgd_hook/orthogonalization"):
+            initial_q = orthogonalize(initial_q, config.orthogonalization_epsilon)
         p_numel = gradient.shape[0] * item.q_memory.shape[1]
         p = first[offset : offset + p_numel].view(gradient.shape[0], -1)
         p.copy_(compute_left_factor(corrected, initial_q))
@@ -722,6 +796,14 @@ def power_sgd_ddp_hook(
     buckets; the aggregate completion tail also includes reconstruction writes.
     """
     context = state.note_bucket(bucket)
+    with _profile_marker(
+        "powersgd_hook/bucket_ready",
+        **_bucket_profile_identity(context),
+        bucket_bytes=_tensor_bytes(context.buffer),
+        phase="compressed" if context.phase is not None else "warmup",
+    ):
+        pass
+    _mark_future_complete(context)
 
     def fail(exc: BaseException) -> None:
         # Torch futures accept Exception only, including on cancellation paths.
@@ -757,11 +839,13 @@ def power_sgd_ddp_hook(
                 preparation_stream.wait_event(context.bucket_ready_event)
                 record_inputs(preparation_stream)
                 with torch.cuda.stream(preparation_stream):
-                    prepared = _prepare_compressed_bucket(state, context)
+                    with _profile_range("powersgd_hook/preparation"):
+                        prepared = _prepare_compressed_bucket(state, context)
                     context.prepare_done = torch.cuda.Event()
                     context.prepare_done.record(preparation_stream)
             else:
-                prepared = _prepare_compressed_bucket(state, context)
+                with _profile_range("powersgd_hook/preparation"):
+                    prepared = _prepare_compressed_bucket(state, context)
     except BaseException as exc:
         fail(exc)
         return context.completion_future
@@ -805,9 +889,9 @@ def power_sgd_ddp_hook(
                 context.buffer.div_(state.world_size)
                 context.completion_future.set_result(context.buffer)
 
-            _all_reduce_future(state, context.buffer, "dense").add_done_callback(
-                guarded(finish_dense)
-            )
+            _profiled_all_reduce_future(
+                state, context, context.buffer, "dense"
+            ).add_done_callback(guarded(finish_dense))
             return
 
         first, second, dense_views, matrix_work = prepared
@@ -818,9 +902,10 @@ def power_sgd_ddp_hook(
             for work in matrix_work:
                 # P is a sum. Scaling before this normalization changes epsilon's
                 # effect, and is unnecessary for the PowerSGD projection.
-                work.p.copy_(
-                    orthogonalize(work.p, state.config.orthogonalization_epsilon)
-                )
+                with _profile_range("powersgd_hook/orthogonalization"):
+                    work.p.copy_(
+                        orthogonalize(work.p, state.config.orthogonalization_epsilon)
+                    )
                 work.q.copy_(compute_right_factor(work.corrected, work.p))
 
             def after_q() -> None:
@@ -834,14 +919,15 @@ def power_sgd_ddp_hook(
                 context.collective_completion_future.set_result(None)
 
                 def reconstruct_bucket() -> None:
-                    second.div_(state.world_size)
-                    for work in matrix_work:
-                        approximation = reconstruct(work.p, work.q)
-                        if state.config.error_feedback == "ef14":
-                            work.state.error.copy_(work.corrected - approximation)
-                        work.state.q_memory.copy_(work.q)
-                        work.state.q_initialized.fill_(True)
-                        work.gradient.copy_(approximation)
+                    with _profile_range("powersgd_hook/reconstruction_error"):
+                        second.div_(state.world_size)
+                        for work in matrix_work:
+                            approximation = reconstruct(work.p, work.q)
+                            if state.config.error_feedback == "ef14":
+                                work.state.error.copy_(work.corrected - approximation)
+                            work.state.q_memory.copy_(work.q)
+                            work.state.q_initialized.fill_(True)
+                            work.gradient.copy_(approximation)
                     # CUDA-aware completion exports all reconstruction/error
                     # writes to DDP and the aggregate lifecycle Future.
                     context.completion_future.set_result(context.buffer)
@@ -856,11 +942,27 @@ def power_sgd_ddp_hook(
                 else:
                     reconstruct_bucket()
 
-            _all_reduce_future(state, second, "q").add_done_callback(guarded(after_q))
+            _profiled_all_reduce_future(state, context, second, "q").add_done_callback(
+                guarded(after_q)
+            )
 
-        _all_reduce_future(state, first, "p_plus_aux").add_done_callback(
-            guarded(after_p)
-        )
+        _profiled_all_reduce_future(
+            state, context, first, "p_plus_aux"
+        ).add_done_callback(guarded(after_p))
 
-    context.previous_collective_tail.add_done_callback(guarded(launch))
+    with _profile_marker(
+        "powersgd_hook/chain_wait_begin",
+        **_bucket_profile_identity(context),
+    ):
+        pass
+
+    def after_previous_profiled(previous: torch.futures.Future) -> None:
+        with _profile_marker(
+            "powersgd_hook/chain_wait_end",
+            **_bucket_profile_identity(context),
+        ):
+            pass
+        guarded(launch)(previous)
+
+    context.previous_collective_tail.add_done_callback(after_previous_profiled)
     return context.completion_future

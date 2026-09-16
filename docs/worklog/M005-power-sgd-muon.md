@@ -36,14 +36,23 @@ M005 的实现和修订由以下提交组成：
 2. `tests/test_training_profiler_trace.py::test_greedylore_bucket_timeline_reports_queue_launch_and_completion_offsets`
    期望 timeline 没有当前实现新增的 `prepare_*` / `chain_wait_*` 字段。
 
-没有启动 formal training、timing、profiler、benchmark 或 CM run；没有改动上述
-GreedyLore 文件，也没有为 M005 编造 experiment ID、指标或质量结果。NCCL suite
-保留为后续 exclusive-GPU correctness gate，本次没有在占用 GPU 的条件下运行。
+没有启动 formal training、timing、profiler trace capture、benchmark 或 CM run；
+没有改动上述 GreedyLore 文件，也没有为 M005 编造 experiment ID、指标或质量
+结果。Task 5 最终 CUDA review fix 在只读检查确认可安全使用的本地 GPU 上运行了
+`.venv/bin/pytest -q -m multi_gpu tests/test_power_sgd_ddp_hook_nccl.py`：
+`3 passed, 14 warnings in 22.59s`。FP32 与 BF16 case 均为真实本地 two-rank NCCL
+correctness，覆盖 rank-skewed delay、allocator churn、returned-Future 可见性、三轮
+压缩、mixed dense auxiliary、跨 rank collective signature 一致性与真实 DDP
+backward。第三个 warmed CUDA regression 在所选两张 GPU 上分别验证：未等待任一
+bucket Future 时，`finish_step` aggregate 仍能向 caller stream 暴露多 bucket、独立
+reconstruction stream 上的 gradient、EF14 error、Q memory 和 `q_initialized`
+写入。该 suite 是 correctness smoke，不构成 timing 或性能实验。
 
 ### 结论与下一步
 
 实现、checkpoint schema、CPU/Gloo hook lifecycle 和 DDP integration 已有测试
-覆盖，方法记录进入 `testing`。下一步必须先完成可独占 GPU 的 NCCL correctness
-gate，再进行 profiler-off paired timing 和公平 quality/convergence runs；在此
+覆盖，本地 two-rank NCCL correctness 与 aggregate CUDA visibility 也已有上述
+短测试证据，方法记录进入 `testing`。下一步仍需完成 multi-node correctness、
+端到端 training、profiler-off paired timing 和公平 quality/convergence runs；在此
 之前不应把 payload 公式写成端到端 speedup，也不应把 PowerSGD 的 SGD 证据写成
 Muon convergence 证据。
