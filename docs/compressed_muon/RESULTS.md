@@ -1080,6 +1080,16 @@ CM087/088均为 **completed/diagnostic-positive**，但都是单样本，不能�
 | CM092 / CM088 shared200 | 416.94 ms | **361.63 ms** | **-55.31 ms (-13.27%)** | 458.74 ms | -21.17% |
 | CM092 / CM088 shared800 | 352.90 ms | **346.59 ms** | **-6.31 ms (-1.79%)** | 458.74 ms | -24.45% |
 
+这些行对应的 model size 与 batch 几何如下；下表中的 `device/global bsz` 分别表示每张 GPU 的 batch 和 4 卡汇总后的 global batch，GA 均为 1：
+
+| 实验 / 对照几何 | 模型规模（参数量） | 模型结构（dim / layers / heads） | device/global bsz | dtype |
+|---|---:|---:|---:|---|
+| CM089 / CM078 full BF16 | GPT-130M（约130M） | 768 / 8 / 12 | 128 / 512 | BF16 |
+| CM090 / CM085 independent200 | GPT-350M（354.7M） | 1024 / 20 / 16 | 64 / 256 | FP32 参数、gradient、bucket 和 M002 state；BF16 autocast |
+| CM091 / CM087 bucket160 | GPT-350M（354.7M） | 1024 / 20 / 16 | 8 / 32 | FP32 参数、gradient、bucket 和 M002 state；BF16 autocast |
+| CM091 / CM087 bucket80 | GPT-350M（354.7M） | 1024 / 20 / 16 | 8 / 32 | FP32 参数、gradient、bucket 和 M002 state；BF16 autocast |
+| CM092 / CM088 independent200/shared200/shared800 | GPT-720M（718.6M） | 1280 / 30 / 20 | 8 / 32 | FP32 参数、gradient、bucket 和 M002 state；BF16 autocast |
+
 CM092的shared interval200/800来自同一新controller，可用二点模型拆分为：
 
 | 分量 | CM088 local-SVD | CM092 sharded-SVD | 变化 |
