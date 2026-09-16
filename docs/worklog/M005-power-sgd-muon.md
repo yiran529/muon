@@ -84,6 +84,10 @@ CM095a 启动前进行了4卡短试跑：dim64、2层、rank2、BF16、4 updates
 `start_compress_step=0`、无compile，exit 0，最终打印 step4/4 与验证指标。
 此试跑只验证入口参数和基本DDP压缩路径，不作为rank32性能数据。
 随后启动 `cm095a-powersgd-timing` tmux 控制器；按用户要求不轮询。
+但启动门槛只检查每卡空闲显存，错误地选入已有其他计算进程的GPU7。
+用户指出后立即向本次torchrun发TERM，确认CM095a父子进程均退出；保留
+产物但不使用部分运行数据。CM095b启动门槛改为每卡显存占用低于1 GiB且
+GPU UUID不在计算进程表中，四卡同时满足才运行；不复用CM095a产物。
 
 首次 controller 启动后按用户要求关闭 checkpoint 保存；训练 worker 被定向停止，
 原 controller 与 CM093 早期产物以 `-aborted-20260916T181005-checkpoint-enabled`

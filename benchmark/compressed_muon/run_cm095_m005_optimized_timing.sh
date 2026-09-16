@@ -3,7 +3,7 @@
 set -uo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-artifact_root="$repo_dir/artifacts/compressed_muon/CM095a-m005-powersgd-optimized-cm089-geometry-ws4-s42"
+artifact_root="$repo_dir/artifacts/compressed_muon/CM095b-m005-powersgd-optimized-cm089-geometry-ws4-s42"
 cell_name=powersgd-timing-r1
 cell_dir="$artifact_root/$cell_name"
 config="$repo_dir/configs/compressed_muon/cm095a_m005_power_sgd_optimized_timing.yaml"
@@ -13,6 +13,7 @@ python_bin="$repo_dir/.venv/bin/python"
 data_dir="$repo_dir/data/fineweb10B"
 world_size=4
 minimum_free_mib=18000
+maximum_idle_used_mib=1024
 gpu_wait_seconds=300
 
 timestamp() { date --iso-8601=seconds; }
@@ -36,10 +37,18 @@ finish() {
 trap finish EXIT
 
 select_gpus() {
-    nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null |
-    awk -F, -v minimum="$minimum_free_mib" '
-        {gsub(/ /, "", $1); gsub(/ /, "", $2)}
-        ($2 + 0) >= minimum {print $1}
+    local busy_uuids
+    busy_uuids="$(
+        nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>/dev/null |
+        awk '/^GPU-/ {gsub(/ /, "", $0); print}' | paste -sd, -
+    )"
+    nvidia-smi --query-gpu=index,uuid,memory.used,memory.free \
+        --format=csv,noheader,nounits 2>/dev/null |
+    awk -F, -v minimum="$minimum_free_mib" -v maximum="$maximum_idle_used_mib" \
+        -v busy="$busy_uuids" '
+        {for (i = 1; i <= 4; i++) gsub(/ /, "", $i)}
+        ($3 + 0) < maximum && ($4 + 0) >= minimum &&
+            index("," busy ",", "," $2 ",") == 0 {print $1}
     ' | sort -n | head -n "$world_size" | paste -sd, -
 }
 while true; do
@@ -47,7 +56,7 @@ while true; do
     if [[ -n "$gpu_list" && "$(awk -F, '{print NF}' <<<"$gpu_list")" -eq "$world_size" ]]; then
         break
     fi
-    log "GPU_WAIT required=$world_size minimum_free_mib=$minimum_free_mib retry_seconds=$gpu_wait_seconds"
+    log "GPU_WAIT required=$world_size maximum_idle_used_mib=$maximum_idle_used_mib no_compute_process=true retry_seconds=$gpu_wait_seconds"
     sleep "$gpu_wait_seconds"
 done
 printf '%s\n' "$gpu_list" > "$artifact_root/gpu_list.txt"
@@ -58,7 +67,7 @@ import json
 import os
 
 print(json.dumps({
-    "experiment_id": "CM095a-m005-powersgd-optimized-cm089-geometry-ws4-s42",
+    "experiment_id": "CM095b-m005-powersgd-optimized-cm089-geometry-ws4-s42",
     "world_size": 4,
     "global_batch_size": 512,
     "device_batch_size": 128,
@@ -92,6 +101,7 @@ command=(env -u NCCL_DEBUG -u NCCL_P2P_DISABLE -u NCCL_SHM_DISABLE
     --num_iterations 820 --timing-warmup-steps 20 --bucket-cap-mb 80
     --training-seed 42 --warmup_steps 0 --warmdown_ratio 0
     --lr_schedule linear --checkpoint_freq 0
+    --wandb_job_name CM095b-m005-powersgd-optimized-cm089-geometry-ws4-s42
     --power_sgd_rank 32 --power_sgd_start_compress_step 0
     --power_sgd_error_feedback ef14 --power_sgd_warm_start
     --power_sgd_seed 42)
