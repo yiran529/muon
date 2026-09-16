@@ -56,3 +56,16 @@ reconstruction stream 上的 gradient、EF14 error、Q memory 和 `q_initialized
 端到端 training、profiler-off paired timing 和公平 quality/convergence runs；在此
 之前不应把 payload 公式写成端到端 speedup，也不应把 PowerSGD 的 SGD 证据写成
 Muon convergence 证据。
+
+## 2026-09-16：CM093/CM094 rank32 主实验启动
+
+按 GreedyLore 论文 Table IV 与 CM070 的低秩口径，只安排 M005 rank32 主实验：
+CM093 为 GPT-60M/10,000 updates，CM094 为 GPT-130M/20,000 updates；均使用
+4 GPU DDP、BF16参数、FineWeb10B、seq256、global/device batch512/128、
+bucket160 MiB、EF14、warm start、step1000后压缩和 seed1234。dense 与 M002
+对照复用 CM070，不重跑 high-rank PowerSGD。
+
+首次 controller 启动后按用户要求关闭 checkpoint 保存；训练 worker 被定向停止，
+原 controller 与 CM093 早期产物以 `-aborted-20260916T181005-checkpoint-enabled`
+后缀保留。两份正式配置均改为 `checkpoint_freq: 0`，随后使用原实验编号重新启动；
+本次按要求未执行额外脚本测试。
