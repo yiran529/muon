@@ -81,14 +81,30 @@ def _completed_future(device: torch.device) -> torch.futures.Future:
 def _join_completion_futures(
     previous: torch.futures.Future,
     current: torch.futures.Future,
+    device: torch.device,
 ) -> torch.futures.Future:
-    """Complete after both inputs and propagate either input exception."""
+    """Join host completion, CUDA visibility, and errors from both inputs."""
+    joined = torch.futures.Future(devices=_future_devices(device))
 
     def finish(completed: torch.futures.Future) -> None:
-        for future in completed.value():
-            future.value()
+        try:
+            result = None
+            for future in completed.value():
+                # collect_all guarantees host completion. wait() is therefore
+                # only a stream dependency export, not device synchronization.
+                result = future.wait()
+            # collect_all's child Future is not CUDA-aware. Explicitly export a
+            # tensor through our device-aware Future to retain the joined event.
+            joined.set_result(result)
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                failure = RuntimeError(f"{type(exc).__name__}: {exc}")
+                failure.__cause__ = exc
+                exc = failure
+            joined.set_exception(exc)
 
-    return torch.futures.collect_all([previous, current]).then(finish)
+    torch.futures.collect_all([previous, current]).add_done_callback(finish)
+    return joined
 
 
 class PowerSGDDDPState:
@@ -372,7 +388,7 @@ class PowerSGDDDPState:
         with self._context_lock:
             self._active_contexts[context_id] = context
             self.tail_future = _join_completion_futures(
-                previous_tail, completion_future
+                previous_tail, completion_future, buffer.device
             )
             self.collective_tail = collective_completion_future
 
@@ -400,7 +416,9 @@ class PowerSGDDDPState:
             )
         if not self.tail_future.done():
             raise PowerSGDStateError("PowerSGD bucket tail is still in flight")
-        self.tail_future.value()
+        # done() above preserves the nonblocking lifecycle check. The completed
+        # Future wait exports every reconstruction to the caller's CUDA stream.
+        self.tail_future.wait()
         self._finished_step = True
 
     def commit_step(self) -> None:

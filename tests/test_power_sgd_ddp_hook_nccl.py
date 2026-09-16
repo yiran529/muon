@@ -59,6 +59,114 @@ def _free_port():
         return sock.getsockname()[1]
 
 
+def _join_workers(context):
+    deadline = time.monotonic() + 90
+    try:
+        while not context.join(timeout=max(0, deadline - time.monotonic())):
+            if time.monotonic() >= deadline:
+                pytest.fail("PowerSGD CUDA correctness smoke exceeded 90 seconds")
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+
+def _finish_visibility_worker(rank):
+    """Do not let bucket.wait() hide a missing aggregate stream dependency."""
+    torch.set_num_threads(1)
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    parameters = [
+        torch.nn.Parameter(torch.zeros(64, 96, device=device)) for _ in range(2)
+    ]
+    state = make_state([(p, "matrix") for p in parameters])
+    consumer = torch.cuda.Stream(device=device)
+    reconstruction_streams = [torch.cuda.Stream(device=device) for _ in parameters]
+    # Warm up the real hook so CUDA module loading/allocation cannot consume
+    # the deliberate reconstruction delay before the consumer is submitted.
+    state.begin_step()
+    for i, parameter in enumerate(parameters):
+        state._reconstruction_streams[device] = reconstruction_streams[i]
+        hook_module.power_sgd_ddp_hook(
+            state, FakeGradBucket([parameter], [torch.ones_like(parameter)], index=i)
+        ).wait()
+    state.finish_step()
+    state.commit_step()
+    torch.cuda.current_stream(device).synchronize()
+
+    for parameter in parameters:
+        item = state.parameter_state(parameter)
+        item.error.fill_(3)
+        item.q_memory.zero_()
+        item.q_initialized.fill_(False)
+    consumer.wait_stream(torch.cuda.current_stream(device))
+    original = hook_module.reconstruct
+    reconstruction_index = 0
+
+    def delayed_reconstruct(p, q):
+        nonlocal reconstruction_index
+        torch.cuda._sleep(500_000_000 if reconstruction_index == 0 else 50_000_000)
+        reconstruction_index += 1
+        return original(p, q)
+
+    hook_module.reconstruct = delayed_reconstruct
+    try:
+        state.begin_step()
+        buckets = [
+            FakeGradBucket([p], [torch.ones_like(p)], index=i)
+            for i, p in enumerate(parameters)
+        ]
+        results = []
+        for i, bucket in enumerate(buckets):
+            # Independent streams make B finish before A. This exercises the
+            # aggregate dependency on every bucket, not just the final tensor.
+            state._reconstruction_streams[device] = reconstruction_streams[i]
+            results.append(hook_module.power_sgd_ddp_hook(state, bucket))
+        assert state.tail_future.done()
+        with torch.cuda.stream(consumer):
+            state.finish_step()
+            snapshots = [
+                (
+                    bucket.buffer().clone(),
+                    state.parameter_state(p).error.clone(),
+                    state.parameter_state(p).q_memory.clone(),
+                    state.parameter_state(p).q_initialized.clone(),
+                )
+                for p, bucket in zip(parameters, buckets)
+            ]
+        consumer.synchronize()
+        for output, error, q, initialized in snapshots:
+            assert (
+                initialized.item()
+            ), "finish_step did not expose reconstruction writes"
+            torch.testing.assert_close(
+                output, torch.full_like(output, 4), atol=5e-5, rtol=5e-5
+            )
+            torch.testing.assert_close(
+                error, torch.zeros_like(error), atol=5e-5, rtol=0
+            )
+            assert torch.linalg.vector_norm(q).item() > 0
+        # Only after observing the finish boundary may the test consume bucket
+        # Futures. Their waits must not supply the dependency being tested.
+        for result in results:
+            result.wait()
+        state.commit_step()
+    finally:
+        hook_module.reconstruct = original
+        for stream in reconstruction_streams:
+            stream.synchronize()
+
+
+@pytest.mark.multi_gpu
+def test_finish_step_exports_all_reconstruction_writes_without_bucket_wait(monkeypatch):
+    devices = _exclusive_devices()
+    if len(devices) < 2:
+        pytest.skip("requires two exclusive CUDA devices")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(devices))
+    _join_workers(mp.spawn(_finish_visibility_worker, nprocs=2, join=False))
+
+
 def _worker(rank, port, dtype_name):
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
@@ -230,13 +338,4 @@ def test_pipeline_nccl_visibility_allocator_churn_and_rank_order(
         pytest.skip("requires two exclusive CUDA devices and NCCL")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(devices))
     context = mp.spawn(_worker, args=(_free_port(), dtype_name), nprocs=2, join=False)
-    deadline = time.monotonic() + 90
-    try:
-        while not context.join(timeout=max(0, deadline - time.monotonic())):
-            if time.monotonic() >= deadline:
-                pytest.fail("PowerSGD NCCL correctness smoke exceeded 90 seconds")
-    finally:
-        for process in context.processes:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
+    _join_workers(context)
