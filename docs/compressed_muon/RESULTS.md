@@ -1063,3 +1063,32 @@ CM088 保持 CM086 的720M FP32配置，仅将global/device batch从48/12降到3
 batch8的shared二点模型估计ordinary为 `331.553 ms`，约比dense快 `27.72%`；单次refresh额外约 `17077.333 ms`，与batch12的 `17010.667 ms` 基本一致。降低batch后dense缩短 `57.05 ms`，independent缩短 `21.29 ms`，shared只缩短约10 ms，结果是相对收益反而从 `12.81%/17.20%/29.57%` 收窄到 `6.61%/9.11%/23.07%`。这表明“batch越小、通信占比越高、压缩收益越大”在这里并不单调：M002存在几乎不随batch下降的score、重构和refresh成本地板。
 
 CM087/088均为 **completed/diagnostic-positive**，但都是单样本，不能替代重复实验或给出区间。原始产物：`artifacts/compressed_muon/CM087-m002-gpt350m-fp32-current-code-batch8-bucket-bridge-ws4-s42/`、`artifacts/compressed_muon/CM088-m002-gpt720m-fp32-device-batch8-timing-ws4-s42/`。
+
+## CM089–CM092：跨 rank 分片 basis refresh（2026-09-16）
+
+`sharded_svd`保留refresh corrected-gradient dense All-Reduce，但不再让每个rank重复计算全部矩阵的basis。参数按估算分解成本确定性分配给4个rank；各rank在`finish_step()`计算自己的SVD/eigh，再按稳定参数顺序广播完整basis。basis与error仍在所有rank复制，因此这项改动优化refresh计算，不降低持久显存，也相对`local_svd`新增完整basis广播。
+
+四组历史几何共7个profiler-off单样本全部exit0：
+
+| 新实验 / 对照几何 | 历史 local-SVD | sharded-SVD | 变化 | 历史 dense | sharded相对dense |
+|---|---:|---:|---:|---:|---:|
+| CM089 / CM078 full BF16 | 203.77 ms | **198.67 ms** | **-5.10 ms (-2.50%)** | 198.627 ms | +0.02% |
+| CM090 / CM085 independent200 | 432.13 ms | **411.94 ms** | **-20.19 ms (-4.67%)** | 392.65 ms | +4.91% |
+| CM091 / CM087 bucket160 | 201.66 ms | **174.66 ms** | **-27.00 ms (-13.39%)** | 239.11 ms | -26.95% |
+| CM091 / CM087 bucket80 | 215.93 ms | **185.35 ms** | **-30.58 ms (-14.16%)** | 252.70 ms | -26.65% |
+| CM092 / CM088 independent200 | 428.41 ms | **371.93 ms** | **-56.48 ms (-13.18%)** | 458.74 ms | -18.92% |
+| CM092 / CM088 shared200 | 416.94 ms | **361.63 ms** | **-55.31 ms (-13.27%)** | 458.74 ms | -21.17% |
+| CM092 / CM088 shared800 | 352.90 ms | **346.59 ms** | **-6.31 ms (-1.79%)** | 458.74 ms | -24.45% |
+
+CM092的shared interval200/800来自同一新controller，可用二点模型拆分为：
+
+| 分量 | CM088 local-SVD | CM092 sharded-SVD | 变化 |
+|---|---:|---:|---:|
+| 估计 ordinary step | 331.553 ms | 341.577 ms | +10.024 ms |
+| 单次 refresh 额外时间 | 17077.333 ms | **4010.667 ms** | **-13066.666 ms (-76.51%)** |
+| interval200 refresh摊销 | 85.387 ms/update | **20.053 ms/update** | -65.334 ms/update |
+| interval800 refresh摊销 | 21.347 ms/update | **5.013 ms/update** | -16.334 ms/update |
+
+单次refresh约缩短至原来的23.5%，接近4卡参数级分片的理想量级，证明多rank重复basis分解是主要refresh瓶颈。interval800原本已经强烈摊薄refresh，所以sharded-SVD只再改善`1.79%`；interval200和更大FP32模型上的完整周期收益更明显。ordinary估计较CM088历史值高约10 ms，但sharded路径不改变ordinary步骤，这一跨实验差异不作机制归因。
+
+CM089 peak allocated为`11447 MiB`，CM090为`22086 MiB`，CM091 bucket160/80为`9731/9707 MiB`，CM092三项均为`19548 MiB`。短窗口validation loss均有限且无NaN/Inf，只用于确认运行稳定，不作质量比较。所有百分比均为与历史单样本的跨实验比较；除CM092内部interval差分外，不视为严格配对或统计结论。原始产物：`artifacts/compressed_muon/CM089-m002-sharded-svd-cm078-geometry-ws4-s42/`至`CM092-m002-sharded-svd-cm088-geometry-ws4-s42/`。

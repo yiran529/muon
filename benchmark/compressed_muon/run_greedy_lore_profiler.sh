@@ -81,7 +81,7 @@ validate_modes() {
     IFS=',' read -ra values <<<"$raw"
     for value in "${values[@]}"; do
         case "$value" in
-            dense|greedylore_local_svd|greedylore_local_svd_shared|greedylore_broadcast|greedylore_local_svd_partial|greedylore_local_svd_full) ;;
+            dense|greedylore_local_svd|greedylore_local_svd_shared|greedylore_broadcast|greedylore_local_svd_partial|greedylore_local_svd_full|greedylore_sharded_svd|greedylore_sharded_svd_shared|greedylore_sharded_svd_full) ;;
             *) printf 'invalid %s mode: %s\n' "$label" "$value" >&2; return 64 ;;
         esac
         if [[ "$seen" == *",$value,"* ]]; then
@@ -331,7 +331,7 @@ run_cell() {
             --greedy_lore_update_interval "$greedy_lore_update_interval"
             --greedy_lore_start_compress_step "$timing_warmup_steps"
             --greedy_lore_dense_aux_communication_dtype "$greedy_lore_dense_aux_communication_dtype")
-        if [[ "$mode_name" == "greedylore_local_svd_shared" ]]; then
+        if [[ "$mode_name" == "greedylore_local_svd_shared" || "$mode_name" == "greedylore_sharded_svd_shared" ]]; then
             command+=(--greedy_lore_score_randomization shared)
         else
             command+=(--greedy_lore_score_randomization independent)
@@ -341,7 +341,7 @@ run_cell() {
         fi
         if [[ "$mode_name" == "greedylore_local_svd_partial" ]]; then
             command+=(--greedy_lore_isolate_dense_aux_buckets)
-        elif [[ "$mode_name" == "greedylore_local_svd_full" ]]; then
+        elif [[ "$mode_name" == "greedylore_local_svd_full" || "$mode_name" == "greedylore_sharded_svd_full" ]]; then
             [[ -n "$greedy_lore_calibrated_bucket_cap_mb_list" ]] || {
                 log "BLOCKED missing_calibrated_bucket_caps cell=$cell"
                 return 64
@@ -354,6 +354,8 @@ run_cell() {
         fi
         if [[ "$mode_name" == "greedylore_broadcast" ]]; then
             command+=(--greedy_lore_basis_sync broadcast)
+        elif [[ "$mode_name" == greedylore_sharded_svd* ]]; then
+            command+=(--greedy_lore_basis_sync sharded_svd)
         else
             command+=(--greedy_lore_basis_sync local_svd)
         fi

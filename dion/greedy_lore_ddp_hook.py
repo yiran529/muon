@@ -170,6 +170,34 @@ def _tensor_bytes(tensor: Tensor) -> int:
     return int(tensor.numel() * tensor.element_size())
 
 
+def _sharded_svd_owner_map(
+    parameter_states: Sequence[GreedyLoreParameterState],
+    world_size: int,
+) -> dict[int, int]:
+    """Assign whole-matrix decompositions with deterministic LPT balancing."""
+
+    loads = [0] * world_size
+    owners = {}
+    ordered = sorted(
+        parameter_states,
+        key=lambda state: (
+            -(
+                state.orientation.compressed_shape[0] ** 2
+                * state.orientation.compressed_shape[1]
+                + state.orientation.compressed_shape[0] ** 3
+            ),
+            state.spec.stable_name,
+        ),
+    )
+    for parameter_state in ordered:
+        rows, columns = parameter_state.orientation.compressed_shape
+        cost = rows * rows * columns + rows * rows * rows
+        owner = min(range(world_size), key=lambda rank: (loads[rank], rank))
+        owners[id(parameter_state.spec.parameter)] = owner
+        loads[owner] += cost
+    return owners
+
+
 def _bucket_profile_identity(context: "BucketContext") -> dict[str, int]:
     return {
         "context_id": context.context_id,
@@ -230,7 +258,7 @@ def _bucket_profile_metadata(state: "GreedyLoreDDPState", context: "BucketContex
         if (
             context.phase is not None
             and is_refresh_step(context.step, state.config)
-            and state.config.basis_sync == "broadcast"
+            and state.config.basis_sync in ("broadcast", "sharded_svd")
         ):
             basis_bytes += _tensor_bytes(parameter_state.basis)
     phase = "warmup"
@@ -359,6 +387,7 @@ class GreedyLoreDDPState:
             if process_group is not None
             else (0,)
         )
+        self.group_local_rank = self.group_ranks.index(self.global_rank)
         self._specs_by_parameter = {
             id(spec.parameter): spec for spec in self.parameter_specs
         }
@@ -388,6 +417,17 @@ class GreedyLoreDDPState:
                     device=spec.parameter.device,
                 ),
             )
+        self._ordered_matrix_states = tuple(
+            sorted(
+                self._parameter_states.values(),
+                key=lambda parameter_state: parameter_state.spec.stable_name,
+            )
+        )
+        self._sharded_svd_owners = _sharded_svd_owner_map(
+            self._ordered_matrix_states,
+            self.world_size,
+        )
+        self._sharded_refresh_gradients: dict[int, Tensor] = {}
 
         device = self.parameter_specs[0].parameter.device
         self.tail_future = _completed_future(device)
@@ -579,6 +619,7 @@ class GreedyLoreDDPState:
         self._finished_step = False
         self._seen_parameter_ids.clear()
         self._current_bucket_layout.clear()
+        self._sharded_refresh_gradients.clear()
         return self._active_step
 
     def _record_bucket_layout(self, context: BucketContext) -> None:
@@ -789,6 +830,11 @@ class GreedyLoreDDPState:
         if not self.tail_future.done():
             raise GreedyLoreStateError("GreedyLore bucket tail is still in flight")
         self.tail_future.value()
+        if (
+            self.config.basis_sync == "sharded_svd"
+            and is_refresh_step(self._active_step, self.config)
+        ):
+            _finish_sharded_svd_refresh(self)
         # DDP's first iteration intentionally uses its construction-time bucket;
         # role alignment is meaningful only after the reducer has rebuilt once.
         if self.require_role_aligned_buckets and self._active_step >= 2:
@@ -1150,12 +1196,17 @@ def _broadcast_future(
     state: GreedyLoreDDPState,
     tensor: Tensor,
     category: str,
+    source_global_rank: int | None = None,
 ) -> torch.futures.Future:
     if state.process_group is not None and state.world_size > 1:
         with _collective_profile_range(category, "broadcast", tensor):
             return dist.broadcast(
                 tensor,
-                src=state.group_ranks[0],
+                src=(
+                    state.group_ranks[0]
+                    if source_global_rank is None
+                    else source_global_rank
+                ),
                 group=state.process_group,
                 async_op=True,
             ).get_future()
@@ -1290,6 +1341,63 @@ def _refresh_local_svd(
     return context.buffer
 
 
+def _record_sharded_svd_refresh(
+    state: GreedyLoreDDPState,
+    context: BucketContext,
+    completed: torch.futures.Future,
+) -> Tensor:
+    _divide_completed_buffer(state, completed.value())
+    for gradient, parameter_state in _matrix_entries(context):
+        state._sharded_refresh_gradients[id(parameter_state.spec.parameter)] = gradient
+    return context.buffer
+
+
+def _finish_sharded_svd_refresh(state: GreedyLoreDDPState) -> None:
+    missing = [
+        parameter_state.spec.stable_name
+        for parameter_state in state._ordered_matrix_states
+        if id(parameter_state.spec.parameter) not in state._sharded_refresh_gradients
+    ]
+    if missing:
+        raise GreedyLoreStateError(
+            "sharded SVD refresh is missing matrix gradients: " + ", ".join(missing)
+        )
+
+    with _profile_range("greedylore_hook/sharded_svd"):
+        for parameter_state in state._ordered_matrix_states:
+            parameter_id = id(parameter_state.spec.parameter)
+            if state._sharded_svd_owners[parameter_id] != state.group_local_rank:
+                continue
+            gradient = state._sharded_refresh_gradients[parameter_id]
+            global_corrected = orient_matrix(gradient, parameter_state.orientation)
+            basis, _, _ = refresh_basis(global_corrected, state.config.rank)
+            parameter_state.basis.copy_(basis)
+
+    broadcasts = []
+    for parameter_state in state._ordered_matrix_states:
+        parameter_id = id(parameter_state.spec.parameter)
+        owner_local_rank = state._sharded_svd_owners[parameter_id]
+        broadcasts.append(
+            _broadcast_future(
+                state,
+                parameter_state.basis,
+                "greedylore_hook/basis_broadcast",
+                state.group_ranks[owner_local_rank],
+            )
+        )
+    for broadcast in broadcasts:
+        broadcast.wait()
+    for parameter_state in state._ordered_matrix_states:
+        parameter_state.last_support.copy_(
+            torch.arange(
+                state.config.rank,
+                dtype=torch.int64,
+                device=parameter_state.last_support.device,
+            )
+        )
+        parameter_state.error.zero_()
+
+
 def _launch_dense_bucket(
     state: GreedyLoreDDPState,
     context: BucketContext,
@@ -1313,6 +1421,16 @@ def _launch_refresh_bucket(
     source = _profiled_all_reduce_future(
         state, context, context.buffer, "greedylore_hook/dense"
     )
+    if state.config.basis_sync == "sharded_svd":
+        return source.then(
+            _on_bucket_execution_stream_result(
+                state,
+                context,
+                lambda completed: _record_sharded_svd_refresh(
+                    state, context, completed
+                ),
+            )
+        )
     if state.config.basis_sync == "local_svd":
         return source.then(
             _on_bucket_execution_stream_result(

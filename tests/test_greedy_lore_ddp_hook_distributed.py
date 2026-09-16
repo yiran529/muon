@@ -309,6 +309,83 @@ def test_two_rank_broadcast_refresh_runs_rank_zero_svd_and_broadcasts_stable_ord
     mp.spawn(_broadcast_worker, args=(2, _free_port()), nprocs=2, join=True)
 
 
+def _sharded_svd_worker(rank, world_size, port):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    observer = CollectiveObserver()
+    set_active_observer(observer)
+    original_svd = torch.linalg.svd
+    svd_calls = 0
+
+    def counted_svd(*args, **kwargs):
+        nonlocal svd_calls
+        svd_calls += 1
+        return original_svd(*args, **kwargs)
+
+    try:
+        model = _ControlledGradientModel(second_shape=(3, 5))
+        ddp = DDP(model, gradient_as_bucket_view=True)
+        state = GreedyLoreDDPState(
+            process_group=dist.group.WORLD,
+            fingerprint="7" * 64,
+            parameter_specs=[
+                GreedyLoreDDPParameterSpec(model.first, "z-last", 0, "matrix"),
+                GreedyLoreDDPParameterSpec(model.dense, "middle", 1, "dense_aux"),
+                GreedyLoreDDPParameterSpec(model.second, "a-first", 2, "matrix"),
+            ],
+            optimizer_parameters=list(model.parameters()),
+            config=GreedyLoreConfig(
+                rank=1,
+                start_compress_step=0,
+                update_interval=2,
+                basis_sync="sharded_svd",
+            ),
+        )
+        first_gradient = torch.tensor(
+            [[4.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        ) + rank
+        second_gradient = torch.arange(15.0).reshape(3, 5) - rank
+        dense_gradient = torch.tensor([2.0 + rank, 3.0 - rank])
+        state.parameter_state(model.first).error.fill_(-rank)
+        state.parameter_state(model.second).error.fill_(rank)
+        ddp.register_comm_hook(state, greedy_lore_ddp_hook)
+
+        with mock.patch("torch.linalg.svd", counted_svd):
+            state.begin_step()
+            ddp(first_gradient, dense_gradient, second_gradient).backward()
+            assert svd_calls == 0
+            state.finish_step()
+
+        assert svd_calls == 1
+        state.commit_step()
+        state.validate_replicated_basis_across_ranks()
+        basis_events = [
+            event
+            for event in observer.events
+            if event.category == "greedylore_hook/basis_broadcast"
+        ]
+        assert [event.bytes for event in basis_events] == [36, 16]
+        assert [event.operation for event in basis_events] == ["broadcast", "broadcast"]
+        torch.testing.assert_close(
+            state.parameter_state(model.first).error,
+            torch.zeros_like(state.parameter_state(model.first).error),
+        )
+        torch.testing.assert_close(
+            state.parameter_state(model.second).error,
+            torch.zeros_like(state.parameter_state(model.second).error),
+        )
+    finally:
+        set_active_observer(None)
+        dist.destroy_process_group()
+
+
+def test_two_rank_sharded_svd_refresh_defers_and_balances_full_model_factorization():
+    mp.spawn(_sharded_svd_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
 def _compressed_refresh_gradients(rank):
     first = torch.tensor([[5.0, 0.0, 0.0], [0.0, 4.0, 0.0]])
     dense = torch.tensor([30.0 + rank, 40.0 - rank])

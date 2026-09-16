@@ -30,7 +30,9 @@ class GreedyLoreHyperparameters(train.Hyperparameters):
     greedy_lore_update_interval: int = 200
     greedy_lore_seed: int = 42
     greedy_lore_start_compress_step: int = 1000
-    greedy_lore_basis_sync: Literal["local_svd", "broadcast"] = "local_svd"
+    greedy_lore_basis_sync: Literal[
+        "local_svd", "broadcast", "sharded_svd"
+    ] = "local_svd"
     greedy_lore_dense_aux_communication_dtype: Literal[
         "bucket", "float32", "bfloat16"
     ] = "bucket"
@@ -48,7 +50,7 @@ def configure_greedy_lore_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--greedy_lore_start_compress_step", type=int, default=None)
     parser.add_argument(
         "--greedy_lore_basis_sync",
-        choices=("local_svd", "broadcast"),
+        choices=("local_svd", "broadcast", "sharded_svd"),
         default=None,
     )
     parser.add_argument(

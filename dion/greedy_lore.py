@@ -15,7 +15,7 @@ class GreedyLoreConfig:
     update_interval: int = 200
     seed: int = 42
     start_compress_step: int = 1000
-    basis_sync: Literal["local_svd", "broadcast"] = "local_svd"
+    basis_sync: Literal["local_svd", "broadcast", "sharded_svd"] = "local_svd"
     dense_aux_communication_dtype: Literal[
         "bucket", "float32", "bfloat16"
     ] = "bucket"
@@ -42,8 +42,10 @@ class GreedyLoreConfig:
             raise ValueError("update_interval must be positive")
         if self.start_compress_step < 0:
             raise ValueError("start_compress_step must be non-negative")
-        if self.basis_sync not in ("local_svd", "broadcast"):
-            raise ValueError("basis_sync must be 'local_svd' or 'broadcast'")
+        if self.basis_sync not in ("local_svd", "broadcast", "sharded_svd"):
+            raise ValueError(
+                "basis_sync must be 'local_svd', 'broadcast', or 'sharded_svd'"
+            )
         if self.dense_aux_communication_dtype not in (
             "bucket",
             "float32",

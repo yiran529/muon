@@ -627,3 +627,14 @@ controller 在GPU 2–5串行完成并exit `0`。CM079中350M的M002在device ba
 - CM088结果：4/4 cells成功。batch8下dense/independent200/shared200/shared800为`458.74/428.41/416.94/352.90 ms`，相对dense快`6.61%/9.11%/23.07%`，反而小于CM086 batch12的`12.81%/17.20%/29.57%`。shared ordinary估计`331.553 ms`，refresh额外`17077.333 ms`，与batch12基本一致；固定M002成本使收益随batch变化并不单调。
 - 状态：completed/diagnostic-positive；CM087/088均为探索性单样本，不计算重复区间。
 - 产物：`artifacts/compressed_muon/CM087-m002-gpt350m-fp32-current-code-batch8-bucket-bridge-ws4-s42/`、`artifacts/compressed_muon/CM088-m002-gpt720m-fp32-device-batch8-timing-ws4-s42/`。
+
+## 2026-09-16：sharded-SVD refresh 实现与 CM089–CM092 启动
+
+- 动机：`local_svd` 在每个rank对相同全局平均corrected gradient重复完整basis分解；新增`basis_sync=sharded_svd`，按矩阵分解成本确定性LPT分配owner，各rank只计算自己的参数，再按稳定参数名顺序从对应owner广播完整basis。
+- 生命周期：refresh hook仍完成corrected dense All-Reduce并正常返回bucket Future；全模型分片分解、basis广播、support更新和error清零集中放在backward之后、gradient clipping之前的`finish_step()`，避免跨bucket pending Future与现有tail形成依赖环。basis和error仍在所有rank复制，算法压缩位置不变；相对local-SVD新增完整basis广播payload。
+- 验证：新增两rankGloo行为测试，确认分解延迟到`finish_step()`、两个rank各执行一个分解、广播顺序/字节和最终replicated basis一致；GreedyLore配置、单rank hook、两rankhook及训练入口共`69 passed`。另以2卡NCCL、BF16小模型运行4步，覆盖两次refresh，exit0、peak 252 MiB。未测试新增launcher脚本，遵循用户要求。
+- 实验：2026-09-16在tmux `CM089-CM092-sharded-svd`启动单controller，使用GPU一次性选择且Agent不轮询。CM089复用CM078 full-isolation BF16几何；CM090复用CM085；CM091复用CM087的bucket160/80；CM092复用CM088的independent/shared及interval200/800。所有cell串行、`repeats=1`，不运行dense历史基线或profile。
+- 结果：controller及7/7 cells均exit0。CM089为`198.67 ms`，较CM078历史full local-SVD低`2.50%`并与历史dense基本持平；CM090为`411.94 ms`，较CM085历史local-SVD低`4.67%`但仍比历史dense高`4.91%`；CM091 bucket160/80为`174.66/185.35 ms`，较历史local-SVD低`13.39%/14.16%`；CM092 independent200/shared200/shared800为`371.93/361.63/346.59 ms`，较历史对应local-SVD低`13.18%/13.27%/1.79%`。
+- Refresh归因：由CM092同批shared interval200/800二点差分估计ordinary为`341.577 ms`、单次refresh额外`4010.667 ms`；CM088历史对应值为`331.553/17077.333 ms`。因此单次refresh缩短约`13.067 s (76.51%)`，接近四卡参数级分片的理想量级；ordinary的约`+10.02 ms`跨实验差异不归因为sharded-SVD，因为该模式只改变refresh步骤。
+- 结论：completed/diagnostic-positive。分片计算在更大FP32模型上显著降低完整周期时间，验证了重复SVD是主要refresh瓶颈；CM085大physical batch下仍未超过dense，说明ordinary本地计算和通信比例仍决定最终盈亏。所有新cell均为单样本，与CM078/085/087/088的百分比属于历史跨实验比较，不给出置信区间或严格配对claim。
+- 代码与产物：`dion/greedy_lore.py`、`dion/greedy_lore_ddp_hook.py`、`train_greedylore.py`、`benchmark/compressed_muon/run_greedy_lore_profiler.sh`、`benchmark/compressed_muon/run_cm089_cm092_sharded_svd_timing.sh`；controller产物为`artifacts/compressed_muon/CM089-CM092-sharded-svd-controller/`。
