@@ -879,6 +879,83 @@ partial−dense 为 `+4.773 ms (+2.41%)`，三组区间 `[+3.08,+6.04] ms`；ful
 
 稳态 refresh 的 partial/full local-SVD GPU 分别为 `1569.157/1565.804 ms`，且与 backward GPU compute overlap 均为0；按 interval200 粗摊约为 `7.846/7.829 ms/update`。因此，ordinary exposed local 与 refresh 摊销的量级已经足以消耗 exposed NCCL 节省，方向上与 profiler-off 的 `+2.41%/+2.59%` 回退一致。这里仍不能机械相加不同 rank-max 或把单个 Kineto profile window 当作真实 step time；定量端到端结论继续以三重复 profiler-off timing 为准。
 
+### CM078 step-time 口径、详细分解与时间轴
+
+本节的 `step` 是一个 optimizer update。GA1 下每个 update 只有一个 microstep，处理 `4 GPUs × 128 samples/GPU × 256 tokens = 131072 tokens`。profiler-off 的 `198.627/203.400/203.770 ms` 是800个 measured updates 的端到端均值；800步正好覆盖4个 interval-200 周期，因此 compressed 均值已包含4次 refresh，不能在 `203.400/203.770 ms` 上再加 `7.846/7.829 ms`。Kineto 另外只捕获一个 step220 refresh 和一个 step221 ordinary，用于解释机制，不用于代替800步 timing。
+
+一个 update 的逻辑顺序如下。profile window 在所选 microstep 之前经 barrier 和 CUDA synchronize 后开始，在 optimizer 之后再 CUDA synchronize 并结束；因此最后的同步会吸收前面异步排队但尚未完成的 GPU 工作。
+
+```text
+profile window
+│
+├─ final microstep
+│  ├─ forward
+│  ├─ 预取下一个 batch
+│  └─ backward
+│     ├─ genuine backward GPU compute
+│     └─ parameter ready → DDP/GreedyLore hook
+├─ gradient-sync finish
+├─ gradient norm / clipping
+├─ optimizer.step（包含 Muon Newton–Schulz 与 result collective）
+└─ CUDA synchronize
+```
+
+ordinary 单样本的 host 范围和 GPU/communication 归因如下（ms，均为四个 rank 的逐列最大值）：
+
+| ordinary 模式 | profile window | final microstep CPU | forward CPU | backward CPU | grad norm CPU | optimizer CPU | NCCL union | NCCL/backward overlap | exposed NCCL | local GPU union | local/backward overlap | exposed local GPU |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| dense | 203.154 | 66.415 | 6.247 | 10.470 | 1.088 | 7.238 | 52.137 | 19.206 | 32.931 | — | — | — |
+| partial isolation | 195.287 | 112.038 | 6.250 | 55.839 | 1.455 | 9.590 | 35.414 | 14.564 | 20.850 | 6.868 | 2.756 | 4.262 |
+| full isolation | 198.328 | 112.510 | 7.425 | 55.952 | 1.189 | 7.937 | 39.003 | 15.410 | 23.593 | 6.139 | 2.273 | 3.915 |
+
+CPU range 是 host wall duration 而非纯 GPU compute，并且 `final microstep` 已包含 forward、预取和 backward；NCCL/local GPU 又会与 backward GPU compute 重叠，所以表中各列不是互斥分量，不能求和得到 profile window。compressed 的 backward CPU 从 dense 的 `10.470 ms` 增到约 `56 ms`，也不表示模型反向 kernel 变慢五倍：GreedyLore hook 在 `loss.backward()` 内触发，该 host range 同时包含 hook 调度、callback、collective 发射与部分依赖等待。
+
+dense ordinary 的 `52.137 ms` NCCL 中有 `19.206 ms` 与 genuine backward compute 重叠，余下 `32.931 ms` exposed；其中 `25.125 ms` gradient-sync tail 落在最后一个 backward GPU kernel 之后。GreedyLore ordinary 将这个 tail 压到0，但在每个 matrix bucket ready 后引入了 score preparation、score+aux All-Reduce、Top-r/factor/error、factor All-Reduce 和 reconstruction：
+
+```text
+dense ordinary
+backward GPU compute  ████████████████│
+DDP NCCL                 ═══ overlap ═════╪══ 25.125 ms tail ══▶
+
+GreedyLore ordinary
+backward GPU compute  ████████████████████████│
+bucket ready             └─ score → score/aux AR → Top-r/factor/error
+                                                  └─ factor AR → reconstruction
+local GPU                  ██████ 6.139–6.868 ms union
+                            ├─ 2.273–2.756 ms 与 backward overlap
+                            └─ 3.915–4.262 ms exposed
+gradient-sync tail                                                0 ms
+```
+
+refresh step 不走 ordinary 压缩：它先用 corrected gradient 准备完整 bucket，做 dense All-Reduce 并除以 world size，然后对每个 matrix 做 local SVD，更新 basis/support 并清零 error。这使 refresh 的停顿主要落在 `loss.backward()` 里的 hook 路径：
+
+| refresh 模式 | profile window | final microstep CPU | backward CPU | local-SVD GPU | SVD/backward overlap | NCCL union | exposed NCCL |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| partial isolation | 1938.904 ms | 1925.612 ms | 1869.156 ms | 1569.157 ms | 0 ms | 75.995 ms | 61.173 ms |
+| full isolation | 1936.437 ms | 1916.216 ms | 1859.531 ms | 1565.804 ms | 0 ms | 86.389 ms | 72.408 ms |
+
+```text
+ordinary compressed step  │───────────── 约 195–198 ms ───────│
+
+refresh step              │ forward │ backward hook ............................. │ optimizer │
+                                      ├─ dense All-Reduce
+                                      └─ local SVD ████████████████████████████
+                                                   1566–1569 ms，backward overlap=0
+                          │─────────────────── 约 1937–1939 ms ──────────────────│
+```
+
+单样本 profile window 上，refresh 比同模式 ordinary 约长 `1738–1744 ms`，而 `1566–1569 ms` 是其中明确归因到 local-SVD GPU kernel union 的部分；其余还可包含 SVD CPU/API 调度、dense refresh collective、stream 串行、callback 和同步等待。按周期可作概念性表示 `T_avg ≈ (199×T_ordinary + T_refresh)/200`；但真实 `T_avg` 来自800步 profiler-off wall-clock，不是由这两个单样本反推。ordinary profile window 偶然低于 dense 也不与最终负结果矛盾：它没有 refresh、每模式只有一个 Kineto 样本，而端到端 timing 是3重复完整周期均值。
+
+CM078 ordinary 原始 trace 还记录了 Muon optimizer 内部范围。同一 rank 内的 Newton–Schulz GPU annotation 取区间并集后，其 rank-max 与正式汇总如下：
+
+| ordinary 模式 | optimizer CPU | Newton–Schulz GPU union | Muon-result NCCL |
+|---|---:|---:|---:|
+| dense | 7.238 ms | 3.162 ms | 7.886 ms |
+| partial isolation | 9.590 ms | 3.125 ms | 7.385 ms |
+| full isolation | 7.937 ms | 3.220 ms | 7.655 ms |
+
+Muon 本地 Newton–Schulz 约为 `3.1–3.2 ms`，result All-Reduce 约为 `7.4–7.9 ms`。`optimizer CPU` 是包含异步 kernel/collective 发射的 host wall range，GPU 和 NCCL 工作也可能在其返回后继续，因此三列不能相加为一个 Muon 关键路径总时间。
+
 CM078 最终状态为 **completed/negative+diagnostic**：稳态 trace 排除了 CM077 首调用污染，确认 M002 能减少 ordinary exposed communication，但 full isolation 不优于 partial；当前主要代价转向每步 score preparation/local GPU 与每200步约1.57秒的同步 refresh，而不是 bucket chain wait。原始产物：`artifacts/compressed_muon/CM078-m002-gpt130m-bf16-dense-aux-full-isolation-timing-profile-ws4-s42/`。
 
 ## CM079/CM080：350M/1B 最大候选 device batch timing（2026-09-15）
@@ -922,3 +999,67 @@ shared 的 step CV 为 `0.884%`，mean throughput 为 `40.81K tokens/s`。探索
 原始 `bandwidth.json` 的两个带宽字段后缀误写为 `gbps`，计算实际为 bytes/s 除以 `1e9`，所以本表按 **GB/s** 记录；不能解释成 Gbit/s。该 microbenchmark 反映孤立 collective 能力，不等于训练中 exposed communication。
 
 CM081 结论为 **completed/negative-vs-dense+diagnostic**：shared-vector score 显著降低了1B M002 step time，证明完整 independent-vector score 是实际瓶颈之一；但它只消除约四分之一的历史回退，M002 仍比 dense 慢约16%，且 refresh SVD、factor/error/reconstruction 与通信关键路径均未改变。shared 的短窗口 validation loss 与 independent 接近，不能据此宣称质量等价。后续若继续该方向，应先做 shared ordinary/refresh 分相，再决定是否投入完整训练质量验证。原始产物：`artifacts/compressed_muon/CM081-m002-shared-score-gpt1b-nccl-timing-ws4-s42/`。
+
+## CM082：shared phase timing 与 gradient-sync oracle（2026-09-15）
+
+复用 CM080/CM081 的 GPT-1B BF16、seq256、global/device batch96/24、bucket80 MiB、rank32配置，只新增 shared interval800 和 dense no-gradient-sync oracle 各一个20 warmup + 800 measured cell。shared interval200采用CM081的 `602.247 ms`，dense采用CM080的 `518.720 ms`；因此下述差值均为跨实验单样本诊断，不是同期配对或置信区间。
+
+shared interval800 为 `519.530 ms`。采用二点模型 `T(I)=T_ordinary+R_refresh/I`，由 interval200/800 估计：
+
+| 指标 | 估计值 |
+|---|---:|
+| shared ordinary step | 491.958 ms |
+| 单次 refresh 额外时间 | 22057.778 ms |
+| refresh 在 interval200 的摊销 | 110.289 ms/update |
+| refresh 在 interval800 的摊销 | 27.572 ms/update |
+
+这说明 shared score 已使估计 ordinary 比历史 dense 快约 `26.762 ms (5.16%)`，但 interval200 的 refresh 摊销足以把它变成 `+83.527 ms (+16.10%)` 的总体回退；把 interval 延长到800后，与历史 dense 只差 `+0.810 ms (+0.16%)`。该二点模型假设除 refresh 频率外其余条件不变，只用于定位量级。
+
+修正 DDP hook 的 `GradBucket` 注解后，no-gradient-sync oracle 成功完成，step 为 `434.240 ms`、peak allocated `16603 MiB`。相对历史 dense 低 `84.480 ms`，可视为在保留 Muon result communication、但跳过 DDP gradient All-Reduce 时的 timing-only 上限。oracle 会允许各 rank 参数分叉，不能用于训练质量或正确性结论。
+
+CM082 状态为 **completed/diagnostic**：1B shared 路径的主要剩余问题是周期 refresh，而当前硬件上 gradient sync 仍有约84 ms的可消除空间；ordinary 压缩具备收益，但 interval200 无法兑现为端到端加速。首次 controller bug 产物保留为 `-attempt1-controller-bug`，不纳入结果。原始产物：`artifacts/compressed_muon/CM082-m002-shared-phase-gradient-sync-oracle-gpt1b-ws4-s42/`。
+
+## CM083/CM084：GPT-1B FP32 容量边界（2026-09-15—16）
+
+两次实验均使用 GPT-1B、4 GPU、FP32 parameter/gradient/DDP bucket/GreedyLore state 与 packed communication，前向仍为 BF16 autocast。CM083 在 seq256 下将 device batch 从 `24` 依次降到 `1`，所有 shared probe 均 OOM；device batch1时每卡已使用约 `23.50/23.52 GiB`，随后申请18 MiB BF16 activation失败。CM084 继续将 seq_len 降为128和64，并分别尝试 device batch `8/4/2/1`，仍全部 OOM。
+
+两组都没有进入正式 dense/independent/shared timing，也没有生成 summary。启动时GPU满足空闲阈值，失败在四个rank上一致复现，因此归类为确定性 **capacity-blocked**，而非外部资源争用。降低 sequence length 和 batch 无法越过容量边界，说明该配置主要受 FP32 参数、gradient、DDP bucket 与 M002 持久状态等静态占用限制，activation 已不是决定项。原始产物：`artifacts/compressed_muon/CM083-m002-shared-score-gpt1b-fp32-max-batch-timing-ws4-s42/`、`artifacts/compressed_muon/CM084-m002-shared-score-gpt1b-fp32-reduced-seq-timing-ws4-s42/`。
+
+## CM085/CM086：350M/720M FP32 score 与 interval timing（2026-09-16）
+
+在1B FP32不可行后，改用 GPT-350M（dim1024/20层，354.7M参数）和 GPT-720M（dim1280/30层，718.6M参数）。两者均为FP32参数、gradient、bucket和M002状态，BF16 autocast、seq256、bucket80 MiB、rank32；每种模式只运行一个20 warmup + 800 measured cell，因此结果用于快速诊断，不计算重复区间。
+
+| 实验 | device/global batch | dense | independent i200 | shared i200 | shared i800 |
+|---|---:|---:|---:|---:|---:|
+| CM085 / 350M | 64/256 | 392.65 ms | 432.13 ms (`+10.05%`) | 422.79 ms (`+7.68%`) | 395.20 ms (`+0.65%`) |
+| CM086 / 720M | 12/48 | 515.79 ms | 449.70 ms (`-12.81%`) | 427.06 ms (`-17.20%`) | 363.27 ms (`-29.57%`) |
+
+CM085 的各模式 peak allocated 为 dense `19293 MiB`、三种M002 `22086 MiB`。shared i200/i800 差分估计 ordinary 为 `386.003 ms`，比dense快 `6.647 ms (1.69%)`；单次refresh额外约 `7357.333 ms`，在 interval200/800 分别摊销 `36.787/9.197 ms/update`。因此350M最大可行batch下 ordinary 已略有潜在收益，但 interval800 仍只接近dense，没有形成可稳健宣称的端到端加速。
+
+CM086 中 device batch `32/24/16` OOM、`12`通过；dense/M002 peak为 `14955/21138 MiB`。shared差分估计 ordinary `342.007 ms`，比dense快约 `33.69%`；单次refresh额外约 `17010.667 ms`，在 interval200/800 摊销 `85.053/21.263 ms/update`。720M、FP32通信且较小batch的配置首次显示大幅端到端正收益，其中shared和更长interval都继续改善结果，但M002额外显存约 `6.18 GiB`。
+
+CM085 首次误设为24层、实际405.0M参数的 probe 在发现后停止，保存在 `-attempt1-wrong-depth`，完全排除出上述结果。CM085/086说明模型规模本身不能决定收益：通信dtype、physical batch、固定压缩成本和refresh频率共同改变临界点。原始产物：`artifacts/compressed_muon/CM085-m002-score-gpt350m-fp32-max-batch-timing-ws4-s42/`、`artifacts/compressed_muon/CM086-m002-score-gpt720m-fp32-max-batch-timing-ws4-s42/`。
+
+## CM087/CM088：350M历史桥接与720M batch诊断（2026-09-16）
+
+CM087 用当前代码把350M恢复到 CM051 的 FP32、seq256、global/device batch32/8、rank32、interval200和bucket160口径，再在相同代码与batch下切换到bucket80。每个模式只有一个20 warmup + 200 measured cell：
+
+| bucket | dense | independent i200 | M002−dense |
+|---:|---:|---:|---:|
+| 160 MiB | 239.11 ms | 201.66 ms | -37.45 ms (-15.66%) |
+| 80 MiB | 252.70 ms | 215.93 ms | -36.77 ms (-14.55%) |
+
+bucket160的 `-15.66%` 几乎复现 CM051 三重复的 `-15.97%`（dense/M002 `232.880/195.567 ms`）。因此，CM085 在 batch64 下变成 `+10.05%` 不能主要归因于当前代码退化；**physical batch/工作负载几何是主要差异**。bucket80与160的相对收益只差约1.11个百分点，而两种模式的绝对step都约慢14 ms；鉴于只是单样本，不能把该共同漂移归因为bucket cap。
+
+CM088 保持 CM086 的720M FP32配置，仅将global/device batch从48/12降到32/8；四个20 warmup + 800 measured cells均成功：
+
+| 模式 | batch12 / CM086 | batch8 / CM088 | batch8相对dense |
+|---|---:|---:|---:|
+| dense | 515.79 ms | 458.74 ms | — |
+| independent i200 | 449.70 ms | 428.41 ms | -6.61% |
+| shared i200 | 427.06 ms | 416.94 ms | -9.11% |
+| shared i800 | 363.27 ms | 352.90 ms | -23.07% |
+
+batch8的shared二点模型估计ordinary为 `331.553 ms`，约比dense快 `27.72%`；单次refresh额外约 `17077.333 ms`，与batch12的 `17010.667 ms` 基本一致。降低batch后dense缩短 `57.05 ms`，independent缩短 `21.29 ms`，shared只缩短约10 ms，结果是相对收益反而从 `12.81%/17.20%/29.57%` 收窄到 `6.61%/9.11%/23.07%`。这表明“batch越小、通信占比越高、压缩收益越大”在这里并不单调：M002存在几乎不随batch下降的score、重构和refresh成本地板。
+
+CM087/088均为 **completed/diagnostic-positive**，但都是单样本，不能替代重复实验或给出区间。原始产物：`artifacts/compressed_muon/CM087-m002-gpt350m-fp32-current-code-batch8-bucket-bridge-ws4-s42/`、`artifacts/compressed_muon/CM088-m002-gpt720m-fp32-device-batch8-timing-ws4-s42/`。

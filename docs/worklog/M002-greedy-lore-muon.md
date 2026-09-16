@@ -584,5 +584,46 @@ controller 在GPU 2–5串行完成并exit `0`。CM079中350M的M002在device ba
 - 配置：GPT-1B BF16、4 GPU、seq256、global/device batch96/24、bucket80 MiB、rank32；只新增shared interval800与no-gradient-sync oracle各1个20 warmup + 800 measured cell，dense与shared interval200分别复用CM080/CM081历史summary，由单一controller串行执行。
 - 方法：假设`T(I)=T_ordinary+R_refresh/I`，由interval200/800解出ordinary和单次refresh额外时间。oracle通过benchmark-only DDP identity hook跳过gradient All-Reduce，但保留Muon optimizer/result communication；允许rank参数分叉，只作timing上限。
 - 进展：首次controller在选卡后、任何cell启动前因shell同一`local`声明引用未绑定`label`而exit1，失败根目录移为`-attempt1-controller-bug`。修复后shared interval800成功，step为`519.53 ms`、peak为`20948 MiB`；结合CM081 interval200的`602.247 ms`，二点模型估计shared ordinary为`491.96 ms`、单次refresh额外约`22.06 s`，即interval200/800分别摊销`110.29/27.57 ms/update`。interval800仅比CM080历史dense `518.720 ms`慢`0.81 ms (0.16%)`，单样本/跨实验不作等效声明，但`82.72 ms`的interval差异远大于CM081约5.3 ms样本标准差，refresh主导方向明确。
-- Oracle：首次在DDP hook注册时因bucket注解为`Any`而失败，尚未进入训练；已增加回归测试并改为PyTorch要求的`dist.GradBucket`，将只重跑oracle，不重跑成功的interval800。
+- Oracle：首次在DDP hook注册时因bucket注解为`Any`而失败；改为PyTorch要求的`dist.GradBucket`后重跑成功。no-gradient-sync step为`434.24 ms`、peak为`16603 MiB`，相对CM080历史dense低`84.48 ms`，作为当前配置下可消除gradient-sync时间的timing上限。该oracle允许各rank参数分叉，只用于性能归因。
+- 结论：completed/diagnostic。shared估计ordinary为`491.958 ms`，比历史dense快约`5.16%`，但单次refresh额外约`22.06 s`，在interval200下完全抵消ordinary收益；interval800仅比历史dense慢`0.81 ms (0.16%)`。所有对照均为跨实验单样本，不计算区间或宣称等效。
 - 产物：`artifacts/compressed_muon/CM082-m002-shared-phase-gradient-sync-oracle-gpt1b-ws4-s42/`。
+
+## 2026-09-15：CM083 GPT-1B FP32 shared score timing
+
+- 目的：检查参数、gradient、DDP bucket与GreedyLore状态均为FP32时，CM081/CM082观察到的shared score改善和refresh主导趋势是否延续，并判断增加dense通信字节后interval800能否超过dense。
+- dtype口径：`model_dtype=float32`，前向计算仍使用BF16 autocast；DDP bucket随参数/gradient为FP32；error/basis随参数为FP32，score/factor随corrected/bucket为FP32，`dense_aux_communication_dtype=bucket`保证packed communication不另行降精度。正式日志必须同时出现FP32模型、bucket通信dtype和shared score标记，否则controller失败关闭。
+- 实验：device batch按`24/16/12/8/4/2/1`递减探测shared；找到首个可行点后运行dense、shared interval200、shared interval800各1个20 warmup + 800 measured cell，4 GPU、seq256、bucket80 MiB、rank32、seed42。
+- 状态：completed/capacity-blocked；shared探测从device batch24递减到1均OOM，device batch1时每卡约占`23.50/23.52 GiB`，申请18 MiB BF16 activation失败。未进入dense、independent或shared正式timing，无summary；四rank一致且启动时满足空闲阈值，归为确定性容量不足。
+- 产物：`artifacts/compressed_muon/CM083-m002-shared-score-gpt1b-fp32-max-batch-timing-ws4-s42/`。
+
+## 2026-09-16：CM084 GPT-1B FP32 reduced-sequence timing
+
+- 目的：降低sequence length以绕过CM083的FP32容量边界，同时保持1B模型、FP32参数/gradient/bucket/GreedyLore状态和BF16 autocast口径。
+- 实验：先在seq128按device batch`8/4/2/1`递减探测shared；若全部OOM，再在seq64重复。首个可行组合串行运行dense、independent interval200、shared interval200、shared interval800，各1个20 warmup + 800 measured cell；4 GPU、bucket80 MiB、rank32、seed42。
+- 状态：completed/capacity-blocked；seq128与seq64下device batch`8/4/2/1`均OOM，未进入正式timing。降低activation规模仍无法容纳1B FP32 M002，说明静态参数、gradient与压缩状态占用主导。
+- 产物：`artifacts/compressed_muon/CM084-m002-shared-score-gpt1b-fp32-reduced-seq-timing-ws4-s42/`。
+
+## 2026-09-16：CM085 GPT-350M FP32 score timing
+
+- 目的：在CM083/CM084证明1B FP32受静态显存阻塞后，改用350M检验FP32 gradient/bucket通信量增加时，independent/shared score与refresh interval的端到端表现。
+- 实验：GPT-350M（dim1024/20 layers/16 heads，354.7M参数）、seq256、4 GPU、bucket80 MiB、rank32、seed42；shared按device batch`64/48/32/24/16/8/4/2/1`递减探测，首个可行点串行运行dense、independent interval200、shared interval200、shared interval800，各1个20 warmup + 800 measured cell。
+- 结果：修正后的350M在device/global batch64/256下完成4/4 timing cells。dense/independent200/shared200/shared800分别为`392.65/432.13/422.79/395.20 ms`，相对dense为`+10.05%/+7.68%/+0.65%`；peak为dense `19293 MiB`、三种M002 `22086 MiB`。shared差分估计ordinary `386.003 ms`、单次refresh额外`7357.333 ms`，即interval200/800摊销`36.787/9.197 ms/update`。
+- 状态：completed/diagnostic-negative；每配置单样本，不计算区间。attempt1误设24层、实际405.0M，在batch probe阶段停止，保留为`-attempt1-wrong-depth`并排除出全部结论。
+- 产物：`artifacts/compressed_muon/CM085-m002-score-gpt350m-fp32-max-batch-timing-ws4-s42/`。
+
+## 2026-09-16：CM086 GPT-720M FP32 score timing
+
+- 目的：在350M和1B之间增加规模点；选择dim1280/30 layers/20 heads（718.6M参数），与1B同为30层，以减少深度变化对趋势解释的干扰。
+- 实验：seq256、4 GPU、FP32参数/gradient/bucket/GreedyLore状态、BF16 autocast、bucket80 MiB、rank32、seed42；shared按device batch`32/24/16/12/8/4/2/1`递减探测，首个可行点串行运行dense、independent interval200、shared interval200、shared interval800，各1个20 warmup + 800 measured cell。
+- 结果：device batch`32/24/16` OOM、`12`通过，正式global/device batch48/12。dense/independent200/shared200/shared800分别为`515.79/449.70/427.06/363.27 ms`，相对dense快`12.81%/17.20%/29.57%`；peak为`14955/21138 MiB`。shared差分估计ordinary `342.007 ms`、单次refresh额外`17010.667 ms`，即interval200/800摊销`85.053/21.263 ms/update`。
+- 状态：completed/diagnostic-positive；每配置单样本，不计算区间。720M FP32、小batch首次显示大幅端到端收益，但M002额外显存约`6.18 GiB`。
+- 产物：`artifacts/compressed_muon/CM086-m002-score-gpt720m-fp32-max-batch-timing-ws4-s42/`。
+
+## 2026-09-16：CM087/CM088 batch 与 bucket 归因
+
+- CM087：当前代码、GPT-350M、FP32参数/gradient/bucket、BF16 autocast、seq256、global/device batch32/8、rank32、interval200；以bucket160和80分别运行dense/independent各一个20 warmup + 200 measured cell。bucket160对齐CM051以估计代码/环境变化，bucket160→80隔离bucket影响，再与CM085的batch64结果连接。
+- CM088：GPT-720M保持CM086的FP32和bucket80口径，只将global/device batch从48/12降至32/8；运行dense、independent interval200、shared interval200/800各一个20 warmup + 800 measured cell，检验更小batch是否进一步扩大收益。
+- CM087结果：4/4 cells成功。bucket160的dense/independent为`239.11/201.66 ms`，M002快`37.45 ms (15.66%)`，几乎复现CM051三重复的`15.97%`；bucket80为`252.70/215.93 ms`，M002快`36.77 ms (14.55%)`。这支持CM085的反转主要来自batch/工作负载几何而非代码退化；bucket差异只有单样本，不作因果claim。
+- CM088结果：4/4 cells成功。batch8下dense/independent200/shared200/shared800为`458.74/428.41/416.94/352.90 ms`，相对dense快`6.61%/9.11%/23.07%`，反而小于CM086 batch12的`12.81%/17.20%/29.57%`。shared ordinary估计`331.553 ms`，refresh额外`17077.333 ms`，与batch12基本一致；固定M002成本使收益随batch变化并不单调。
+- 状态：completed/diagnostic-positive；CM087/088均为探索性单样本，不计算重复区间。
+- 产物：`artifacts/compressed_muon/CM087-m002-gpt350m-fp32-current-code-batch8-bucket-bridge-ws4-s42/`、`artifacts/compressed_muon/CM088-m002-gpt720m-fp32-device-batch8-timing-ws4-s42/`。
