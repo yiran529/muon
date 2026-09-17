@@ -1102,3 +1102,84 @@ CM092的shared interval200/800来自同一新controller，可用二点模型拆�
 单次refresh约缩短至原来的23.5%，接近4卡参数级分片的理想量级，证明多rank重复basis分解是主要refresh瓶颈。interval800原本已经强烈摊薄refresh，所以sharded-SVD只再改善`1.79%`；interval200和更大FP32模型上的完整周期收益更明显。ordinary估计较CM088历史值高约10 ms，但sharded路径不改变ordinary步骤，这一跨实验差异不作机制归因。
 
 CM089 peak allocated为`11447 MiB`，CM090为`22086 MiB`，CM091 bucket160/80为`9731/9707 MiB`，CM092三项均为`19548 MiB`。短窗口validation loss均有限且无NaN/Inf，只用于确认运行稳定，不作质量比较。所有百分比均为与历史单样本的跨实验比较；除CM092内部interval差分外，不视为严格配对或统计结论。原始产物：`artifacts/compressed_muon/CM089-m002-sharded-svd-cm078-geometry-ws4-s42/`至`CM092-m002-sharded-svd-cm088-geometry-ws4-s42/`。
+
+## CM093/CM094：M005 PowerSGD-Muon rank32 主质量训练（2026-09-16）
+
+完成 M005 rank32 的两项正式质量训练：4×GPU DDP（GPU 2–5）、BF16 参数、FineWeb10B、seq256、global/device batch `512/128`、bucket160 MiB、seed1234、Muon + scalar AdamW、EF14、warm start，均从 step1000 开始压缩。CM093 为 GPT-60M/10,000 updates（1,000 warmup），CM094 为 GPT-130M/20,000 updates（2,000 warmup）。两项正式 cell 与 controller 均 exit `0`；下表的 step average 是训练输出的全程累计平均，包含压缩启用前阶段。
+
+| 模型 / 方法 | final val loss | PPL | step average | peak allocated |
+|---|---:|---:|---:|---:|
+| GPT-60M M005 rank32（CM093） | 4.1482 | 63.32 | 274.85 ms | 6209 MiB |
+| GPT-130M M005 rank32（CM094） | 3.7253 | 41.48 | 612.31 ms | 11580 MiB |
+
+与 CM070 的同 dtype 对照比较如下：
+
+| 模型 | 对照 | M005 相对对照的质量 | M005 相对对照的 step | M005 相对对照的 peak |
+|---|---|---:|---:|---:|
+| GPT-60M | BF16 dense `4.1079 / 93.05 ms / 6058 MiB` | loss `+0.0403`，PPL `+4.11%` | `+181.80 ms`（慢 `195.38%`） | `+151 MiB`（`+2.49%`） |
+| GPT-60M | BF16 GL rank32 `4.2119 / 94.82 ms / 6303 MiB` | loss `-0.0637`，PPL `-6.17%` | `+180.03 ms`（慢 `189.87%`） | `-94 MiB`（`-1.49%`） |
+| GPT-130M | BF16 dense `3.6530 / 210.56 ms / 11208 MiB` | loss `+0.0723`，PPL `+7.50%` | `+401.75 ms`（慢 `190.80%`） | `+372 MiB`（`+3.32%`） |
+| GPT-130M | BF16 GL rank32 `3.7645 / 215.04 ms / 11633 MiB` | loss `-0.0392`，PPL `-3.84%` | `+397.27 ms`（慢 `184.74%`） | `-53 MiB`（`-0.46%`） |
+
+M005 rank32 在两个规模上都优于 CM070 的 BF16 GreedyLore rank32 质量，但仍分别比 BF16 dense 高 `0.0403/0.0723` loss；它没有带来 wall-clock 收益，最终全程平均 step 约为 dense 的 `2.90/2.91×`。从压缩起点到最终输出，CM093 的累计 step average 从 step1000 的 `93.13 ms` 升至 `274.85 ms`，CM094 从 `210.58 ms` 升至 `612.31 ms`，说明当前 PowerSGD 压缩阶段的本地计算与同步开销仍显著；这里没有 profiler-off 重复 timing，不能进一步把成本拆分归因。该结果分类为 **quality-positive-vs-GL32 but performance-negative-vs-dense**，不支持 M005 rank32 的端到端加速或 time-to-quality 声明。
+
+原始产物：`artifacts/compressed_muon/CM093-m005-powersgd-muon-gpt60m-bf16-rank32-ddp-ws4-s1234/`、`artifacts/compressed_muon/CM094-m005-powersgd-muon-gpt130m-bf16-rank32-ddp-ws4-s1234/`；controller：`artifacts/compressed_muon/CM093-CM094-m005-rank32-main-controller/`。W&B run IDs 为 `5pnhy9mg`（CM093）和 `74umk3n3`（CM094）。
+
+## CM096/CM097：优化后 M005 rank32 完整质量复跑（2026-09-17）
+
+CM096/CM097 分别逐项复用 CM093/CM094 的完整训练配置，只改变为包含 warm-start Q 复用和同 shape batched Gram–Schmidt 的优化后实现。两项均在通过“每卡显存占用低于1 GiB且无计算进程”门槛的 GPU 2/3/4/7 上串行运行，不保存 checkpoint；formal cells 与 controller 均 exit `0`。step average 仍是包括 step1000 前 dense 阶段在内的全程累计平均。
+
+| 实验 | 模型 | final val loss | PPL | step average | peak allocated | 相对优化前同配实验 |
+|---|---|---:|---:|---:|---:|---:|
+| CM096 | GPT-60M | 4.1485 | 63.34 | 94.43 ms | 6310 MiB | loss `+0.0003`；step `-180.42 ms (-65.64%)` |
+| CM097 | GPT-130M | 3.7255 | 41.49 | 206.52 ms | 11580 MiB | loss `+0.0002`；step `-405.79 ms (-66.27%)` |
+
+最终 validation loss 与优化前 CM093/CM094 的差值仅 `0.0003/0.0002`，在这两个单 seed 完整训练上没有观察到优化导致的质量退化；这验证的是训练结果保持，不是逐步数值等价。与 CM070 的历史同 dtype 对照比较：
+
+| 模型 | 优化后 M005 相对 BF16 dense | 优化后 M005 相对 BF16 GL rank32 |
+|---|---:|---:|
+| GPT-60M | loss `+0.0406`；step慢 `1.48%` | loss `-0.0634`；step快 `0.41%` |
+| GPT-130M | loss `+0.0725`；step快 `1.92%` | loss `-0.0390`；step快 `3.96%` |
+
+因此，M005 在 60M/130M 上仍保留“质量优于历史 GreedyLore rank32、但逊于 dense”的关系，而原先约 `2.9×` dense 的性能负结果被推翻：优化后全程 step 已处于历史 dense/GreedyLore 的约 `±4%` 范围。上述 baseline 差值是跨实验、非同期配对比较，不能解释为统计显著的小幅加速。原始产物：`artifacts/compressed_muon/CM096-m005-powersgd-optimized-gpt60m-bf16-rank32-ddp-ws4-s1234/`、`artifacts/compressed_muon/CM097-m005-powersgd-optimized-gpt130m-bf16-rank32-ddp-ws4-s1234/`；controller：`artifacts/compressed_muon/CM096-CM097-m005-optimized-rank32-main-controller/`。W&B run IDs 为 `8w4eai61`（CM096）和 `3ufxprln`（CM097）。
+
+## CM098–CM101：M005 GreedyLore 历史几何 stage-1 timing（2026-09-17）
+
+阶段一在 GPU 2/3/4/7 上串行完成7个 profiler-off 单样本 cell，所有 cells 与 controller 均 exit `0`。统一使用 rank32、EF14、warm start、step0起压缩；前20个 PowerSGD updates作为 timing warmup，之后按历史几何测量800或200个updates。短窗口 validation loss 仅用于确认无 NaN/Inf，不作质量比较。
+
+| 实验 / 几何 | M005 step | peak | 历史 dense | 相对 dense | 历史 M002 local-SVD | 相对 local-SVD | 历史 M002 sharded-SVD |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| CM098 350M BF16 batch72 | 384.06 ms | 18410 MiB | 370.31 ms | +3.71% | 408.73 ms | -6.04% | — |
+| CM098 1B BF16 batch24 | 694.61 ms | 20188 MiB | 518.72 ms | +33.91% | 632.97 ms | +9.74% | — |
+| CM099 350M FP32 batch64 | 460.53 ms | 21653 MiB | 392.65 ms | +17.29% | 432.13 ms | +6.57% | 411.94 ms（+11.80%） |
+| CM100 350M FP32 batch8, bucket160 | 239.26 ms | 9298 MiB | 239.11 ms | +0.06% | 201.66 ms | +18.65% | 174.66 ms（+36.99%） |
+| CM100 350M FP32 batch8, bucket80 | 363.22 ms | 9274 MiB | 252.70 ms | +43.74% | 215.93 ms | +68.21% | 185.35 ms（+95.96%） |
+| CM101 720M FP32 batch12 | 723.26 ms | 20095 MiB | 515.79 ms | +40.22% | 449.70 ms | +60.83% | — |
+| CM101 720M FP32 batch8 | 716.56 ms | 18509 MiB | 458.74 ms | +56.20% | 428.41 ms | +67.26% | 371.93 ms（+92.66%） |
+
+结果显示，优化后的 M005 在较小 BF16 模型上仍有竞争力：350M batch72 只比历史 dense 慢 `3.71%`，并比历史 M002 快 `6.03%`。但在1B BF16、350M FP32 batch64和720M FP32上分别比历史 dense 慢 `33.91%`、`17.29%`和`40.22–56.20%`；随着矩阵宽度与FP32通信几何增长，同 shape batching没有消除本地投影/正交化和两阶段 P/Q collective 的扩展成本。
+
+CM100 对 bucket cap 表现出异常强的敏感性：bucket160 几乎与历史 dense 持平，而 bucket80 慢 `43.74%`，两者相差 `123.96 ms (51.81%)`，显存峰值却近似不变。相比之下，历史 M002 在两种 bucket 下仅有约14 ms的共同漂移；因此不能把 CM100 bucket80 直接归纳为 PowerSGD 的稳定表现，需通过重复实验或 profile 检查 bucket数量/顺序、packing与collective依赖链。
+
+CM098–CM101 均为与历史结果的单样本跨实验比较，没有 current-code dense 配对或重复区间。按“距离历史 dense 不超过5%”的探索性门槛，后续配对复测候选为 CM098 350M BF16 batch72 和 CM100 bucket160；1B BF16及其余FP32点当前为性能负结果，优先级低于对 CM100 bucket 敏感性的机制诊断。原始产物：`artifacts/compressed_muon/CM098-m005-powersgd-bf16-scale-timing-ws4-s42/`至`artifacts/compressed_muon/CM101-m005-powersgd-gpt720m-fp32-batch-timing-ws4-s42/`；controller：`artifacts/compressed_muon/CM098-CM101-m005-stage1-timing-controller/`。
+
+## CM102/CM103：60M BF16 PowerSGD 与 sharded-SVD GreedyLore 配对 timing（2026-09-17）
+
+在 GPU 2/3/6/7 上同期比较优化后 M005 PowerSGD 与 M002 sharded-SVD GreedyLore。两组均固定 GPT-60M（dim512、4层、8 heads）、4卡DDP、BF16 parameter/gradient/bucket、seq256、GA1、bucket80 MiB、rank32和seed42；CM102使用global/device batch `512/128`，CM103使用`32/8`。GreedyLore采用independent score、sharded-SVD和interval200；PowerSGD采用EF14与warm-start Q，没有周期refresh参数。每种几何完成3组交替顺序配对，每个cell含20个压缩态warmup与800个profiler-off measured updates；controller与12/12 cells均exit `0`。
+
+| 实验 / repeat | PowerSGD | GreedyLore | PowerSGD−GreedyLore |
+|---|---:|---:|---:|
+| CM102 batch128 / r1 | 96.49 ms | 93.85 ms | +2.64 ms |
+| CM102 batch128 / r2 | 95.42 ms | 94.64 ms | +0.78 ms |
+| CM102 batch128 / r3 | 96.18 ms | 94.54 ms | +1.64 ms |
+| **CM102 mean** | **96.030 ms** | **94.343 ms** | **+1.687 ms (+1.79%)** |
+| CM103 batch8 / r1 | 35.64 ms | 27.02 ms | +8.62 ms |
+| CM103 batch8 / r2 | 35.30 ms | 27.23 ms | +8.07 ms |
+| CM103 batch8 / r3 | 35.50 ms | 26.27 ms | +9.23 ms |
+| **CM103 mean** | **35.480 ms** | **26.840 ms** | **+8.640 ms (+32.19%)** |
+
+CM102 的 PowerSGD/GreedyLore CV 为 `0.573%/0.456%`，三组配对差值范围为 `[+0.78,+2.64] ms`；CM103 CV 为 `0.482%/1.880%`，差值范围为 `[+8.07,+9.23] ms`。两种batch下三组差值全部同方向。CM102 throughput 为 PowerSGD `1.365M`、GreedyLore `1.389M tokens/s`；CM103分别为 `230.9K/305.2K tokens/s`。peak allocated 在CM102为`6311/6319 MiB`，CM103为`1231/1338 MiB`，PowerSGD的显存优势分别只有`8/107 MiB`。
+
+CM102 的 GreedyLore mean `94.343 ms` 与相同主要几何的 CM067 历史 local-SVD mean `94.343 ms` 相同；在60M上没有观察到sharded-SVD相对历史local-SVD的端到端收益。相对CM067历史dense `92.043 ms`，本轮PowerSGD和GreedyLore分别慢约`4.33%/2.50%`，但这是跨卡组、跨实验比较，不作为同期dense结论。CM103没有相同小batch历史dense，因而只能支持两种压缩方法的同期相对结论。
+
+结果分类为 **paired-negative-for-M005**：batch128下PowerSGD仅比GreedyLore慢`1.79%`，仍属接近；physical batch降至8后差距扩大到`32.19%`，说明模型计算缩短时，PowerSGD每步投影、正交化及两阶段P/Q collective的固定成本占比明显上升。短窗口validation loss仅用于确认运行健康，不提供质量比较。原始产物：`artifacts/compressed_muon/CM102-m005-vs-m002-gpt60m-bf16-batch128-timing-ws4-s42/`、`artifacts/compressed_muon/CM103-m005-vs-m002-gpt60m-bf16-batch8-timing-ws4-s42/`；controller：`artifacts/compressed_muon/CM102-CM103-powersgd-vs-greedylore-60m-bf16-controller/`。

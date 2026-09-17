@@ -638,3 +638,18 @@ controller 在GPU 2–5串行完成并exit `0`。CM079中350M的M002在device ba
 - Refresh归因：由CM092同批shared interval200/800二点差分估计ordinary为`341.577 ms`、单次refresh额外`4010.667 ms`；CM088历史对应值为`331.553/17077.333 ms`。因此单次refresh缩短约`13.067 s (76.51%)`，接近四卡参数级分片的理想量级；ordinary的约`+10.02 ms`跨实验差异不归因为sharded-SVD，因为该模式只改变refresh步骤。
 - 结论：completed/diagnostic-positive。分片计算在更大FP32模型上显著降低完整周期时间，验证了重复SVD是主要refresh瓶颈；CM085大physical batch下仍未超过dense，说明ordinary本地计算和通信比例仍决定最终盈亏。所有新cell均为单样本，与CM078/085/087/088的百分比属于历史跨实验比较，不给出置信区间或严格配对claim。
 - 代码与产物：`dion/greedy_lore.py`、`dion/greedy_lore_ddp_hook.py`、`train_greedylore.py`、`benchmark/compressed_muon/run_greedy_lore_profiler.sh`、`benchmark/compressed_muon/run_cm089_cm092_sharded_svd_timing.sh`；controller产物为`artifacts/compressed_muon/CM089-CM092-sharded-svd-controller/`。
+
+## 2026-09-17：CM102/CM103 与优化后 PowerSGD 的60M paired timing启动
+
+- 目的：在相同60M BF16几何上同期比较M002 sharded-SVD与优化后M005，并检查physical batch从128降至8后的相对表现。
+- 配置：4卡、seq256、GA1、bucket80、rank32、seed42；CM102为global/device batch512/128，CM103为32/8。M002使用independent score、sharded-SVD和interval200，M005使用EF14与warm-start Q。
+- 设计：每种几何3组交替顺序配对，每cell为20 warmup + 800 measured updates；不重跑dense，不启用profiler、W&B或checkpoint。CM102可桥接CM067相同几何的历史local-SVD与dense；CM103此前没有相同60M小batch结果。
+- 执行：单controller严格等待四张无计算进程且显存占用低于1 GiB的GPU，12个cell串行运行，agent不轮询。
+
+## 2026-09-17：CM102/CM103 与 PowerSGD 的60M paired timing完成
+
+- 状态：controller与12/12 cells均exit `0`，使用GPU 2/3/6/7。
+- CM102 batch128：PowerSGD/GreedyLore sharded-SVD mean为`96.030/94.343 ms`，GreedyLore快`1.687 ms (1.76% of PowerSGD；PowerSGD相对GreedyLore慢1.79%)`；三组差值`+2.64/+0.78/+1.64 ms`。
+- CM103 batch8：PowerSGD/GreedyLore mean为`35.480/26.840 ms`，GreedyLore快`8.640 ms (24.35% of PowerSGD；PowerSGD相对GreedyLore慢32.19%)`；三组差值`+8.62/+8.07/+9.23 ms`。
+- 观察：CM102 GreedyLore mean与CM067历史local-SVD mean同为`94.343 ms`，60M上未显示sharded-SVD端到端收益；batch降至8后GreedyLore相对优势明显扩大。CM103无dense对照，只作两种压缩方法的同期结论。
+- 产物：`artifacts/compressed_muon/CM102-m005-vs-m002-gpt60m-bf16-batch128-timing-ws4-s42/`、`artifacts/compressed_muon/CM103-m005-vs-m002-gpt60m-bf16-batch8-timing-ws4-s42/`及controller目录。
