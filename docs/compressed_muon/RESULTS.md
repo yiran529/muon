@@ -1183,3 +1183,57 @@ CM102 的 PowerSGD/GreedyLore CV 为 `0.573%/0.456%`，三组配对差值范围�
 CM102 的 GreedyLore mean `94.343 ms` 与相同主要几何的 CM067 历史 local-SVD mean `94.343 ms` 相同；在60M上没有观察到sharded-SVD相对历史local-SVD的端到端收益。相对CM067历史dense `92.043 ms`，本轮PowerSGD和GreedyLore分别慢约`4.33%/2.50%`，但这是跨卡组、跨实验比较，不作为同期dense结论。CM103没有相同小batch历史dense，因而只能支持两种压缩方法的同期相对结论。
 
 结果分类为 **paired-negative-for-M005**：batch128下PowerSGD仅比GreedyLore慢`1.79%`，仍属接近；physical batch降至8后差距扩大到`32.19%`，说明模型计算缩短时，PowerSGD每步投影、正交化及两阶段P/Q collective的固定成本占比明显上升。短窗口validation loss仅用于确认运行健康，不提供质量比较。原始产物：`artifacts/compressed_muon/CM102-m005-vs-m002-gpt60m-bf16-batch128-timing-ws4-s42/`、`artifacts/compressed_muon/CM103-m005-vs-m002-gpt60m-bf16-batch8-timing-ws4-s42/`；controller：`artifacts/compressed_muon/CM102-CM103-powersgd-vs-greedylore-60m-bf16-controller/`。
+
+## CM104：M005 scripted Gram–Schmidt 稳态 timing（2026-09-18）
+
+在4×RTX 4090（GPU 3/4/5/6）上串行运行15个PowerSGD-only cell，15/15 cells和controller均exit `0`。统一使用4卡DDP、seq256、GA1、rank32、EF14、warm-start Q、seed42，step0起压缩；每项先进行20个压缩态warmup，再测量800个updates，只有350M FP32 batch8的两个bucket cell测量200个updates。未启用profiler、W&B或checkpoint，未重跑dense或GreedyLore。下表的batch是`device/global`，step是压缩态测量窗口平均；FP32指参数/梯度/bucket dtype，forward仍使用BF16 autocast。短窗口val loss仅用于运行健康检查，不是质量比较。
+
+| 模型 / dtype | batch | bucket MiB | measured updates | M005 step | peak allocated | val loss |
+|---|---:|---:|---:|---:|---:|---:|
+| 60M BF16 | 128/512 | 160 | 800 | 94.56 ms | 6311 MiB | 4.9174 |
+| 130M BF16 | 128/512 | 160 | 800 | 204.11 ms | 11603 MiB | 4.6864 |
+| 350M BF16 | 72/288 | 80 | 800 | 386.59 ms | 18410 MiB | 4.7685 |
+| 1B BF16 | 24/96 | 80 | 800 | 633.50 ms | 20188 MiB | 5.2446 |
+| 60M BF16 | 128/512 | 80 | 800 | 93.85 ms | 6311 MiB | 4.9174 |
+| 60M BF16 | 8/32 | 80 | 800 | 30.76 ms | 1332 MiB | 6.1467 |
+| 60M FP32 | 128/512 | 80 | 800 | 102.01 ms | 7185 MiB | 4.8617 |
+| 60M FP32 | 8/32 | 80 | 800 | 41.02 ms | 1814 MiB | 6.1007 |
+| 130M FP32 | 128/512 | 80 | 800 | 219.88 ms | 13759 MiB | 4.6464 |
+| 130M FP32 | 8/32 | 80 | 800 | 94.93 ms | 3562 MiB | 5.9952 |
+| 350M FP32 | 64/256 | 80 | 800 | 427.57 ms | 21653 MiB | 4.8290 |
+| 350M FP32 | 8/32 | 160 | 200 | 230.44 ms | 9298 MiB | 6.5733 |
+| 350M FP32 | 8/32 | 80 | 200 | 315.87 ms | 9274 MiB | 6.5749 |
+| 720M FP32 | 12/48 | 80 | 800 | 648.81 ms | 20095 MiB | 5.7566 |
+| 720M FP32 | 8/32 | 80 | 800 | 637.66 ms | 18509 MiB | 5.9621 |
+
+同几何的历史M005 step如下；差值为`CM104−历史M005`。这只是跨运行的单样本诊断，不足以把变化单独归因于scripted Gram–Schmidt或去除clone。
+
+| 几何 | 历史M005 | CM104 M005 | 差值 |
+|---|---:|---:|---:|
+| 60M BF16 batch128 bucket80（CM102 mean） | 96.030 ms | 93.85 ms | -2.18 ms (-2.27%) |
+| 60M BF16 batch8 bucket80（CM103 mean） | 35.480 ms | 30.76 ms | -4.72 ms (-13.30%) |
+| 350M BF16 batch72 bucket80（CM098） | 384.06 ms | 386.59 ms | +2.53 ms (+0.66%) |
+| 1B BF16 batch24 bucket80（CM098） | 694.61 ms | 633.50 ms | -61.11 ms (-8.80%) |
+| 350M FP32 batch64 bucket80（CM099） | 460.53 ms | 427.57 ms | -32.96 ms (-7.16%) |
+| 350M FP32 batch8 bucket160（CM100） | 239.26 ms | 230.44 ms | -8.82 ms (-3.69%) |
+| 350M FP32 batch8 bucket80（CM100） | 363.22 ms | 315.87 ms | -47.35 ms (-13.04%) |
+| 720M FP32 batch12 bucket80（CM101） | 723.26 ms | 648.81 ms | -74.45 ms (-10.29%) |
+| 720M FP32 batch8 bucket80（CM101） | 716.56 ms | 637.66 ms | -78.90 ms (-11.01%) |
+
+与历史M002 GreedyLore的同几何对照如下。local-SVD与sharded-SVD是不同实现，不能混作一个baseline；百分比均为`(CM104 PowerSGD / GreedyLore − 1) × 100%`，负数表示PowerSGD更快。CM104没有同期GreedyLore复测，因此这些差值尤其是约1%以内的差异不构成稳定排序。
+
+| 几何 | CM104 PowerSGD | 历史M002 local-SVD | 相对local | 历史M002 sharded-SVD | 相对sharded |
+|---|---:|---:|---:|---:|---:|
+| 60M BF16 batch128 bucket80 | 93.85 ms | 94.343 ms（CM067 mean） | -0.52% | 94.343 ms（CM102 mean） | -0.52% |
+| 60M BF16 batch8 bucket80 | 30.76 ms | — | — | 26.840 ms（CM103 mean） | +14.61% |
+| 350M BF16 batch72 bucket80 | 386.59 ms | 408.727 ms（CM079） | -5.42% | — | — |
+| 1B BF16 batch24 bucket80 | 633.50 ms | 632.973 ms（CM080） | +0.08% | — | — |
+| 350M FP32 batch64 bucket80 | 427.57 ms | 432.13 ms（CM085） | -1.06% | 411.94 ms（CM090） | +3.79% |
+| 350M FP32 batch8 bucket160 | 230.44 ms | 201.66 ms（CM087） | +14.27% | 174.66 ms（CM091） | +31.94% |
+| 350M FP32 batch8 bucket80 | 315.87 ms | 215.93 ms（CM087） | +46.28% | 185.35 ms（CM091） | +70.42% |
+| 720M FP32 batch12 bucket80 | 648.81 ms | 449.70 ms（CM086） | +44.28% | — | — |
+| 720M FP32 batch8 bucket80 | 637.66 ms | 428.41 ms（CM088） | +48.84% | 371.93 ms（CM092） | +71.45% |
+
+观察：相同几何的历史M005对照中8/9项step降低，但350M BF16 batch72微升`0.66%`。与历史GreedyLore比较，60M BF16大batch和1B BF16基本持平，350M BF16快于历史local-SVD；350M FP32大batch与local-SVD接近、仍慢于sharded-SVD。小batch时差距仍明显：60M BF16 batch8比历史sharded-SVD慢`14.61%`，350M/720M FP32各小batch点慢约`14–71%`。350M FP32 batch8在CM104的bucket80仍比bucket160慢`85.43 ms (37.07%)`，bucket敏感性未消失，但本轮无重复，不能确定机制。
+
+结果分类为 **diagnostic-mixed**：当前改动后的单次step有多个较旧M005更快的点，却仍不能说明算法本身在FP32小batch上具有优势；下一步如需可靠收益结论，应对候选几何做同期轮换配对和重复。原始产物：`artifacts/compressed_muon/CM104-m005-scripted-gs-timing-ws4-s42/`，包含controller状态、各cell命令与结果、`git_head.txt`、`git_status.txt`和`code.patch`。实验时HEAD为`ac091d38db15d009311d35101d2f5511ac688579`，优化代码仍有未提交改动；仅靠HEAD无法重现该实现。

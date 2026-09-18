@@ -16,6 +16,7 @@ from torch.profiler import record_function
 
 from .collective_observer import observe_collective
 from .power_sgd import (
+    _orthogonalize_owned,
     PowerSGDConfig,
     compressed_phase,
     compute_left_factor,
@@ -727,7 +728,7 @@ def _orthogonalize_grouped(
             results[index] = orthogonalize(matrices[index], epsilon)
             continue
         batch = torch.stack([matrices[index] for index in indices])
-        orthogonalized = orthogonalize(batch, epsilon)
+        orthogonalized = _orthogonalize_owned(batch, epsilon)
         for index, matrix in zip(indices, orthogonalized.unbind(0)):
             results[index] = matrix
     return [result for result in results if result is not None]

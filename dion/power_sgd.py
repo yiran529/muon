@@ -87,15 +87,9 @@ def make_random_factor(
     return torch.randn((rows, rank), device=device, dtype=torch.float32, generator=generator).to(dtype)
 
 
-def orthogonalize(matrix: Tensor, epsilon: float = 1e-8) -> Tensor:
-    """Column-orthogonalize one matrix or a batch with FP32 accumulation."""
-    if matrix.ndim not in (2, 3):
-        raise ValueError("orthogonalize requires a two- or three-dimensional tensor")
-    if matrix.shape[-1] > matrix.shape[-2]:
-        raise ValueError("orthogonalize requires at least as many rows as columns")
-    if epsilon < 0:
-        raise ValueError("epsilon must be non-negative")
-    work = matrix.float().clone()
+@torch.jit.script
+def _orthogonalize_gram_schmidt(work: Tensor, epsilon: float) -> Tensor:
+    """Apply the paper's column-wise Gram--Schmidt recurrence in-place."""
     for index in range(work.shape[-1]):
         column = work[..., :, index]
         norm = torch.linalg.vector_norm(column, dim=-1, keepdim=True)
@@ -105,7 +99,30 @@ def orthogonalize(matrix: Tensor, epsilon: float = 1e-8) -> Tensor:
             remaining = work[..., :, index + 1 :]
             coefficients = normalized.unsqueeze(-2) @ remaining
             remaining -= normalized.unsqueeze(-1) @ coefficients
-    return work.to(dtype=matrix.dtype)
+    return work
+
+
+def _orthogonalize(matrix: Tensor, epsilon: float, *, copy_input: bool) -> Tensor:
+    if matrix.ndim not in (2, 3):
+        raise ValueError("orthogonalize requires a two- or three-dimensional tensor")
+    if matrix.shape[-1] > matrix.shape[-2]:
+        raise ValueError("orthogonalize requires at least as many rows as columns")
+    if epsilon < 0:
+        raise ValueError("epsilon must be non-negative")
+    work = matrix.float()
+    if copy_input and work is matrix:
+        work = work.clone()
+    return _orthogonalize_gram_schmidt(work, epsilon).to(dtype=matrix.dtype)
+
+
+def orthogonalize(matrix: Tensor, epsilon: float = 1e-8) -> Tensor:
+    """Column-orthogonalize one matrix or a batch with FP32 accumulation."""
+    return _orthogonalize(matrix, epsilon, copy_input=True)
+
+
+def _orthogonalize_owned(matrix: Tensor, epsilon: float = 1e-8) -> Tensor:
+    """Orthogonalize a private temporary that may be reused as FP32 work."""
+    return _orthogonalize(matrix, epsilon, copy_input=False)
 
 
 def corrected_gradient(gradient: Tensor, error: Tensor | None = None) -> Tensor:

@@ -261,14 +261,14 @@ def test_warm_start_randomizes_only_the_first_compressed_step(monkeypatch):
 def test_same_shape_matrices_use_batched_orthogonalization(monkeypatch):
     parameters = [torch.nn.Parameter(torch.zeros(8, 12)) for _ in range(2)]
     state = make_state([(parameter, "matrix") for parameter in parameters])
-    original = hook_module.orthogonalize
+    original = hook_module._orthogonalize_owned
     shapes = []
 
     def observed(matrix, epsilon):
         shapes.append(tuple(matrix.shape))
         return original(matrix, epsilon)
 
-    monkeypatch.setattr(hook_module, "orthogonalize", observed)
+    monkeypatch.setattr(hook_module, "_orthogonalize_owned", observed)
     state.begin_step()
     result = hook_module.power_sgd_ddp_hook(
         state,
@@ -279,6 +279,27 @@ def test_same_shape_matrices_use_batched_orthogonalization(monkeypatch):
 
     assert (2, 12, 1) in shapes
     assert (2, 8, 1) in shapes
+
+
+def test_grouped_orthogonalization_reuses_owned_fp32_stack(monkeypatch):
+    matrices = [torch.randn(12, 4) for _ in range(2)]
+    originals = [matrix.clone() for matrix in matrices]
+    clone_dtypes = []
+    original_clone = torch.Tensor.clone
+
+    def observed_clone(tensor, *args, **kwargs):
+        clone_dtypes.append(tensor.dtype)
+        return original_clone(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", observed_clone)
+
+    results = hook_module._orthogonalize_grouped(matrices, epsilon=1e-8)
+
+    assert clone_dtypes == []
+    assert all(
+        torch.equal(matrix, original) for matrix, original in zip(matrices, originals)
+    )
+    assert len(results) == len(matrices)
 
 
 @pytest.mark.parametrize("failure_stage", [0, 1])

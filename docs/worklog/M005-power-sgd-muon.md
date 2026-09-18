@@ -209,3 +209,27 @@ PowerSGD/GreedyLore sharded-SVD mean为`96.030/94.343 ms`，M005慢
 PowerSGD每步投影、正交化及P/Q两阶段collective的固定成本占比显著增加。CM102
 GreedyLore mean与CM067历史local-SVD mean恰好同为`94.343 ms`；CM103没有同期或
 历史同配置dense，因此不作相对dense claim。结果已同步至RESULTS和实验登记。
+
+## 2026-09-18：CM104 scripted Gram–Schmidt timing完成并归档
+
+在保持既有PowerSGD计算流程的前提下，当前工作区实现使用TorchScript执行同一
+Gram–Schmidt循环，并去除不必要的clone。CM104在GPU 3/4/5/6串行测量15个
+PowerSGD-only几何；15/15 cells和controller均exit `0`，短窗口val loss均有限。
+统一配置为4卡DDP、seq256、GA1、rank32、EF14、warm-start、seed42、step0起压缩；
+20个压缩态warmup后通常测量800 updates，350M FP32 batch8的bucket160/80两项
+测量200 updates。无同期dense或GreedyLore，也没有repeats或完整质量复跑。
+
+同几何历史M005比较，9项中8项step降低、1项（350M BF16 batch72）增加`0.66%`；
+1B BF16从`694.61`到`633.50 ms`，350M FP32 batch64从`460.53`到`427.57 ms`，
+720M FP32 batch8从`716.56`到`637.66 ms`。对历史GreedyLore，60M BF16 batch128
+接近持平（`93.85`对`94.343 ms`）；batch8仍慢于sharded-SVD `14.61%`。
+350M FP32 batch64相对local-SVD快`1.06%`、相对sharded-SVD慢`3.79%`；
+350M/720M FP32小batch对相同几何的GreedyLore仍明显落后。350M FP32 batch8
+的bucket80比bucket160慢`85.43 ms (37.07%)`，bucket敏感性仍在。
+
+以上均为单次跨实验诊断，不能把收益归因于单个代码优化，也不能据小幅差异判定
+稳定胜负。完整15项数据和GreedyLore对照已写入`docs/compressed_muon/RESULTS.md`，
+实验状态已登记在`docs/compressed_muon/EXPERIMENTS.md`。原始产物位于
+`artifacts/compressed_muon/CM104-m005-scripted-gs-timing-ws4-s42/`；记录的HEAD为
+`ac091d38db15d009311d35101d2f5511ac688579`，但优化代码未提交，产物中保存
+`git_status.txt`与`code.patch`，复现时必须连同补丁一起使用。

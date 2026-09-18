@@ -653,3 +653,11 @@ controller 在GPU 2–5串行完成并exit `0`。CM079中350M的M002在device ba
 - CM103 batch8：PowerSGD/GreedyLore mean为`35.480/26.840 ms`，GreedyLore快`8.640 ms (24.35% of PowerSGD；PowerSGD相对GreedyLore慢32.19%)`；三组差值`+8.62/+8.07/+9.23 ms`。
 - 观察：CM102 GreedyLore mean与CM067历史local-SVD mean同为`94.343 ms`，60M上未显示sharded-SVD端到端收益；batch降至8后GreedyLore相对优势明显扩大。CM103无dense对照，只作两种压缩方法的同期结论。
 - 产物：`artifacts/compressed_muon/CM102-m005-vs-m002-gpt60m-bf16-batch128-timing-ws4-s42/`、`artifacts/compressed_muon/CM103-m005-vs-m002-gpt60m-bf16-batch8-timing-ws4-s42/`及controller目录。
+
+## 2026-09-18：CM105 补齐 CM104 缺失的 sharded-SVD timing 启动
+
+- 目的：对照 CM104 的15个PowerSGD几何，仅补此前没有同设置M002 independent-score、sharded-SVD、interval200数据的9项；已有6项不重跑。
+- 配置：4卡DDP、seq256、GA1、rank32、seed42、bucket80/160 MiB；60M/130M BF16 batch128 bucket160，350M BF16 batch72，1B BF16 batch24，60M/130M FP32各batch128/8，720M FP32 batch12。每项20 warmup + 800 measured updates，单次、无profiler/W&B/checkpoint；GreedyLore从step20开始压缩，与既有M002 timing口径相同。
+- 执行：`benchmark/compressed_muon/run_cm105_m002_sharded_svd_missing_cm104_timing.sh`在tmux `CM105-m002-sharded-svd`后台串行运行。启动时选择无计算进程且显存占用低于1 GiB的GPU 2/3/4/5，已进入第1/9项；后续由脚本调度，agent不轮询。若某cell失败，记录退出码并继续其余几何，不自动降低batch。
+- 状态：running；完成后再汇总与CM104的单样本跨实验比较，不作同期配对或统计显著声明。
+- 产物：`artifacts/compressed_muon/CM105-m002-sharded-svd-missing-cm104-timing-ws4-s42/`。

@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import dion.power_sgd as power_sgd_module
 from dion.power_sgd import (
     PowerSGDConfig,
     compressed_phase,
@@ -13,6 +14,20 @@ from dion.power_sgd import (
     reconstruct,
     should_compress,
 )
+
+
+def _reference_orthogonalize(matrix, epsilon=1e-8):
+    work = matrix.float().clone()
+    for index in range(work.shape[-1]):
+        column = work[..., :, index]
+        norm = torch.linalg.vector_norm(column, dim=-1, keepdim=True)
+        normalized = column / (norm + epsilon)
+        work[..., :, index] = normalized
+        if index + 1 < work.shape[-1]:
+            remaining = work[..., :, index + 1 :]
+            coefficients = normalized.unsqueeze(-2) @ remaining
+            remaining -= normalized.unsqueeze(-1) @ coefficients
+    return work.to(dtype=matrix.dtype)
 
 
 def test_should_compress_counts_both_factors():
@@ -71,6 +86,42 @@ def test_orthogonalize_accumulates_in_fp32_and_returns_input_dtype():
     result = orthogonalize(matrix, epsilon=1e-8)
     assert result.dtype == matrix.dtype
     assert torch.allclose(result.float().T @ result.float(), torch.eye(2), atol=2e-2)
+
+
+def test_orthogonalize_uses_scripted_gram_schmidt_core():
+    assert isinstance(
+        power_sgd_module._orthogonalize_gram_schmidt,
+        torch.jit.ScriptFunction,
+    )
+
+
+def test_orthogonalize_does_not_clone_after_low_precision_conversion(monkeypatch):
+    clone_dtypes = []
+    original_clone = torch.Tensor.clone
+
+    def observed_clone(tensor, *args, **kwargs):
+        clone_dtypes.append(tensor.dtype)
+        return original_clone(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", observed_clone)
+
+    orthogonalize(torch.randn(12, 4, dtype=torch.bfloat16))
+
+    assert clone_dtypes == []
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(12, 4), (3, 12, 4)])
+def test_scripted_orthogonalize_matches_reference_exactly(dtype, shape):
+    generator = torch.Generator().manual_seed(17)
+    matrix = torch.randn(shape, dtype=dtype, generator=generator)
+    original = matrix.clone()
+
+    result = orthogonalize(matrix, epsilon=1e-8)
+    expected = _reference_orthogonalize(matrix, epsilon=1e-8)
+
+    assert torch.equal(result, expected)
+    assert torch.equal(matrix, original)
 
 
 def test_orthogonalize_batches_matrices_without_changing_individual_results():
